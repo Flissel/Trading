@@ -1,0 +1,212 @@
+"""Command-line entry point for bounded local research runs."""
+
+import argparse
+import shutil
+from decimal import Decimal
+from pathlib import Path
+
+from trading_bot.backtest import BacktestCase, BacktestRunner, write_report
+from trading_bot.features import MarketState
+from trading_bot.fold_evaluation import run_fold_evaluation
+from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
+from trading_bot.research_run import run_capture_research
+from trading_bot.storage import StoragePolicy
+from trading_bot.strategy import CostScenario
+from trading_bot.walk_forward_run import derive_walk_forward_config, run_capture_walk_forward
+
+
+def main(arguments: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="trading-research")
+    commands = parser.add_subparsers(dest="command", required=True)
+    demo = commands.add_parser("demo-backtest")
+    demo.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    demo.add_argument("--output", type=Path, default=Path("artifacts/demo-report.json"))
+    demo.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
+    capture = commands.add_parser("capture-public-candles")
+    capture.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    capture.add_argument("--output", type=Path, required=True)
+    capture.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
+    capture.add_argument("--limit", type=int, default=96)
+    history = commands.add_parser("capture-history")
+    history.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    history.add_argument("--output", type=Path, required=True)
+    history.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
+    history.add_argument("--bars", type=int, default=2880)
+    history.add_argument("--end-time-ms", type=int)
+    research = commands.add_parser("research-capture")
+    research.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    research.add_argument("--capture", type=Path, required=True)
+    research.add_argument("--output", type=Path, required=True)
+    research.add_argument("--oos-fraction", default="0.20")
+    research.add_argument("--minimum-train-samples", type=int, default=20)
+    research.add_argument("--random-seed", type=int, default=17)
+    walk_forward = commands.add_parser("walk-forward-manifest")
+    walk_forward.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    walk_forward.add_argument("--capture", type=Path, required=True)
+    walk_forward.add_argument("--output", type=Path, required=True)
+    walk_forward.add_argument("--train-duration-ns", type=int, required=True)
+    walk_forward.add_argument("--validation-duration-ns", type=int, required=True)
+    walk_forward.add_argument("--test-duration-ns", type=int, required=True)
+    walk_forward.add_argument("--step-ns", type=int, required=True)
+    walk_forward.add_argument("--embargo-ns", type=int, required=True)
+    walk_forward.add_argument("--holdout-duration-ns", type=int, required=True)
+    walk_forward.add_argument("--horizon-bars", type=int, default=1)
+    fold_evaluation = commands.add_parser("evaluate-fold")
+    fold_evaluation.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    fold_evaluation.add_argument("--capture", type=Path, required=True)
+    fold_evaluation.add_argument("--split-manifest", type=Path, required=True)
+    fold_evaluation.add_argument("--output", type=Path, required=True)
+    fold_evaluation.add_argument("--registry", type=Path, required=True)
+    fold_evaluation.add_argument("--fold-index", type=int, required=True)
+    fold_evaluation.add_argument("--random-seed", type=int, default=17)
+    fold_evaluation.add_argument("--block-length", type=int, default=16)
+    fold_evaluation.add_argument("--bootstrap-repetitions", type=int, default=2000)
+    parsed = parser.parse_args(arguments)
+
+    if parsed.command == "demo-backtest":
+        workspace = parsed.workspace_root.resolve()
+        output = parsed.output
+        if not output.is_absolute():
+            output = workspace / output
+        output = output.resolve()
+        free_bytes = shutil.disk_usage(workspace).free
+        StoragePolicy(workspace, parsed.reserve_bytes).authorize(
+            target=output,
+            temporary_directory=output.parent,
+            free_bytes=free_bytes,
+            worst_case_required_bytes=1_000_000,
+        )
+        report = _demo_runner().run(_demo_case(), baseline_name="momentum")
+        write_report(output, report)
+        return 0
+    if parsed.command == "capture-public-candles":
+        workspace = parsed.workspace_root.resolve()
+        output = parsed.output
+        if not output.is_absolute():
+            output = workspace / output
+        capture_public_candles(
+            workspace_root=workspace,
+            output_directory=output,
+            reserve_bytes=parsed.reserve_bytes,
+            limit=parsed.limit,
+        )
+        return 0
+    if parsed.command == "capture-history":
+        workspace = parsed.workspace_root.resolve()
+        output = parsed.output
+        if not output.is_absolute():
+            output = workspace / output
+        capture_public_candle_history(
+            workspace_root=workspace,
+            output_directory=output,
+            reserve_bytes=parsed.reserve_bytes,
+            bars=parsed.bars,
+            end_time_ms=parsed.end_time_ms,
+        )
+        return 0
+    if parsed.command == "research-capture":
+        workspace = parsed.workspace_root.resolve()
+        capture_root = parsed.capture.resolve()
+        output = parsed.output.resolve()
+        if not capture_root.is_relative_to(workspace) or not output.is_relative_to(workspace):
+            raise ValueError("research paths must stay inside workspace")
+        run_capture_research(
+            capture_root,
+            output_path=output,
+            oos_fraction=parsed.oos_fraction,
+            minimum_train_samples=parsed.minimum_train_samples,
+            random_seed=parsed.random_seed,
+        )
+        return 0
+    if parsed.command == "walk-forward-manifest":
+        workspace = parsed.workspace_root.resolve()
+        capture_root = parsed.capture.resolve()
+        output = parsed.output.resolve()
+        if not capture_root.is_relative_to(workspace) or not output.is_relative_to(workspace):
+            raise ValueError("walk-forward paths must stay inside workspace")
+        config = derive_walk_forward_config(
+            capture_root,
+            horizon_bars=parsed.horizon_bars,
+            train_duration_ns=parsed.train_duration_ns,
+            validation_duration_ns=parsed.validation_duration_ns,
+            test_duration_ns=parsed.test_duration_ns,
+            step_ns=parsed.step_ns,
+            embargo_ns=parsed.embargo_ns,
+            holdout_duration_ns=parsed.holdout_duration_ns,
+        )
+        run_capture_walk_forward(
+            capture_root,
+            output_path=output,
+            config=config,
+            horizon_bars=parsed.horizon_bars,
+        )
+        return 0
+    if parsed.command == "evaluate-fold":
+        workspace = parsed.workspace_root.resolve()
+        paths = (
+            parsed.capture.resolve(),
+            parsed.split_manifest.resolve(),
+            parsed.output.resolve(),
+            parsed.registry.resolve(),
+        )
+        if any(not path.is_relative_to(workspace) for path in paths):
+            raise ValueError("fold evaluation paths must stay inside workspace")
+        run_fold_evaluation(
+            paths[0],
+            split_manifest_path=paths[1],
+            output_path=paths[2],
+            registry_path=paths[3],
+            fold_index=parsed.fold_index,
+            random_seed=parsed.random_seed,
+            block_length=parsed.block_length,
+            bootstrap_repetitions=parsed.bootstrap_repetitions,
+        )
+        return 0
+    raise AssertionError("unreachable command")
+
+
+def _demo_runner() -> BacktestRunner:
+    return BacktestRunner(
+        base_costs=CostScenario("base", Decimal("1"), Decimal("1"), Decimal("1"), Decimal("0")),
+        adverse_costs=CostScenario(
+            "adverse", Decimal("2"), Decimal("2"), Decimal("2"), Decimal("1")
+        ),
+        random_seed=17,
+    )
+
+
+def _demo_case() -> BacktestCase:
+    prices = ("100", "102", "101", "104", "103")
+    states = tuple(_demo_state(index, value) for index, value in enumerate(prices))
+    return BacktestCase(
+        case_id="synthetic-demo-v1",
+        states=states,
+        forward_returns=(
+            Decimal("0.02"),
+            Decimal("-0.01"),
+            Decimal("0.03"),
+            Decimal("-0.005"),
+            Decimal(0),
+        ),
+        observed_spread_bps=(Decimal(2),) * len(states),
+    )
+
+
+def _demo_state(index: int, value: str) -> MarketState:
+    price = Decimal(value)
+    time_ns = (index + 1) * 1_000_000_000
+    return MarketState(
+        event_id=f"demo-{index}",
+        available_time_ns=time_ns,
+        decision_time_ns=time_ns,
+        mid_price=price,
+        best_bid=price - Decimal("0.5"),
+        best_ask=price + Decimal("0.5"),
+        bid_size=Decimal(2),
+        ask_size=Decimal(1),
+        trade_buy_quantity=Decimal(3),
+        trade_sell_quantity=Decimal(1),
+        funding_rate=Decimal("0.0001"),
+        book_valid=True,
+        feed_age_ns=1,
+    )
