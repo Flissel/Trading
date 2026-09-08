@@ -1,7 +1,7 @@
 # Cross-Sectional Daily Momentum Family Design
 
-Status: Draft for review on 2026-09-08. `research_only`. Not approved for
-implementation. Pre-registers experiment family `xs_momentum_panel_v1` under
+Status: Approved in chat on 2026-09-09 (draft 2026-09-08). `research_only`.
+Approved for implementation planning only. Pre-registers experiment family `xs_momentum_panel_v1` under
 `PHASE_0_EVALUATION_PROTOCOL.md` with the prospective addendum in section 13
 of this document. No live, paper, or shadow authority follows from it.
 

@@ -1,6 +1,6 @@
 # Phase 0 Evaluation and Promotion Protocol
 
-Status: Draft v0.1
+Status: Draft v0.2 (v0.1 of 2026-08-24 plus section 16 of 2026-09-09)
 Date: 2026-08-24
 Applies to: BTC and ETH perpetual research at 15-minute, 1-hour, and 4-hour forecast horizons
 
@@ -238,3 +238,23 @@ Revisit this protocol when:
 - an independent statistical review recommends a stricter gate.
 
 Any relaxation must be prospective. Thresholds may not be weakened to rescue an already evaluated candidate.
+
+## 16. Panel research addendum (v0.2, 2026-09-08)
+
+This addendum extends section 1 to weekly-decision, one-week-holding research
+on a panel of Binance USD-M USDT perpetuals. It changes no numeric gate.
+
+- A position episode is one weekly portfolio rebalance; contracts inside an
+  episode are not independent samples (PHASE_0_DATASET_SPEC section on
+  cross-series dependence).
+- The 200-episode floor of section 9.9 applies to the pooled out-of-sample
+  episode count of a family.
+- Block length for the bootstrap is at least the holding period and is fixed
+  before evaluation; four weekly episodes for a one-week holding period.
+- Cost scenarios follow section 7 with turnover-based charging; execution
+  assumptions that are not measured are declared per family and are at least
+  as adverse as the measured BTC evidence.
+- Families without fitted parameters register every member as a trial and
+  perform no validation selection.
+- Non-learned panel rules are direct-policy baselines under section 9.1;
+  section 8 does not apply to them.
