@@ -6,8 +6,6 @@ from decimal import Decimal
 from trading_bot.panel_config import PanelUniverseRules
 from trading_bot.panel_reader import PanelBar
 
-DAY_NS = 86_400_000_000_000
-
 
 @dataclass(frozen=True, slots=True)
 class ContractHistory:
