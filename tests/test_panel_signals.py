@@ -3,7 +3,7 @@ from pathlib import Path
 
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
-from trading_bot.panel_signals import build_weight_vectors
+from trading_bot.panel_signals import _normalise, _water_fill, build_weight_vectors
 from trading_bot.panel_universe import build_contract_histories, select_universe
 
 DAY_NS = 86_400_000_000_000
@@ -113,6 +113,69 @@ def sparse_time_series_panel(days: int = 100) -> tuple[PanelBar, ...]:
         closes = oscillating_series(symbol, days, drift, amplitude)
         rows.extend(series(symbol, closes))
     return tuple(rows)
+
+
+def water_fill_cases() -> list[dict[str, Decimal]]:
+    """A deterministic battery of raw weight vectors for the capping routine,
+    covering single-outlier, staggered, and many-simultaneous-violator shapes
+    across varying contract counts, each duplicated with alternating signs
+    layered on. No randomness: every value is a fixed arithmetic formula, so
+    the case set is identical on every run."""
+    cases: list[dict[str, Decimal]] = []
+
+    # A single dominant outlier among otherwise-equal unit weights.
+    for n in (1, 2, 3, 5, 8, 13, 21, 34):
+        raw = {f"O{i:02d}": Decimal(1) for i in range(n)}
+        raw["O00"] = Decimal(50)
+        cases.append(raw)
+
+    # Strictly decaying magnitudes (each successive round freezes exactly one
+    # more entry, forcing repeated re-scaling of whatever remains unfrozen).
+    for n in (3, 5, 8, 13, 21):
+        raw = {f"S{i:02d}": Decimal(2) ** (n - i) for i in range(n)}
+        cases.append(raw)
+
+    # More than one violator at once: a quarter of the contracts share one
+    # large magnitude, the rest one small magnitude. (A 50/50 split can never
+    # produce a violator here: cap = 2/n means half the population sitting
+    # exactly at the cap already exhausts the entire unit gross, so the large
+    # half's per-entry share always lands strictly below cap regardless of the
+    # magnitude ratio — confirmed numerically before picking the 1-in-4 split.)
+    for n in (4, 8, 12, 20, 40):
+        large_count = n // 4
+        raw = {f"M{i:02d}": (Decimal(100) if i < large_count else Decimal(1)) for i in range(n)}
+        cases.append(raw)
+
+    # Every contract already equal (no violator should ever appear).
+    for n in (1, 4, 9, 16):
+        raw = {f"E{i:02d}": Decimal(1) for i in range(n)}
+        cases.append(raw)
+
+    # Every pattern above again, with alternating signs layered on.
+    for raw in list(cases):
+        signed = {
+            key: (value if index % 2 == 0 else -value)
+            for index, (key, value) in enumerate(raw.items())
+        }
+        cases.append(signed)
+
+    return cases
+
+
+def test_water_fill_satisfies_cap_gross_and_sign_invariants() -> None:
+    """Property test for the capping routine in isolation, independent of any
+    price-series fixture: for every case in `water_fill_cases()`, water-filling
+    the normalised raw weights to `cap = 2/n` must always produce a result whose
+    absolute values sum to exactly one, none of which exceeds the cap, and each
+    of which keeps the sign of its raw input."""
+    for raw in water_fill_cases():
+        cap = Decimal(2) / Decimal(len(raw))
+        positive_inputs = {key for key, value in raw.items() if value >= 0}
+        result = _water_fill(_normalise(raw), cap)
+        gross = sum((abs(value) for value in result.values()), Decimal(0))
+        assert abs(gross - Decimal(1)) < Decimal("0.0000000001"), raw
+        assert all(abs(value) <= cap + Decimal("0.0000000001") for value in result.values()), raw
+        assert all((value >= 0) == (key in positive_inputs) for key, value in result.items()), raw
 
 
 def test_cross_sectional_legs_are_balanced_and_sorted() -> None:

@@ -125,35 +125,45 @@ def _time_series_weights(
 def _water_fill(weights: dict[str, Decimal], cap: Decimal) -> dict[str, Decimal]:
     """Clip every weight to `cap`, redistributing the rest so gross stays exactly one.
 
-    Uncapped entries absorb whatever gross the capped ("violator") entries give up,
-    so the result satisfies both constraints exactly: no weight's absolute value
-    exceeds `cap`, and the absolute values sum to exactly one. Each round either
-    stops (no violators) or strictly grows the violator set, so this terminates
-    within `len(weights)` rounds. A violator keeps its own sign.
+    Once an entry is clipped to `cap` it is frozen there permanently and never
+    rescaled again; only entries that have never been frozen absorb the residual
+    budget. That makes the frozen set grow monotonically round over round (an
+    entry can newly join it, but never leave), so this terminates within
+    `len(weights)` rounds, and the result satisfies both constraints exactly: no
+    weight's absolute value exceeds `cap`, and the absolute values sum to exactly
+    one. A frozen entry keeps its own sign.
+
+    (An earlier version recomputed the violator set from scratch each round
+    instead of accumulating it, so an already-clipped entry could sit in "others"
+    on a later round and be rescaled back above the cap — the violator set
+    oscillated rather than grew, and the loop could exhaust its round budget
+    still over cap. Freezing cumulatively is what fixes that.)
     """
     current = dict(weights)
+    frozen: set[str] = set()
     for _ in range(len(current)):
-        violators = [key for key, value in current.items() if abs(value) > cap]
-        if not violators:
+        new_violators = [
+            key for key, value in current.items() if key not in frozen and abs(value) > cap
+        ]
+        if not new_violators:
             break
-        frozen = Decimal(len(violators)) * cap
-        if frozen >= 1:
-            # Every contract at the cap would already meet or exceed unit gross;
-            # equal weights are always feasible because cap == 2/n and 1/n <= 2/n.
-            current = {
+        frozen.update(new_violators)
+        for key in new_violators:
+            current[key] = cap if current[key] >= 0 else -cap
+        frozen_gross = Decimal(len(frozen)) * cap
+        if frozen_gross >= 1:
+            # Every frozen contract already meets or exceeds unit gross on its
+            # own; equal weights are always feasible because cap == 2/n and
+            # 1/n <= 2/n.
+            return {
                 key: (Decimal(1) if value >= 0 else Decimal(-1)) / Decimal(len(current))
                 for key, value in current.items()
             }
-            break
-        others = [key for key in current if key not in violators]
+        others = [key for key in current if key not in frozen]
         others_gross = sum(abs(current[key]) for key in others)
-        scale = (Decimal(1) - frozen) / others_gross if others_gross else Decimal(0)
-        current = {
-            key: (
-                (cap if current[key] >= 0 else -cap) if key in violators else current[key] * scale
-            )
-            for key in current
-        }
+        scale = (Decimal(1) - frozen_gross) / others_gross if others_gross else Decimal(0)
+        for key in others:
+            current[key] = current[key] * scale
     return current
 
 
