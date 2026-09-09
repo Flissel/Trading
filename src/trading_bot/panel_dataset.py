@@ -192,11 +192,13 @@ def verify_panel_dataset(dataset_root: Path) -> tuple[bool, tuple[str, ...]]:
     files = manifest.get("files")
     if not isinstance(files, list):
         return False, tuple([*errors, "MANIFEST_STRUCTURE_INVALID"])
+    listed_paths: set[str] = set()
     for entry in files:
         if not isinstance(entry, dict):
             errors.append("MANIFEST_STRUCTURE_INVALID")
             continue
         relative = str(entry.get("relative_path"))
+        listed_paths.add(relative)
         path = dataset_root / relative
         try:
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -205,6 +207,10 @@ def verify_panel_dataset(dataset_root: Path) -> tuple[bool, tuple[str, ...]]:
             continue
         if digest != entry.get("sha256"):
             errors.append(f"PARQUET_HASH_MISMATCH:{relative}")
+    for path in sorted(dataset_root.rglob("*.parquet")):
+        relative = path.relative_to(dataset_root).as_posix()
+        if relative not in listed_paths:
+            errors.append(f"UNLISTED_PARQUET_FILE:{relative}")
     return not errors, tuple(errors)
 
 

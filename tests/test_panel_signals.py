@@ -1,3 +1,4 @@
+import random
 from decimal import Decimal
 from pathlib import Path
 
@@ -111,6 +112,39 @@ def sparse_time_series_panel(days: int = 100) -> tuple[PanelBar, ...]:
     for index, amplitude in enumerate(amplitudes):
         symbol = f"M{index:03d}USDT"
         closes = oscillating_series(symbol, days, drift, amplitude)
+        rows.extend(series(symbol, closes))
+    return tuple(rows)
+
+
+def noisy_series(days: int, drift: Decimal, amplitude: Decimal, seed: int) -> list[str]:
+    """A trend with genuinely aperiodic, deterministic day-to-day noise -- unlike
+    `oscillating_series`'s day-parity square wave, whose period-2 symmetry makes its
+    realised variance invariant to a one-day window shift (any 31-day window still
+    contains exactly the same alternating +amplitude/-amplitude pattern), which would
+    make a volatility-window test built on it pass even when the window boundary
+    leaks a day it should not see."""
+    generator = random.Random(seed)
+    closes: list[str] = []
+    for day in range(days):
+        trend = Decimal(100) * (Decimal(1) + drift) ** day
+        wobble = Decimal(str(generator.uniform(-1, 1))) * amplitude
+        closes.append(str(trend * (Decimal(1) + wobble)))
+    return closes
+
+
+def volatility_window_sensitive_panel(days: int = 100) -> tuple[PanelBar, ...]:
+    """40 eligible contracts (the config's `minimum_contracts`): 35 perfectly flat
+    (zero trailing return, excluded by design, same as `sparse_time_series_panel`)
+    and 5 carrying genuinely aperiodic noise, so that `_annualised_volatility`'s
+    30-day window actually produces a different sigma when shifted by one day."""
+    rows: list[PanelBar] = []
+    for index in range(35):
+        symbol = f"F{index:03d}USDT"
+        closes = [str(Decimal(100)) for _ in range(days)]
+        rows.extend(series(symbol, closes))
+    for index in range(5):
+        symbol = f"V{index:03d}USDT"
+        closes = noisy_series(days, Decimal("0.01"), Decimal("0.05"), seed=1000 + index)
         rows.extend(series(symbol, closes))
     return tuple(rows)
 
@@ -257,3 +291,39 @@ def test_empty_universe_propagates_reason_codes() -> None:
     vectors = build_weight_vectors(histories, snapshot, spec=SPEC)
     assert vectors["xs_mom_1w"].weights == ()
     assert vectors["xs_mom_1w"].reason_codes == ("UNIVERSE_TOO_SMALL",)
+
+
+def test_weight_vectors_are_unaffected_by_a_bar_one_day_after_the_decision() -> None:
+    """Point-in-time regression test: nothing computed as of `decision` may depend on
+    whether a bar closing after it happens to be present in the history. Uses
+    `volatility_window_sensitive_panel()` rather than the smooth-compounding `panel()`
+    fixture, or the day-parity `sparse_time_series_panel()`, deliberately: both of
+    those have realised variance that is invariant to a one-day window shift (zero
+    variance throughout, respectively perfect period-2 symmetry), so neither can
+    exercise `_annualised_volatility`'s window boundary at all -- the aperiodic noise
+    here gives genuine day-to-day variance, so a shifted volatility window actually
+    changes sigma. The fixture carries 100 days per contract (index 0..99); the
+    decision below lands on day 98's close, so day 99's bar closes exactly one day
+    later. Comparing the full fixture against the same fixture with that one trailing
+    bar removed isolates exactly the leakage this guards against: `_trailing_returns`
+    reading `decision_close_ns + DAY_NS` instead of `decision_close_ns`, or
+    `_annualised_volatility`'s window filter admitting a bar one day past the
+    boundary."""
+    decision = 99 * DAY_NS - 1_000_000
+    with_future_bar = volatility_window_sensitive_panel()
+    without_future_bar = tuple(bar for bar in with_future_bar if bar.close_time_ns <= decision)
+    # Sanity: the fixture actually has a bar strictly after `decision` to drop.
+    assert any(bar.close_time_ns > decision for bar in with_future_bar)
+    assert all(bar.close_time_ns <= decision for bar in without_future_bar)
+
+    histories_with = build_contract_histories(with_future_bar)
+    histories_without = build_contract_histories(without_future_bar)
+    snapshot_with = select_universe(histories_with, decision_close_ns=decision, rules=SPEC.universe)
+    snapshot_without = select_universe(
+        histories_without, decision_close_ns=decision, rules=SPEC.universe
+    )
+    assert snapshot_with == snapshot_without
+
+    vectors_with = build_weight_vectors(histories_with, snapshot_with, spec=SPEC)
+    vectors_without = build_weight_vectors(histories_without, snapshot_without, spec=SPEC)
+    assert vectors_with == vectors_without

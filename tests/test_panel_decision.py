@@ -495,6 +495,18 @@ def test_missing_fold_index_is_rejected(tmp_path: Path) -> None:
     assert "missing fold index(es) 3" in str(excinfo.value)
 
 
+def test_pooled_episode_count_mismatch_is_rejected(tmp_path: Path) -> None:
+    # Only xs_mom_4w is given a shorter per-fold episode list (30 instead of the
+    # default EPISODES_PER_FOLD=40); every other candidate falls back to the default
+    # 40/fold. That makes xs_mom_4w's pooled episode count (180) disagree with every
+    # other candidate's (240), which the shared-episode-count invariant must reject
+    # before any economic gate is evaluated.
+    per_fold_base = {index: {"xs_mom_4w": ["0.01"] * 30} for index in range(6)}
+    per_fold_adverse = {index: {"xs_mom_4w": ["0.001"] * 30} for index in range(6)}
+    with pytest.raises(PanelDecisionError, match="pooled episode count"):
+        build_with_fold_episodes(tmp_path, per_fold_base, per_fold_adverse)
+
+
 def test_tampered_report_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "fold0.json"
     write_fold(path, 0, {})

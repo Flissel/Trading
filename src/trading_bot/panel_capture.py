@@ -39,6 +39,16 @@ class PanelCaptureError(RuntimeError):
     """Raised when panel capture fails closed."""
 
 
+class PanelSourceAbsent(PanelCaptureError):
+    """Raised when one (symbol, month, kind) source dump does not exist upstream.
+
+    A 404 from the public dumps means the contract was not yet listed or was
+    already delisted for that month -- a normal, expected condition for a
+    survivorship-bias-free panel, not an outage. Callers should record the
+    absence and continue rather than aborting the capture.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class PanelPayload:
     url: str
@@ -71,7 +81,11 @@ class PanelZipClient:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 _validate_panel_url(response.geturl())
                 raw = response.read(_MAX_ZIP_BYTES + 1)
-        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                raise PanelSourceAbsent(f"panel dump is absent: {error}") from error
+            raise PanelCaptureError(f"panel dump request failed: {error}") from error
+        except (urllib.error.URLError, TimeoutError) as error:
             raise PanelCaptureError(f"panel dump request failed: {error}") from error
         if len(raw) > _MAX_ZIP_BYTES:
             raise PanelCaptureError("panel dump exceeds the byte limit")
@@ -174,12 +188,25 @@ def capture_panel(
     candles: list[PanelCandleRow] = []
     funding: list[PanelFundingRow] = []
     for symbol in symbols:
+        symbol_candle_row_count = 0
         for month in months:
             for kind, url in (
                 ("klines", build_kline_zip_url(symbol, month)),
                 ("fundingRate", build_funding_zip_url(symbol, month)),
             ):
-                payload = download(url)
+                try:
+                    payload = download(url)
+                except PanelSourceAbsent:
+                    sources.append(
+                        {
+                            "symbol": symbol,
+                            "month": month,
+                            "kind": kind,
+                            "url": url,
+                            "status": "absent",
+                        }
+                    )
+                    continue
                 _validate_panel_url(payload.url)
                 relative = f"raw/{symbol}/{kind}-{month}.zip"
                 path = target / relative
@@ -194,12 +221,19 @@ def capture_panel(
                         "received_time_ns": payload.received_time_ns,
                         "raw_relative_path": relative,
                         "raw_sha256": hashlib.sha256(payload.raw_bytes).hexdigest(),
+                        "status": "present",
                     }
                 )
                 if kind == "klines":
-                    candles.extend(parse_kline_zip(payload, symbol=symbol))
+                    rows = parse_kline_zip(payload, symbol=symbol)
+                    candles.extend(rows)
+                    symbol_candle_row_count += len(rows)
                 else:
                     funding.extend(parse_funding_zip(payload, symbol=symbol))
+        if symbol_candle_row_count == 0:
+            raise PanelCaptureError(
+                f"symbol {symbol} produced no candle rows across every requested month"
+            )
     if not raw_root.is_dir():
         raise PanelCaptureError("panel capture produced no raw payloads")
 
@@ -207,7 +241,9 @@ def capture_panel(
         tuple(candles),
         tuple(funding),
         output_directory=target / "dataset",
-        raw_source_hashes=tuple(str(item["raw_sha256"]) for item in sources),
+        raw_source_hashes=tuple(
+            str(item["raw_sha256"]) for item in sources if item.get("status") == "present"
+        ),
     )
     material: dict[str, object] = {
         "capture_version": "1.0.0",
@@ -251,6 +287,8 @@ def verify_panel_capture(capture_root: Path) -> tuple[bool, tuple[str, ...]]:
     for entry in sources:
         if not isinstance(entry, dict):
             errors.append("MANIFEST_STRUCTURE_INVALID")
+            continue
+        if entry.get("status") == "absent":
             continue
         relative = str(entry.get("raw_relative_path"))
         try:

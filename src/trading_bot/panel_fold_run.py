@@ -136,6 +136,15 @@ def run_panel_fold(
         reason_codes.append("SKIPPED_WEEK_EXIT_COST_UNCHARGED")
     if episode_count == 0:
         reason_codes.append("NO_EPISODES_IN_FOLD")
+    else:
+        # The carried position resets to empty at fold start, so the first
+        # episode always pays a full entry turnover -- but the last episode's
+        # position is never closed out, so it pays no exit. This is one side
+        # of unit gross per fold, uncharged, always in the favourable
+        # direction. Accounting semantics are pre-registered and must not
+        # change to start charging it; this reason code only makes the
+        # omission visible.
+        reason_codes.append("FOLD_FINAL_EXIT_COST_UNCHARGED")
 
     member_names = {member.name for member in spec.members}
     candidates = [

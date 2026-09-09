@@ -155,3 +155,36 @@ def test_tampering_is_detected(tmp_path: Path) -> None:
     valid, errors = verify_panel_dataset(artifact.dataset_root)
     assert not valid
     assert any(error.startswith("PARQUET_HASH_MISMATCH") for error in errors)
+
+
+def test_unlisted_parquet_file_is_detected(tmp_path: Path) -> None:
+    # Simulates copying a partition to a new instrument directory: the manifest
+    # still hashes and verifies every file it lists, but `load_panel_bars` globs the
+    # whole tree, so an unlisted file would silently be picked up by the reader while
+    # verification kept reporting valid. `verify_panel_dataset` must walk the dataset
+    # root and flag any parquet file the manifest does not know about.
+    artifact = publish_panel_dataset(
+        (candle("BTCUSDT", 0),),
+        (),
+        output_directory=tmp_path / "d",
+        raw_source_hashes=SOURCE_HASHES,
+    )
+    original = (
+        artifact.dataset_root
+        / "dataset=daily_candles"
+        / "venue=BINANCE_UM"
+        / "instrument=BTCUSDT"
+        / "part-00000.parquet"
+    )
+    smuggled_dir = (
+        artifact.dataset_root
+        / "dataset=daily_candles"
+        / "venue=BINANCE_UM"
+        / "instrument=ETHUSDT"
+    )
+    smuggled_dir.mkdir(parents=True)
+    (smuggled_dir / "part-00000.parquet").write_bytes(original.read_bytes())
+
+    valid, errors = verify_panel_dataset(artifact.dataset_root)
+    assert not valid
+    assert any(error.startswith("UNLISTED_PARQUET_FILE") for error in errors)

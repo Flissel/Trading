@@ -7,10 +7,15 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from trading_bot import panel_fold_run as panel_fold_run_module
+from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_capture import PanelPayload, capture_panel
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_fold_run import PanelFoldError, run_panel_fold, verify_panel_fold_report
+from trading_bot.panel_reader import load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
+from trading_bot.panel_signals import build_weight_vectors
+from trading_bot.panel_universe import build_contract_histories, select_universe
 from trading_bot.registry import MetadataRegistry
 
 DAY_MS = 86_400_000
@@ -377,3 +382,135 @@ def test_family_spec_mismatch_is_rejected(workspace: tuple[Path, Path, Path]) ->
             registry_path=root / "registry.sqlite3",
             fold_index=0,
         )
+
+
+def _rewrite_manifest_field(path: Path, key: str, value: object) -> None:
+    """Tamper one field of a published manifest and re-derive `manifest_hash` so the
+    file stays internally self-consistent (passes `verify_panel_manifest`) while
+    carrying a value that no longer matches its source-of-truth elsewhere -- isolating
+    whichever downstream linkage check is under test."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document[key] = value
+    material = {k: v for k, v in document.items() if k != "manifest_hash"}
+    document["manifest_hash"] = content_sha256(material)
+    path.write_bytes(canonical_json(document))
+
+
+def test_capture_root_hash_linkage_is_enforced(workspace: tuple[Path, Path, Path]) -> None:
+    root, capture_root, config_path = workspace
+    _rewrite_manifest_field(root / "manifest.json", "capture_root_hash", "0" * 64)
+    with pytest.raises(PanelFoldError, match="not linked to this capture"):
+        run_panel_fold(
+            capture_root,
+            manifest_path=root / "manifest.json",
+            family_spec_path=config_path,
+            output_path=root / "fold0.json",
+            registry_path=root / "registry.sqlite3",
+            fold_index=0,
+        )
+
+
+def test_dataset_root_hash_linkage_is_enforced(workspace: tuple[Path, Path, Path]) -> None:
+    root, capture_root, config_path = workspace
+    _rewrite_manifest_field(root / "manifest.json", "dataset_root_hash", "0" * 64)
+    with pytest.raises(PanelFoldError, match="not linked to this dataset"):
+        run_panel_fold(
+            capture_root,
+            manifest_path=root / "manifest.json",
+            family_spec_path=config_path,
+            output_path=root / "fold0.json",
+            registry_path=root / "registry.sqlite3",
+            fold_index=0,
+        )
+
+
+def test_uncharged_final_exit_reason_code_is_recorded(
+    workspace: tuple[Path, Path, Path],
+) -> None:
+    """The fold's carried position resets to empty at fold start (so the first
+    episode pays a full entry turnover) but the last episode's position is never
+    closed out (so it pays no exit) -- one side of unit gross, uncharged, always in
+    the favourable direction. Pre-registered accounting semantics must not change to
+    start charging it, but the omission must be visible in the report."""
+    root, capture_root, config_path = workspace
+    artifact = run_panel_fold(
+        capture_root,
+        manifest_path=root / "manifest.json",
+        family_spec_path=config_path,
+        output_path=root / "fold0.json",
+        registry_path=root / "registry.sqlite3",
+        fold_index=0,
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    assert artifact.episode_count > 0
+    assert "FOLD_FINAL_EXIT_COST_UNCHARGED" in document["reason_codes"]
+
+
+def test_universe_and_weights_are_point_in_time_across_the_fold(
+    workspace: tuple[Path, Path, Path],
+) -> None:
+    """Regression test for the point-in-time guarantee `run_panel_fold` relies on:
+    for every test decision of fold 0, `select_universe` and `build_weight_vectors`
+    must return identical results whether given the fold-wide histories `run_panel_
+    fold` actually loads, or histories truncated to bars closing at or before that
+    one decision. The truncated histories are built by filtering the already-loaded
+    bars (never by re-reading), matching how `run_panel_fold` builds its own
+    histories once per fold rather than once per decision."""
+    root, capture_root, config_path = workspace
+    spec, _ = load_panel_family_spec(config_path)
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    fold0 = next(item for item in manifest["folds"] if item["fold_index"] == 0)
+    test_end_ns = int(fold0["test_end_ns"])
+    bars = load_panel_bars(capture_root / "dataset", available_before_ns=test_end_ns + 1)
+    fold_wide_histories = build_contract_histories(bars)
+    decisions = sorted(int(value.split(":")[1]) for value in fold0["test_ids"])
+    assert decisions  # sanity: the fixture fold actually has test decisions
+
+    for decision_close_ns in decisions:
+        truncated_bars = tuple(bar for bar in bars if bar.close_time_ns <= decision_close_ns)
+        truncated_histories = build_contract_histories(truncated_bars)
+
+        full_snapshot = select_universe(
+            fold_wide_histories, decision_close_ns=decision_close_ns, rules=spec.universe
+        )
+        truncated_snapshot = select_universe(
+            truncated_histories, decision_close_ns=decision_close_ns, rules=spec.universe
+        )
+        assert truncated_snapshot == full_snapshot
+
+        full_vectors = build_weight_vectors(fold_wide_histories, full_snapshot, spec=spec)
+        truncated_vectors = build_weight_vectors(
+            truncated_histories, truncated_snapshot, spec=spec
+        )
+        assert truncated_vectors == full_vectors
+
+
+def test_fold_wide_bars_are_bounded_exactly_at_the_test_end_boundary(
+    workspace: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pins the exact availability boundary `run_panel_fold` uses to load its
+    fold-wide bars. Widening `test_end_ns + 1` by even a day would extend the fold's
+    information set past its test boundary -- into the embargo gap or beyond -- with
+    no visible symptom other than this pin breaking."""
+    root, capture_root, config_path = workspace
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    fold0 = next(item for item in manifest["folds"] if item["fold_index"] == 0)
+    test_end_ns = int(fold0["test_end_ns"])
+
+    original_load_panel_bars = load_panel_bars
+    captured_boundaries: list[int | None] = []
+
+    def spy(dataset_root: Path, *, available_before_ns: int | None = None) -> object:
+        captured_boundaries.append(available_before_ns)
+        return original_load_panel_bars(dataset_root, available_before_ns=available_before_ns)
+
+    monkeypatch.setattr(panel_fold_run_module, "load_panel_bars", spy)
+    run_panel_fold(
+        capture_root,
+        manifest_path=root / "manifest.json",
+        family_spec_path=config_path,
+        output_path=root / "fold0.json",
+        registry_path=root / "registry.sqlite3",
+        fold_index=0,
+    )
+    assert captured_boundaries == [test_end_ns + 1]

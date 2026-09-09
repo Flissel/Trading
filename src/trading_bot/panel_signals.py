@@ -123,15 +123,16 @@ def _time_series_weights(
 
 
 def _water_fill(weights: dict[str, Decimal], cap: Decimal) -> dict[str, Decimal]:
-    """Clip every weight to `cap`, redistributing the rest so gross stays exactly one.
+    """Clip every weight to `cap`, redistributing the rest so gross stays at one.
 
     Once an entry is clipped to `cap` it is frozen there permanently and never
     rescaled again; only entries that have never been frozen absorb the residual
     budget. That makes the frozen set grow monotonically round over round (an
     entry can newly join it, but never leave), so this terminates within
-    `len(weights)` rounds, and the result satisfies both constraints exactly: no
-    weight's absolute value exceeds `cap`, and the absolute values sum to exactly
-    one. A frozen entry keeps its own sign.
+    `len(weights)` rounds, and the result satisfies both constraints: no
+    weight's absolute value exceeds `cap`, and the absolute values sum to one
+    within Decimal precision (Decimal division is not exact, so the gross is
+    one to roughly 1e-27, not exactly one). A frozen entry keeps its own sign.
 
     (An earlier version recomputed the violator set from scratch each round
     instead of accumulating it, so an already-clipped entry could sit in "others"

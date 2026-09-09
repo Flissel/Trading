@@ -1,20 +1,26 @@
+import io
+import json
+import zipfile
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
 
 import pytest
 
+from trading_bot.panel_capture import PanelPayload, capture_panel
 from trading_bot.panel_config import PanelFoldGeometry, load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
 from trading_bot.panel_samples import (
     PanelSamplesError,
     build_rebalance_samples,
     derive_panel_config,
+    publish_panel_walk_forward,
     rebalance_close_times,
 )
 from trading_bot.splits import build_walk_forward_views
 
 DAY_NS = 86_400_000_000_000
+DAY_MS = 86_400_000
 SPEC, _ = load_panel_family_spec(Path("configs/xs-momentum-panel-v1.json"))
 
 
@@ -93,3 +99,78 @@ def test_short_history_is_rejected() -> None:
     samples = build_rebalance_samples(tuple(bar(index) for index in range(10)), holding_days=7)
     with pytest.raises(PanelSamplesError):
         derive_panel_config(samples, folds=SPEC.folds)
+
+
+_FLOOR_TEST_MONTHS = ("2020-01", "2020-02", "2020-03")
+_FLOOR_TEST_MONTH_START_DAY = {"2020-01": 0, "2020-02": 31, "2020-03": 60}
+_FLOOR_TEST_MONTH_DAYS = {"2020-01": 31, "2020-02": 29, "2020-03": 31}
+_FLOOR_TEST_KLINE_HEADER = (
+    "open_time,open,high,low,close,volume,close_time,quote_volume,count,"
+    "taker_buy_volume,taker_buy_quote_volume,ignore"
+)
+
+
+def _zip_bytes(name: str, text: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(name, text)
+    return buffer.getvalue()
+
+
+def _floor_test_kline_csv(month: str) -> str:
+    lines = [_FLOOR_TEST_KLINE_HEADER]
+    for offset in range(_FLOOR_TEST_MONTH_DAYS[month]):
+        day = _FLOOR_TEST_MONTH_START_DAY[month] + offset
+        open_ms = day * DAY_MS
+        lines.append(
+            f"{open_ms},100,101,99,100,10,{open_ms + DAY_MS - 1},50000000,100,50,25000000,0"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _floor_test_fetch(url: str) -> PanelPayload:
+    month = next(item for item in _FLOOR_TEST_MONTHS if item in url)
+    if "fundingRate" in url:
+        text = "calc_time,funding_interval_hours,last_funding_rate\n0,8,0.0001\n"
+        return PanelPayload(url=url, raw_bytes=_zip_bytes("f.csv", text), received_time_ns=1)
+    return PanelPayload(
+        url=url, raw_bytes=_zip_bytes("k.csv", _floor_test_kline_csv(month)), received_time_ns=1
+    )
+
+
+def test_pooled_sample_floor_is_enforced(tmp_path: Path) -> None:
+    # Three months of daily data (91 days, ~13 weekly Sundays) under a tiny fold
+    # geometry produces a real, complete fold -- so the earlier "no complete fold"
+    # guard does not fire -- but that fold pools only 2 test samples, far under an
+    # inflated `pooled_episode_floor` of 1000. This is the INSUFFICIENT_EVIDENCE
+    # guard in `publish_panel_walk_forward`, confirmed by mutation to be undetected
+    # by the rest of the suite.
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=_FLOOR_TEST_MONTHS,
+        fetch=_floor_test_fetch,
+    )
+    document = json.loads(Path("configs/xs-momentum-panel-v1.json").read_text(encoding="utf-8"))
+    document["folds"] = {
+        "train_duration_ns": 20 * DAY_NS,
+        "validation_duration_ns": 7 * DAY_NS,
+        "test_duration_ns": 14 * DAY_NS,
+        "step_ns": 14 * DAY_NS,
+        "embargo_ns": 7 * DAY_NS,
+        "holdout_duration_ns": 14 * DAY_NS,
+    }
+    document["statistics"]["pooled_episode_floor"] = 1000
+    config_path = tmp_path / "tiny-panel.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    spec, spec_hash = load_panel_family_spec(config_path)
+
+    with pytest.raises(PanelSamplesError, match="INSUFFICIENT_EVIDENCE"):
+        publish_panel_walk_forward(
+            tmp_path / "capture",
+            output_path=tmp_path / "manifest.json",
+            spec=spec,
+            family_spec_hash=spec_hash,
+        )
