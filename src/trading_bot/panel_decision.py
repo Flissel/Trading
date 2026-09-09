@@ -106,6 +106,9 @@ def build_panel_decision(
     pooled: dict[str, _Pooled] = {
         name: _pool(documents, name) for name in member_names + control_names
     }
+    episode_counts = {pooled[name].episode_count for name in member_names + control_names}
+    if len(episode_counts) != 1:
+        raise PanelDecisionError("candidates do not share one pooled episode count")
     fold_count = len(documents)
 
     tests: dict[str, BootstrapMeanTest] = {}
