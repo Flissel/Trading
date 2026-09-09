@@ -212,28 +212,21 @@ class MetadataRegistry:
         )
         return None if row is None else _experiment_from_row(row)
 
-    def list_experiments(self, family_id: UUID | None = None) -> tuple[ExperimentRecord, ...]:
-        connection = self._require_connection()
-        if family_id is None:
-            rows = connection.execute(
+    def list_experiments(self, family_id: UUID) -> tuple[ExperimentRecord, ...]:
+        rows = (
+            self._require_connection()
+            .execute(
                 """
-                SELECT experiment_id, family_id, candidate_name, hypothesis,
-                       split_manifest_hash, code_hash, random_seed, outcome,
-                       result_hash, failure_reason, created_at_ns
-                FROM experiments ORDER BY candidate_name, experiment_id
-                """
-            ).fetchall()
-        else:
-            rows = connection.execute(
-                """
-                SELECT experiment_id, family_id, candidate_name, hypothesis,
-                       split_manifest_hash, code_hash, random_seed, outcome,
-                       result_hash, failure_reason, created_at_ns
-                FROM experiments WHERE family_id = ?
-                ORDER BY created_at_ns, experiment_id
-                """,
+            SELECT experiment_id, family_id, candidate_name, hypothesis,
+                   split_manifest_hash, code_hash, random_seed, outcome,
+                   result_hash, failure_reason, created_at_ns
+            FROM experiments WHERE family_id = ?
+            ORDER BY created_at_ns, experiment_id
+            """,
                 (str(family_id),),
-            ).fetchall()
+            )
+            .fetchall()
+        )
         return tuple(_experiment_from_row(row) for row in rows)
 
     def _require_connection(self) -> sqlite3.Connection:

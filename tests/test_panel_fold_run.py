@@ -2,6 +2,7 @@ import io
 import json
 import zipfile
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
@@ -200,8 +201,10 @@ def test_members_are_registered(workspace: tuple[Path, Path, Path]) -> None:
         registry_path=root / "registry.sqlite3",
         fold_index=0,
     )
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    family_id = uuid5(NAMESPACE_URL, f"{manifest['split_manifest_hash']}:xs_momentum_panel_v1")
     with MetadataRegistry(root / "registry.sqlite3") as registry:
-        rows = registry.list_experiments()
+        rows = registry.list_experiments(family_id)
     assert {row.candidate_name for row in rows} == {
         "xs_mom_1w",
         "xs_mom_4w",
@@ -211,6 +214,7 @@ def test_members_are_registered(workspace: tuple[Path, Path, Path]) -> None:
         "xs_rev_1w",
     }
     assert all(row.outcome == "completed" for row in rows)
+    assert all(row.family_id == family_id for row in rows)
 
 
 def test_report_is_immutable(workspace: tuple[Path, Path, Path]) -> None:
