@@ -12,6 +12,7 @@ from trading_bot.panel_samples import (
     derive_panel_config,
     rebalance_close_times,
 )
+from trading_bot.splits import build_walk_forward_views
 
 DAY_NS = 86_400_000_000_000
 SPEC, _ = load_panel_family_spec(Path("configs/xs-momentum-panel-v1.json"))
@@ -62,6 +63,30 @@ def test_config_places_the_holdout_at_the_end() -> None:
     config = derive_panel_config(samples, folds=geometry)
     assert config.final_holdout_start_ns < samples[-1].decision_time_ns
     assert config.final_holdout_start_ns > samples[0].decision_time_ns
+
+
+def test_holdout_is_disjoint_from_every_fold_partition() -> None:
+    bars = tuple(bar(index) for index in range(400))
+    samples = build_rebalance_samples(bars, holding_days=7)
+    geometry = PanelFoldGeometry(
+        train_duration_ns=100 * DAY_NS,
+        validation_duration_ns=20 * DAY_NS,
+        test_duration_ns=40 * DAY_NS,
+        step_ns=40 * DAY_NS,
+        embargo_ns=14 * DAY_NS,
+        holdout_duration_ns=40 * DAY_NS,
+    )
+    config = derive_panel_config(samples, folds=geometry)
+    views = build_walk_forward_views(list(samples), config)
+    holdout_ids = set(views.final_holdout_ids)
+    fold_ids = {
+        sample_id
+        for fold in views.folds
+        for sample_id in (*fold.train_ids, *fold.validation_ids, *fold.test_ids)
+    }
+    # A non-empty holdout guards against the disjointness check passing vacuously.
+    assert holdout_ids
+    assert holdout_ids.isdisjoint(fold_ids)
 
 
 def test_short_history_is_rejected() -> None:
