@@ -309,6 +309,32 @@ Acceptance:
 - operational incidents and model drift are included;
 - the output is a promotion recommendation, never automatic live activation.
 
+### P1.27 Cross-sectional daily momentum family
+
+Evaluate the pre-registered family `xs_momentum_panel_v1` on a Binance USD-M
+USDT-perpetual panel with weekly holding, under
+`docs/superpowers/specs/2026-09-08-xs-momentum-family-design.md` and section 16
+of the evaluation protocol.
+
+Acceptance:
+
+- the capture verifies, and no contract has more than 3 missing days inside its
+  listed span;
+- the manifest publishes at least the declared fold geometry and the pooled
+  out-of-sample episode count reaches 200, otherwise the family stops at
+  `INSUFFICIENT_EVIDENCE`;
+- all six members and three controls are evaluated on every fold in one
+  invocation per fold;
+- a member is `eligible_for_further_review` only with a positive pooled base
+  mean, a positive 95% block-bootstrap lower bound, a non-negative pooled
+  adverse mean, positive base PnL in at least two thirds of folds, a
+  Benjamini-Hochberg q of 0.10 or less within the six, no fold, contract or
+  episode above half of pooled base net PnL, and dominance over the strongest
+  control under both cost scenarios;
+- the decision report and a root-level `P1_27_DECISION_<date>.md` record every
+  member, including the rejected ones, with turnover and deflated Sharpe;
+- the final holdout stays closed.
+
 ## Explicitly deferred
 
 - real-capital execution;
