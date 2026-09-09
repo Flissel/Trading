@@ -256,3 +256,124 @@ def test_exit_only_contract_uses_its_universe_tier_and_defaults_to_tier_two_when
     untiered_net = dict(untiered.contract_net_contributions)
     assert untiered_net["C:0"] == Decimal("-0.00045")
     assert sum(untiered_net.values(), Decimal(0)) == untiered.net_return
+
+
+def test_forced_close_uses_the_later_of_two_available_bars_and_charges_full_cost() -> None:
+    # B:0 has two bars strictly inside the week, at different prices, and no bar at
+    # the exit time. The exit price must come from the later one (day 6: 88), not
+    # the earlier one (day 3: 92) -- those give different, distinguishable returns.
+    result = evaluate_episode(
+        sample_id="BINANCE_UM:1:w1",
+        member="xs_mom_1w",
+        decision_close_ns=DECISION,
+        holding_days=7,
+        weights=WEIGHTS,
+        previous_weights=(),
+        histories={
+            "A:0": history("A:0", {DECISION: "100", NEXT: "110"}),
+            "B:0": history(
+                "B:0",
+                {
+                    DECISION: "100",
+                    DECISION + 3 * DAY_NS: "92",
+                    DECISION + 6 * DAY_NS: "88",
+                },
+            ),
+        },
+        tiers=TIERS,
+        funding_by_contract={},
+        cost_table=BASE,
+    )
+    assert result.forced_close_count == 1
+    # r_B = 88/100 - 1 = -0.12 (using the day-3 bar of 92 would give -0.08 and a
+    # contribution of 0.04, not 0.06 -- this is what distinguishes "last" from "first").
+    assert dict(result.contract_contributions)["B:0"] == Decimal("0.06")
+    assert dict(result.drifted_weights)["B:0"] == Decimal("0")
+
+    # Both legs turn over fully from an empty previous_weights (tier 1, 5 + 5 = 10 bps):
+    # trading_cost = (0.5 + 0.5) * 10 / 10_000 = 0.001. B:0 additionally pays one forced
+    # extra side: 0.5 * 10 / 10_000 * forced_close_multiplier(1) = 0.0005. The two costs
+    # are additive, not exclusive: B:0 is charged its ordinary entry turnover *and* the
+    # forced exit side.
+    assert result.trading_cost == Decimal("0.001")
+    assert result.forced_close_cost == Decimal("0.0005")
+    # gross_return = 0.5*0.10 + (-0.5)*(-0.12) = 0.05 + 0.06 = 0.11
+    # net_return = 0.11 - 0.001 (trading) - 0 (funding) - 0.0005 (forced) = 0.1085
+    assert result.net_return == Decimal("0.1085")
+
+
+def test_funding_event_at_decision_boundary_excluded_at_exit_boundary_included() -> None:
+    at_decision = evaluate_episode(
+        sample_id="BINANCE_UM:1:w1",
+        member="xs_mom_1w",
+        decision_close_ns=DECISION,
+        holding_days=7,
+        weights=WEIGHTS,
+        previous_weights=(),
+        histories=histories(),
+        tiers=TIERS,
+        funding_by_contract={
+            "A:0": (
+                FundingEvent(
+                    contract_id="A:0",
+                    instrument_id="A",
+                    calc_time_ns=DECISION,
+                    rate=Decimal("0.002"),
+                ),
+            )
+        },
+        cost_table=BASE,
+    )
+    assert at_decision.funding_cost == Decimal("0")
+
+    at_exit = evaluate_episode(
+        sample_id="BINANCE_UM:1:w1",
+        member="xs_mom_1w",
+        decision_close_ns=DECISION,
+        holding_days=7,
+        weights=WEIGHTS,
+        previous_weights=(),
+        histories=histories(),
+        tiers=TIERS,
+        funding_by_contract={
+            "A:0": (
+                FundingEvent(
+                    contract_id="A:0",
+                    instrument_id="A",
+                    calc_time_ns=NEXT,
+                    rate=Decimal("0.002"),
+                ),
+            )
+        },
+        cost_table=BASE,
+    )
+    # 0.5 * 0.002 = 0.001, positive term (payment), multiplier 1 (base)
+    assert at_exit.funding_cost == Decimal("0.001")
+
+
+def test_total_loss_on_a_fully_invested_vector_zeroes_every_drifted_weight() -> None:
+    # A fully invested, two-leg vector (weights sum to 1) where both legs go to zero:
+    # gross_return = 0.5*(-1) + 0.5*(-1) = -1, so 1 + gross_return == 0 exactly.
+    result = evaluate_episode(
+        sample_id="BINANCE_UM:1:w1",
+        member="xs_mom_1w",
+        decision_close_ns=DECISION,
+        holding_days=7,
+        weights=(("A:0", Decimal("0.5")), ("B:0", Decimal("0.5"))),
+        previous_weights=(),
+        histories={
+            "A:0": history("A:0", {DECISION: "100", NEXT: "0"}),
+            "B:0": history("B:0", {DECISION: "100", NEXT: "0"}),
+        },
+        tiers={"A:0": 1, "B:0": 1},
+        funding_by_contract={},
+        cost_table=BASE,
+    )
+    assert result.gross_return == Decimal("-1")
+    # Both legs have a real bar at the exit time, so this is a total loss, not a
+    # forced close -- the zero drifted weights below must come from the
+    # denominator guard, not from the forced-close branch.
+    assert result.forced_close_count == 0
+    drifted = dict(result.drifted_weights)
+    assert drifted["A:0"] == Decimal("0")
+    assert drifted["B:0"] == Decimal("0")
