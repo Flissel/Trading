@@ -42,11 +42,23 @@ def deflated_sharpe_ratio(
 
     values = [float(value) for value in net_returns]
     mean = sum(values) / observations
-    variance = sum((value - mean) ** 2 for value in values) / (observations - 1)
-    deviation = math.sqrt(variance)
-    skewness = sum(((value - mean) / deviation) ** 3 for value in values) / observations
-    kurtosis = sum(((value - mean) / deviation) ** 4 for value in values) / observations
-    observed = mean / deviation
+    sample_variance = sum((value - mean) ** 2 for value in values) / (observations - 1)
+    sample_deviation = math.sqrt(sample_variance)
+    observed = mean / sample_deviation
+
+    # Skewness and kurtosis are standardised population moments: both the deviation
+    # they are divided by and the average over the powers use the same divisor T, so
+    # the two stay self-consistent (this is scipy.stats.skew/kurtosis's convention).
+    # The Sharpe ratio above stays on the sample (T-1) deviation deliberately -- it is
+    # a distinct quantity, and sharpe_ratio()/Task 11's trial Sharpes use that form.
+    population_variance = sum((value - mean) ** 2 for value in values) / observations
+    population_deviation = math.sqrt(population_variance)
+    skewness = (
+        sum(((value - mean) / population_deviation) ** 3 for value in values) / observations
+    )
+    kurtosis = (
+        sum(((value - mean) / population_deviation) ** 4 for value in values) / observations
+    )
 
     trials = [float(value) for value in trial_sharpes]
     trial_mean = sum(trials) / len(trials)

@@ -50,3 +50,9 @@ def test_deflated_sharpe_needs_at_least_two_trials() -> None:
     series = alternating("0.01", "0.02", 50)
     with pytest.raises(PanelStatisticsError):
         deflated_sharpe_ratio(series, trial_sharpes=(Decimal("0.5"),))
+
+
+def test_deflated_sharpe_needs_at_least_three_observations() -> None:
+    series = alternating("0.01", "0.02", 2)
+    with pytest.raises(PanelStatisticsError):
+        deflated_sharpe_ratio(series, trial_sharpes=(Decimal("0.1"), Decimal("0.2")))
