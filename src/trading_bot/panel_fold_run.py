@@ -182,7 +182,7 @@ def run_panel_fold(
     temporary.write_bytes(canonical_json(document))
     temporary.replace(output_path)
 
-    _register(spec, family_spec_hash, manifest, report_hash, registry_path)
+    _register(spec, manifest, report_hash, registry_path)
     return PanelFoldArtifact(
         output_path=output_path,
         report_hash=report_hash,
@@ -228,7 +228,6 @@ def _scenario_record(results: list[EpisodeResult]) -> dict[str, object]:
 
 def _register(
     spec: PanelFamilySpec,
-    family_spec_hash: str,
     manifest: dict[str, object],
     report_hash: str,
     registry_path: Path,
@@ -256,7 +255,6 @@ def _register(
                     created_at_ns=created_at_ns,
                 )
             )
-        _ = family_spec_hash
 
 
 def _code_hash() -> str:
