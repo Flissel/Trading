@@ -10,6 +10,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -124,6 +125,29 @@ def build_funding_zip_url(symbol: str, month: str) -> str:
     )
 
 
+def build_month_listing_url(symbol: str, kind: str) -> str:
+    prefix = _listing_prefix(symbol, kind)
+    encoded_prefix = urllib.parse.quote(prefix, safe="")
+    url = (
+        "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
+        f"?list-type=2&max-keys=1000&prefix={encoded_prefix}"
+    )
+    _validate_panel_url(url)
+    return url
+
+
+def discover_panel_months(fetch: PanelFetch, *, symbol: str, kind: str) -> tuple[str, ...]:
+    """Ask the bucket which months a symbol actually has for one source kind.
+
+    A symbol has at most about eighty months of history, so a single page of
+    up to 1000 keys always suffices; a response that reports itself as
+    truncated is treated as a hard failure rather than a silent partial list.
+    """
+    url = build_month_listing_url(symbol, kind)
+    payload = fetch(url)
+    return _parse_listing_months(payload.raw_bytes, symbol=symbol, kind=kind)
+
+
 def parse_kline_zip(payload: PanelPayload, *, symbol: str) -> tuple[PanelCandleRow, ...]:
     digest = hashlib.sha256(payload.raw_bytes).hexdigest()
     rows: list[PanelCandleRow] = []
@@ -180,11 +204,24 @@ def capture_panel(
     output_directory: Path,
     reserve_bytes: int,
     symbols: tuple[str, ...],
-    months: tuple[str, ...],
+    months: tuple[str, ...] | None = None,
+    month_from: str | None = None,
+    month_to: str | None = None,
     fetch: PanelFetch | None = None,
 ) -> PanelCaptureArtifact:
-    if not symbols or not months:
+    if not symbols:
         raise PanelCaptureError("panel capture needs at least one symbol and one month")
+    if months is not None:
+        if not months:
+            raise PanelCaptureError("panel capture needs at least one symbol and one month")
+        for month in months:
+            _validate_month(month)
+    if month_from is not None:
+        _validate_month(month_from)
+    if month_to is not None:
+        _validate_month(month_to)
+    if month_from is not None and month_to is not None and month_from > month_to:
+        raise PanelCaptureError("month_from must not be after month_to")
     workspace = workspace_root.resolve()
     target = output_directory.resolve()
     StoragePolicy(workspace, reserve_bytes).authorize(
@@ -203,11 +240,30 @@ def capture_panel(
     funding: list[PanelFundingRow] = []
     for symbol in symbols:
         symbol_candle_row_count = 0
-        for month in months:
-            for kind, url in (
-                ("klines", build_kline_zip_url(symbol, month)),
-                ("fundingRate", build_funding_zip_url(symbol, month)),
+        if months is not None:
+            kline_months: tuple[str, ...] = months
+            funding_months: tuple[str, ...] = months
+            ordered_months: tuple[str, ...] = months
+        else:
+            kline_months = _bounded_months(
+                discover_panel_months(download, symbol=symbol, kind="klines"),
+                month_from,
+                month_to,
+            )
+            funding_months = _bounded_months(
+                discover_panel_months(download, symbol=symbol, kind="fundingRate"),
+                month_from,
+                month_to,
+            )
+            ordered_months = tuple(sorted(set(kline_months) | set(funding_months)))
+        for month in ordered_months:
+            for kind, url_builder, kind_months in (
+                ("klines", build_kline_zip_url, kline_months),
+                ("fundingRate", build_funding_zip_url, funding_months),
             ):
+                if month not in kind_months:
+                    continue
+                url = url_builder(symbol, month)
                 try:
                     payload = download(url)
                 except PanelSourceAbsent:
@@ -264,10 +320,14 @@ def capture_panel(
         "venue": _VENUE,
         "interval": "1d",
         "symbols": list(symbols),
-        "months": list(months),
+        "months": list(months) if months is not None else None,
         "sources": sources,
         "dataset_root_hash": dataset.root_hash,
     }
+    if month_from is not None:
+        material["month_from"] = month_from
+    if month_to is not None:
+        material["month_to"] = month_to
     capture_root_hash = content_sha256(material)
     document = dict(material)
     document["capture_root_hash"] = capture_root_hash
@@ -336,6 +396,59 @@ def _zip_rows(raw: bytes) -> list[list[str]]:
     except (zipfile.BadZipFile, UnicodeDecodeError) as error:
         raise PanelCaptureError(f"panel dump is unreadable: {error}") from error
     return [row for row in csv.reader(io.StringIO(text)) if row]
+
+
+def _listing_prefix(symbol: str, kind: str) -> str:
+    _validate_symbol(symbol)
+    if kind == "klines":
+        return f"data/futures/um/monthly/klines/{symbol}/1d/"
+    if kind == "fundingRate":
+        return f"data/futures/um/monthly/fundingRate/{symbol}/"
+    raise PanelCaptureError(f"invalid panel source kind: {kind}")
+
+
+def _listing_key_pattern(symbol: str, kind: str) -> re.Pattern[str]:
+    escaped = re.escape(symbol)
+    if kind == "klines":
+        return re.compile(
+            rf"^data/futures/um/monthly/klines/{escaped}/1d/{escaped}-1d-(\d{{4}}-\d{{2}})\.zip$"
+        )
+    return re.compile(
+        rf"^data/futures/um/monthly/fundingRate/{escaped}/"
+        rf"{escaped}-fundingRate-(\d{{4}}-\d{{2}})\.zip$"
+    )
+
+
+def _parse_listing_months(raw: bytes, *, symbol: str, kind: str) -> tuple[str, ...]:
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError as error:
+        raise PanelCaptureError(f"panel month listing is unreadable: {error}") from error
+    truncated = False
+    keys: list[str] = []
+    for element in root.iter():
+        tag = str(element.tag).rsplit("}", 1)[-1]
+        if tag == "IsTruncated" and (element.text or "").strip().lower() == "true":
+            truncated = True
+        elif tag == "Key" and element.text:
+            keys.append(element.text.strip())
+    if truncated:
+        raise PanelCaptureError(f"panel month listing for {symbol} {kind} was truncated")
+    # The strict pattern re-confirms the exact symbol on every key, so a
+    # prefix collision (BTCUSDT vs. BTCUSDTX) can never leak a foreign month.
+    pattern = _listing_key_pattern(symbol, kind)
+    months = {match.group(1) for key in keys if (match := pattern.match(key)) is not None}
+    return tuple(sorted(months))
+
+
+def _bounded_months(
+    months: tuple[str, ...], month_from: str | None, month_to: str | None
+) -> tuple[str, ...]:
+    return tuple(
+        month
+        for month in months
+        if (month_from is None or month >= month_from) and (month_to is None or month <= month_to)
+    )
 
 
 def _validate_panel_url(url: str) -> None:

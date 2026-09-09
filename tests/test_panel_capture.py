@@ -3,6 +3,7 @@ import json
 import urllib.error
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from email.message import Message
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from trading_bot.panel_capture import (
     build_funding_zip_url,
     build_kline_zip_url,
     capture_panel,
+    discover_panel_months,
     parse_funding_zip,
     parse_kline_zip,
     verify_panel_capture,
@@ -313,3 +315,109 @@ def test_capture_aborts_on_a_non_absent_failure(tmp_path: Path) -> None:
             months=("2024-01", "2024-02"),
             fetch=fetch,
         )
+
+
+def _listing_xml(*, truncated: bool = False, keys: tuple[str, ...] = ()) -> bytes:
+    contents = "".join(f"<Contents><Key>{key}</Key></Contents>" for key in keys)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        f"<IsTruncated>{'true' if truncated else 'false'}</IsTruncated>"
+        f"{contents}"
+        "</ListBucketResult>"
+    ).encode()
+
+
+def test_discover_panel_months_ignores_a_different_symbol_with_shared_prefix() -> None:
+    keys = (
+        "data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip",
+        "data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip.CHECKSUM",
+        "data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-02.zip",
+        "data/futures/um/monthly/klines/BTCUSDTX/1d/BTCUSDTX-1d-2024-03.zip",
+    )
+
+    def fetch(url: str) -> PanelPayload:
+        return PanelPayload(url=url, raw_bytes=_listing_xml(keys=keys), received_time_ns=1)
+
+    months = discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
+    assert months == ("2024-01", "2024-02")
+
+
+def test_discover_panel_months_raises_when_the_listing_is_truncated() -> None:
+    keys = ("data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip",)
+
+    def fetch(url: str) -> PanelPayload:
+        return PanelPayload(
+            url=url, raw_bytes=_listing_xml(truncated=True, keys=keys), received_time_ns=1
+        )
+
+    with pytest.raises(PanelCaptureError):
+        discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
+
+
+def _discovery_and_zip_fetch(
+    *, kline_months: tuple[str, ...], funding_months: tuple[str, ...]
+) -> Callable[[str], PanelPayload]:
+    def fetch(url: str) -> PanelPayload:
+        if "list-type=2" in url:
+            if "fundingRate" in url:
+                keys = tuple(
+                    f"data/futures/um/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-{month}.zip"
+                    for month in funding_months
+                )
+            else:
+                keys = tuple(
+                    f"data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-{month}.zip"
+                    for month in kline_months
+                )
+            return PanelPayload(url=url, raw_bytes=_listing_xml(keys=keys), received_time_ns=1)
+        if "fundingRate" in url:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("f.csv", funding_csv()), received_time_ns=1
+            )
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    return fetch
+
+
+def test_capture_with_months_omitted_discovers_and_fetches_only_existing_months(
+    tmp_path: Path,
+) -> None:
+    fetch = _discovery_and_zip_fetch(kline_months=("2024-01",), funding_months=("2024-01",))
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        fetch=fetch,
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert all(entry["status"] == "present" for entry in manifest["sources"])
+    assert {(entry["month"], entry["kind"]) for entry in manifest["sources"]} == {
+        ("2024-01", "klines"),
+        ("2024-01", "fundingRate"),
+    }
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+
+def test_capture_bounds_filter_the_discovered_months(tmp_path: Path) -> None:
+    fetch = _discovery_and_zip_fetch(
+        kline_months=("2024-01", "2024-02", "2024-03"),
+        funding_months=("2024-01", "2024-02", "2024-03"),
+    )
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        month_from="2024-02",
+        month_to="2024-02",
+        fetch=fetch,
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert {(entry["month"], entry["kind"]) for entry in manifest["sources"]} == {
+        ("2024-02", "klines"),
+        ("2024-02", "fundingRate"),
+    }
