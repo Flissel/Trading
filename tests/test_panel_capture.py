@@ -29,6 +29,26 @@ DAY_MS = 86_400_000
 MONTH_START_DAY = {"2024-01": 0, "2024-02": 31}
 
 
+class _FakeUrlopenResponse:
+    """Minimal stand-in for the object urllib.request.urlopen returns."""
+
+    def __init__(self, body: bytes, url: str) -> None:
+        self._body = body
+        self._url = url
+
+    def __enter__(self) -> "_FakeUrlopenResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+    def read(self, limit: int) -> bytes:
+        return self._body
+
+    def geturl(self) -> str:
+        return self._url
+
+
 def zip_bytes(name: str, text: str) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -131,9 +151,11 @@ def test_panel_zip_client_raises_source_absent_only_for_404(
         raise urllib.error.HTTPError(request.full_url, 404, "Not Found", Message(), None)
 
     monkeypatch.setattr(urllib.request, "urlopen", raise_404)
-    client = PanelZipClient()
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
     with pytest.raises(PanelSourceAbsent):
         client.fetch(build_kline_zip_url("LUNAUSDT", "2023-01"))
+    assert sleeps == []
 
     def raise_500(request: urllib.request.Request, timeout: float) -> None:
         raise urllib.error.HTTPError(request.full_url, 500, "Server Error", Message(), None)
@@ -142,6 +164,53 @@ def test_panel_zip_client_raises_source_absent_only_for_404(
     with pytest.raises(PanelCaptureError) as excinfo:
         client.fetch(build_kline_zip_url("LUNAUSDT", "2023-01"))
     assert not isinstance(excinfo.value, PanelSourceAbsent)
+
+
+def test_panel_zip_client_retries_a_transient_failure_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+
+    def flaky_urlopen(request: urllib.request.Request, timeout: float) -> _FakeUrlopenResponse:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.URLError("connection reset")
+        return _FakeUrlopenResponse(b"payload-bytes", request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    payload = client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert payload.raw_bytes == b"payload-bytes"
+    assert sleeps == [1]
+
+
+def test_panel_zip_client_gives_up_after_four_transient_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def always_times_out(request: urllib.request.Request, timeout: float) -> None:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", always_times_out)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append, max_attempts=4)
+    with pytest.raises(PanelCaptureError, match="4 attempts") as excinfo:
+        client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert not isinstance(excinfo.value, PanelSourceAbsent)
+    assert sleeps == [1, 2, 4]
+
+
+def test_panel_zip_client_does_not_retry_a_403(monkeypatch: pytest.MonkeyPatch) -> None:
+    def raise_403(request: urllib.request.Request, timeout: float) -> None:
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", Message(), None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_403)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    with pytest.raises(PanelCaptureError) as excinfo:
+        client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert not isinstance(excinfo.value, PanelSourceAbsent)
+    assert sleeps == []
 
 
 def test_capture_survives_and_records_a_delisted_symbols_absent_month(

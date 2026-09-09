@@ -71,25 +71,39 @@ PanelFetch = Callable[[str], PanelPayload]
 @dataclass(frozen=True, slots=True)
 class PanelZipClient:
     timeout_seconds: int = 60
+    max_attempts: int = 4
+    sleep: Callable[[float], None] = time.sleep
 
     def fetch(self, url: str) -> PanelPayload:
         _validate_panel_url(url)
-        request = urllib.request.Request(
-            url, headers={"User-Agent": "hybrid-trading-research/0.1"}
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                _validate_panel_url(response.geturl())
-                raw = response.read(_MAX_ZIP_BYTES + 1)
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                raise PanelSourceAbsent(f"panel dump is absent: {error}") from error
-            raise PanelCaptureError(f"panel dump request failed: {error}") from error
-        except (urllib.error.URLError, TimeoutError) as error:
-            raise PanelCaptureError(f"panel dump request failed: {error}") from error
-        if len(raw) > _MAX_ZIP_BYTES:
-            raise PanelCaptureError("panel dump exceeds the byte limit")
-        return PanelPayload(url=url, raw_bytes=raw, received_time_ns=time.time_ns())
+        last_error: BaseException | None = None
+        for attempt in range(1, self.max_attempts + 1):
+            request = urllib.request.Request(
+                url, headers={"User-Agent": "hybrid-trading-research/0.1"}
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    _validate_panel_url(response.geturl())
+                    raw = response.read(_MAX_ZIP_BYTES + 1)
+            except urllib.error.HTTPError as error:
+                if error.code == 404:
+                    raise PanelSourceAbsent(f"panel dump is absent: {error}") from error
+                if error.code < 500:
+                    # Any other 4xx (403, 400, ...) is a real problem, not a
+                    # transient one -- surface it immediately, unretried.
+                    raise PanelCaptureError(f"panel dump request failed: {error}") from error
+                last_error = error
+            except (urllib.error.URLError, TimeoutError) as error:
+                last_error = error
+            else:
+                if len(raw) > _MAX_ZIP_BYTES:
+                    raise PanelCaptureError("panel dump exceeds the byte limit")
+                return PanelPayload(url=url, raw_bytes=raw, received_time_ns=time.time_ns())
+            if attempt < self.max_attempts:
+                self.sleep(2 ** (attempt - 1))
+        raise PanelCaptureError(
+            f"panel dump request failed after {self.max_attempts} attempts: {last_error}"
+        ) from last_error
 
 
 def build_kline_zip_url(symbol: str, month: str) -> str:
