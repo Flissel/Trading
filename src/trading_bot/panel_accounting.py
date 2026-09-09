@@ -1,0 +1,167 @@
+"""Weekly portfolio accounting for the perpetual panel."""
+
+from dataclasses import dataclass
+from decimal import Decimal
+
+from trading_bot.panel_config import PanelCostTable
+from trading_bot.panel_reader import FundingEvent
+from trading_bot.panel_universe import ContractHistory
+
+DAY_NS = 86_400_000_000_000
+_BPS = Decimal(10_000)
+
+
+class PanelAccountingError(RuntimeError):
+    """Raised when an episode cannot be evaluated."""
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeResult:
+    sample_id: str
+    member: str
+    scenario: str
+    gross_return: Decimal
+    turnover: Decimal
+    trading_cost: Decimal
+    funding_cost: Decimal
+    forced_close_cost: Decimal
+    net_return: Decimal
+    gross_exposure: Decimal
+    net_exposure: Decimal
+    forced_close_count: int
+    contract_contributions: tuple[tuple[str, Decimal], ...]
+    contract_net_contributions: tuple[tuple[str, Decimal], ...]
+    drifted_weights: tuple[tuple[str, Decimal], ...]
+
+
+def evaluate_episode(
+    *,
+    sample_id: str,
+    member: str,
+    decision_close_ns: int,
+    holding_days: int,
+    weights: tuple[tuple[str, Decimal], ...],
+    previous_weights: tuple[tuple[str, Decimal], ...],
+    histories: dict[str, ContractHistory],
+    tiers: dict[str, int],
+    funding_by_contract: dict[str, tuple[FundingEvent, ...]],
+    cost_table: PanelCostTable,
+) -> EpisodeResult:
+    """Evaluate one weekly rebalance under a single cost table."""
+    if holding_days < 1:
+        raise PanelAccountingError("holding period must be positive")
+    exit_close_ns = decision_close_ns + holding_days * DAY_NS
+    weight_map = dict(weights)
+    previous_map = dict(previous_weights)
+
+    returns: dict[str, Decimal] = {}
+    forced: set[str] = set()
+    for contract_id, _ in weights:
+        history = histories.get(contract_id)
+        if history is None:
+            raise PanelAccountingError(f"missing history for {contract_id}")
+        entry = history.closes.get(decision_close_ns)
+        if entry is None or entry <= 0:
+            raise PanelAccountingError(f"missing entry close for {contract_id}")
+        exit_price = history.closes.get(exit_close_ns)
+        if exit_price is None:
+            candidates = [
+                value
+                for value in history.close_times
+                if decision_close_ns < value < exit_close_ns
+            ]
+            forced.add(contract_id)
+            exit_price = history.closes[candidates[-1]] if candidates else entry
+        returns[contract_id] = exit_price / entry - Decimal(1)
+
+    contributions = {
+        contract_id: weight_map[contract_id] * returns[contract_id] for contract_id in weight_map
+    }
+    gross_return = sum(contributions.values(), Decimal(0))
+
+    universe = sorted(set(weight_map) | set(previous_map))
+    turnover = Decimal(0)
+    trading_by_contract: dict[str, Decimal] = {}
+    for contract_id in universe:
+        change = abs(
+            weight_map.get(contract_id, Decimal(0)) - previous_map.get(contract_id, Decimal(0))
+        )
+        if change == 0:
+            continue
+        turnover += change
+        # A contract present only in previous_weights carries no current tier
+        # assignment and is unconditionally charged at tier 2, regardless of
+        # whether the caller's tiers mapping happens to still list it.
+        tier = tiers.get(contract_id, 2) if contract_id in weight_map else 2
+        trading_by_contract[contract_id] = change * _per_side_bps(cost_table, tier) / _BPS
+    trading_cost = sum(trading_by_contract.values(), Decimal(0))
+
+    funding_by_id: dict[str, Decimal] = {}
+    for contract_id, weight in weight_map.items():
+        charged = Decimal(0)
+        for event in funding_by_contract.get(contract_id, ()):
+            if not decision_close_ns < event.calc_time_ns <= exit_close_ns:
+                continue
+            term = weight * event.rate
+            if term > 0:
+                charged += term * cost_table.funding_payment_multiplier
+            elif term < 0:
+                charged += term * cost_table.funding_receipt_multiplier
+        if charged != 0:
+            funding_by_id[contract_id] = charged
+    funding_cost = sum(funding_by_id.values(), Decimal(0))
+
+    forced_by_id: dict[str, Decimal] = {}
+    for contract_id in sorted(forced):
+        forced_by_id[contract_id] = (
+            abs(weight_map[contract_id])
+            * _per_side_bps(cost_table, tiers.get(contract_id, 2))
+            / _BPS
+            * cost_table.forced_close_multiplier
+        )
+    forced_close_cost = sum(forced_by_id.values(), Decimal(0))
+
+    net_contributions = {
+        contract_id: contributions.get(contract_id, Decimal(0))
+        - trading_by_contract.get(contract_id, Decimal(0))
+        - funding_by_id.get(contract_id, Decimal(0))
+        - forced_by_id.get(contract_id, Decimal(0))
+        for contract_id in universe
+    }
+    net_return = gross_return - trading_cost - funding_cost - forced_close_cost
+    denominator = Decimal(1) + gross_return
+    drifted: dict[str, Decimal] = {}
+    for contract_id, weight in weight_map.items():
+        if contract_id in forced or denominator == 0:
+            drifted[contract_id] = Decimal(0)
+            continue
+        drifted[contract_id] = weight * (Decimal(1) + returns[contract_id]) / denominator
+
+    return EpisodeResult(
+        sample_id=sample_id,
+        member=member,
+        scenario=cost_table.name,
+        gross_return=gross_return,
+        turnover=turnover,
+        trading_cost=trading_cost,
+        funding_cost=funding_cost,
+        forced_close_cost=forced_close_cost,
+        net_return=net_return,
+        gross_exposure=sum((abs(value) for value in weight_map.values()), Decimal(0)),
+        net_exposure=sum(weight_map.values(), Decimal(0)),
+        forced_close_count=len(forced),
+        contract_contributions=tuple(sorted(contributions.items(), key=lambda item: item[0])),
+        contract_net_contributions=tuple(
+            sorted(net_contributions.items(), key=lambda item: item[0])
+        ),
+        drifted_weights=tuple(sorted(drifted.items(), key=lambda item: item[0])),
+    )
+
+
+def _per_side_bps(cost_table: PanelCostTable, tier: int) -> Decimal:
+    slippage = (
+        cost_table.slippage_bps_per_side_tier_one
+        if tier == 1
+        else cost_table.slippage_bps_per_side_tier_two
+    )
+    return cost_table.fee_bps_per_side + slippage
