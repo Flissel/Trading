@@ -1827,7 +1827,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 Construction, all from closes at or before `decision_close_ns`:
 - Trailing return `close[t] / close[t - lookback_days] - 1`; a contract without the lagged close is dropped from that member's ranking.
 - Cross-sectional: sort by `(trailing_return, contract_id)`; `quintile = max(minimum_quintile_size, len(ranked) // 5)`; bottom `quintile` get `-leg_gross / quintile`, top `quintile` get `+leg_gross / quintile`; `reversed` swaps the signs.
-- Time-series: `raw = sign(trailing_return) / max(sigma, volatility_floor)` where `sigma` is the annualised sample standard deviation of the last `volatility_window_days` daily log returns; normalise to unit gross, then apply `cap = time_series_cap_numerator / len(ranked)` and renormalise, at most 10 rounds.
+- Time-series: `raw = sign(trailing_return) / max(sigma, volatility_floor)` where `sigma` is the annualised sample standard deviation of the last `volatility_window_days` daily log returns; normalise to unit gross, then water-fill against `cap = time_series_cap_numerator / len(ranked)`: clip every entry over the cap, freeze it there cumulatively, and rescale only the still-unfrozen entries each round so the total gross stays exactly one.
 - `no_trade`: empty weights. `passive_long_ew`: `1 / n` on every eligible contract. `random_ranks`: replace the trailing return by `Random(random_seed ^ decision_close_ns).random()` per contract, then the `xs_mom` construction.
 - An empty snapshot yields empty weights and the snapshot's reason codes for every name.
 
@@ -1955,14 +1955,13 @@ Expected: FAIL with `ModuleNotFoundError: No module named 'trading_bot.panel_sig
 
 from dataclasses import dataclass
 from decimal import Decimal
+from itertools import pairwise
 from random import Random
 
 from trading_bot.panel_config import PanelFamilySpec, PanelMember, PanelWeightRules
 from trading_bot.panel_universe import ContractHistory, UniverseSnapshot
 
 DAY_NS = 86_400_000_000_000
-_TOLERANCE = Decimal("0.0000000001")
-_MAX_CAP_ROUNDS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -2075,15 +2074,53 @@ def _time_series_weights(
     if not raw:
         return ()
     cap = rules.time_series_cap_numerator / Decimal(len(raw))
-    weights = _normalise(raw)
-    for _ in range(_MAX_CAP_ROUNDS):
-        clipped = {
-            contract_id: max(-cap, min(cap, value)) for contract_id, value in weights.items()
-        }
-        weights = _normalise(clipped)
-        if all(abs(value) <= cap + _TOLERANCE for value in weights.values()):
-            break
+    weights = _water_fill(_normalise(raw), cap)
     return tuple(sorted(weights.items(), key=lambda item: item[0]))
+
+
+def _water_fill(weights: dict[str, Decimal], cap: Decimal) -> dict[str, Decimal]:
+    """Clip every weight to `cap`, redistributing the rest so gross stays exactly one.
+
+    Once an entry is clipped to `cap` it is frozen there permanently and never
+    rescaled again; only entries that have never been frozen absorb the residual
+    budget. That makes the frozen set grow monotonically round over round (an
+    entry can newly join it, but never leave), so this terminates within
+    `len(weights)` rounds, and the result satisfies both constraints exactly: no
+    weight's absolute value exceeds `cap`, and the absolute values sum to exactly
+    one. A frozen entry keeps its own sign.
+
+    (An earlier version recomputed the violator set from scratch each round
+    instead of accumulating it, so an already-clipped entry could sit in "others"
+    on a later round and be rescaled back above the cap -- the violator set
+    oscillated rather than grew, and the loop could exhaust its round budget
+    still over cap. Freezing cumulatively is what fixes that.)
+    """
+    current = dict(weights)
+    frozen: set[str] = set()
+    for _ in range(len(current)):
+        new_violators = [
+            key for key, value in current.items() if key not in frozen and abs(value) > cap
+        ]
+        if not new_violators:
+            break
+        frozen.update(new_violators)
+        for key in new_violators:
+            current[key] = cap if current[key] >= 0 else -cap
+        frozen_gross = Decimal(len(frozen)) * cap
+        if frozen_gross >= 1:
+            # Every frozen contract already meets or exceeds unit gross on its
+            # own; equal weights are always feasible because cap == 2/n and
+            # 1/n <= 2/n.
+            return {
+                key: (Decimal(1) if value >= 0 else Decimal(-1)) / Decimal(len(current))
+                for key, value in current.items()
+            }
+        others = [key for key in current if key not in frozen]
+        others_gross = sum(abs(current[key]) for key in others)
+        scale = (Decimal(1) - frozen_gross) / others_gross if others_gross else Decimal(0)
+        for key in others:
+            current[key] = current[key] * scale
+    return current
 
 
 def _normalise(weights: dict[str, Decimal]) -> dict[str, Decimal]:
@@ -2101,7 +2138,7 @@ def _annualised_volatility(
     if len(window) < window_days + 1:
         return None
     log_returns: list[Decimal] = []
-    for previous, current in zip(window, window[1:], strict=True):
+    for previous, current in pairwise(window):
         earlier = history.closes[previous]
         later = history.closes[current]
         if earlier <= 0 or later <= 0:
@@ -2155,7 +2192,7 @@ Cost algebra, per unit of turnover and per side, in basis points:
 - `forced_close_cost = Σ_{forced i} |w_i| × (fee + slippage(tier_i)) / 10_000 × forced_close_multiplier`
 - `net_return = gross_return − trading_cost − funding_cost − forced_close_cost`
 - `drifted_i = w_i × (1 + r_i) / (1 + gross_return)`, and `0` for a force-closed contract. If `1 + gross_return == 0`, every drifted weight is `0`.
-- A contract present only in `previous_weights` is charged at tier 2.
+- A contract's tier defaults to 2 only when it is genuinely absent from the tier mapping; a contract still in the eligible universe is charged its real tier, even when `previous_weights` also carries it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -2582,6 +2619,7 @@ A rebalance date is the close time of a daily bar whose UTC weekday is Sunday. T
 ```python
 # tests/test_panel_samples.py
 from decimal import Decimal
+from itertools import pairwise
 from pathlib import Path
 
 import pytest
@@ -2626,7 +2664,7 @@ def test_samples_are_chronological_and_carry_the_holding_label() -> None:
     assert samples[0].label_end_time_ns - samples[0].decision_time_ns == 7 * DAY_NS
     assert all(
         later.decision_time_ns > earlier.decision_time_ns
-        for earlier, later in zip(samples, samples[1:], strict=True)
+        for earlier, later in pairwise(samples)
     )
 
 
@@ -3676,11 +3714,23 @@ def deflated_sharpe_ratio(
 
     values = [float(value) for value in net_returns]
     mean = sum(values) / observations
-    variance = sum((value - mean) ** 2 for value in values) / (observations - 1)
-    deviation = math.sqrt(variance)
-    skewness = sum(((value - mean) / deviation) ** 3 for value in values) / observations
-    kurtosis = sum(((value - mean) / deviation) ** 4 for value in values) / observations
-    observed = mean / deviation
+    sample_variance = sum((value - mean) ** 2 for value in values) / (observations - 1)
+    sample_deviation = math.sqrt(sample_variance)
+    observed = mean / sample_deviation
+
+    # Skewness and kurtosis are standardised population moments: both the deviation
+    # they are divided by and the average over the powers use the same divisor T, so
+    # the two stay self-consistent (this is scipy.stats.skew/kurtosis's convention).
+    # The Sharpe ratio above stays on the sample (T-1) deviation deliberately -- it is
+    # a distinct quantity, and sharpe_ratio()/Task 11's trial Sharpes use that form.
+    population_variance = sum((value - mean) ** 2 for value in values) / observations
+    population_deviation = math.sqrt(population_variance)
+    skewness = (
+        sum(((value - mean) / population_deviation) ** 3 for value in values) / observations
+    )
+    kurtosis = (
+        sum(((value - mean) / population_deviation) ** 4 for value in values) / observations
+    )
 
     trials = [float(value) for value in trial_sharpes]
     trial_mean = sum(trials) / len(trials)

@@ -210,6 +210,25 @@ aber am adversen Kostenfall und am Multiple-Testing-Gate. P1.15 ist daher nicht
 freigegeben. Der vollständige Gate-Nachweis steht in
 `P1_15_DECISION_2026-08-25.md`; der finale Holdout blieb gesperrt.
 
+## Panel-Forschung (P1.27)
+
+Neben der 15-Minuten-BTC-Linie gibt es eine zweite, davon unabhängige Linie:
+ein Wochen-Rebalancing auf einem Panel von Binance-USD-M-USDT-Perpetuals aus
+den öffentlichen Tagesdumps. Ein Sample ist ein Rebalance-Termin, nicht ein
+Coin-Tag; die Kontrakte innerhalb einer Woche sind keine unabhängigen Samples
+(Protokoll Abschnitt 16). Vier Befehle bilden die Kette:
+
+```powershell
+uv run trading-research panel-capture --output data/captures/<datum>-binance-um-usdt-perps-1d --symbols <liste> --months <liste>
+uv run trading-research panel-manifest --capture <capture> --output artifacts/panel-walk-forward-v1.json --family-spec configs/xs-momentum-panel-v1.json
+uv run trading-research panel-fold --capture <capture> --manifest <manifest> --family-spec configs/xs-momentum-panel-v1.json --output artifacts/panel/fold0.json --registry artifacts/panel/metadata-xs-momentum-v1.sqlite3 --fold-index 0
+uv run trading-research panel-decision --fold-report artifacts/panel/fold0.json --family-spec configs/xs-momentum-panel-v1.json --output artifacts/panel/decision-v1.json --registry artifacts/panel/metadata-xs-momentum-v1.sqlite3
+```
+
+Die Familie ist vor dem ersten Datenabruf eingefroren: sechs Mitglieder, drei
+Kontrollen, keine Parametersuche, alles in `configs/xs-momentum-panel-v1.json`,
+dessen SHA-256 in jedem Report als `family_spec_hash` steht.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.
