@@ -202,3 +202,57 @@ def test_turnover_uses_drifted_previous_weights() -> None:
     )
     assert second.turnover < Decimal("0.15")
     assert second.turnover > Decimal("0")
+
+
+def test_exit_only_contract_uses_its_universe_tier_and_defaults_to_tier_two_when_absent() -> None:
+    # C:0 is held last week (previous_weights) but has dropped out of this week's
+    # decision weights entirely, while remaining in the eligible universe. Its exit
+    # turnover must be charged at its own measured tier from `tiers`, not tier 2,
+    # because `tiers` reflects the current eligible universe (task 9's snapshot),
+    # not the member's current portfolio membership.
+    exit_only_weights = (("A:0", Decimal("0.5")),)
+    previous_with_exit = (("A:0", Decimal("0.5")), ("C:0", Decimal("0.3")))
+    exit_only_histories = {"A:0": history("A:0", {DECISION: "100", NEXT: "110"})}
+
+    # Case 1: C:0 is still listed in `tiers` as tier 1 (5 + 5 = 10 bps per side).
+    tiered = evaluate_episode(
+        sample_id="BINANCE_UM:1:w1",
+        member="xs_mom_1w",
+        decision_close_ns=DECISION,
+        holding_days=7,
+        weights=exit_only_weights,
+        previous_weights=previous_with_exit,
+        histories=exit_only_histories,
+        tiers={"A:0": 1, "C:0": 1},
+        funding_by_contract={},
+        cost_table=BASE,
+    )
+    assert tiered.turnover == Decimal("0.3")
+    # 0.3 * (5 + 5) / 10_000 = 0.0003
+    assert tiered.trading_cost == Decimal("0.0003")
+    assert tiered.net_return == Decimal("0.0497")
+    tiered_net = dict(tiered.contract_net_contributions)
+    assert tiered_net["C:0"] == Decimal("-0.0003")
+    assert sum(tiered_net.values(), Decimal(0)) == tiered.net_return
+
+    # Case 2: C:0 is absent from `tiers` (e.g. it has left the eligible universe too),
+    # so it falls back to the conservative tier-2 default (5 + 10 = 15 bps per side).
+    untiered = evaluate_episode(
+        sample_id="BINANCE_UM:1:w1",
+        member="xs_mom_1w",
+        decision_close_ns=DECISION,
+        holding_days=7,
+        weights=exit_only_weights,
+        previous_weights=previous_with_exit,
+        histories=exit_only_histories,
+        tiers={"A:0": 1},
+        funding_by_contract={},
+        cost_table=BASE,
+    )
+    assert untiered.turnover == Decimal("0.3")
+    # 0.3 * (5 + 10) / 10_000 = 0.00045
+    assert untiered.trading_cost == Decimal("0.00045")
+    assert untiered.net_return == Decimal("0.04955")
+    untiered_net = dict(untiered.contract_net_contributions)
+    assert untiered_net["C:0"] == Decimal("-0.00045")
+    assert sum(untiered_net.values(), Decimal(0)) == untiered.net_return

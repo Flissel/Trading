@@ -89,11 +89,9 @@ def evaluate_episode(
         if change == 0:
             continue
         turnover += change
-        # A contract present only in previous_weights carries no current tier
-        # assignment and is unconditionally charged at tier 2, regardless of
-        # whether the caller's tiers mapping happens to still list it.
-        tier = tiers.get(contract_id, 2) if contract_id in weight_map else 2
-        trading_by_contract[contract_id] = change * _per_side_bps(cost_table, tier) / _BPS
+        trading_by_contract[contract_id] = (
+            change * _per_side_bps(cost_table, tiers.get(contract_id, 2)) / _BPS
+        )
     trading_cost = sum(trading_by_contract.values(), Decimal(0))
 
     funding_by_id: dict[str, Decimal] = {}
