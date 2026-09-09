@@ -109,7 +109,7 @@ def publish_panel_dataset(
     admitted, duplicate_rows = _admit_candles(candles)
     if not admitted:
         raise PanelDatasetError("panel dataset has no candle rows")
-    admitted_funding = _admit_funding(funding)
+    admitted_funding, funding_duplicate_rows = _admit_funding(funding)
     instruments = _instrument_quality(admitted)
 
     output_directory.parent.mkdir(parents=True, exist_ok=True)
@@ -123,6 +123,7 @@ def publish_panel_dataset(
             "candle_row_count": len(admitted),
             "funding_row_count": len(admitted_funding),
             "duplicate_rows": duplicate_rows,
+            "funding_duplicate_rows": funding_duplicate_rows,
             "instrument_count": len(instruments),
             "instruments": [
                 {
@@ -216,7 +217,13 @@ def _admit_candles(
         if row.interval_ns != DAY_NS:
             raise PanelDatasetError("panel candles must be daily")
         key = (row.venue, row.instrument_id, row.open_time_ns)
-        if key in seen:
+        existing = seen.get(key)
+        if existing is not None:
+            if existing != row:
+                raise PanelDatasetError(
+                    "conflicting duplicate candle identity for "
+                    f"{row.instrument_id} at open_time_ns={row.open_time_ns}"
+                )
             duplicates += 1
             continue
         seen[key] = row
@@ -224,12 +231,25 @@ def _admit_candles(
     return tuple(ordered), duplicates
 
 
-def _admit_funding(funding: tuple[PanelFundingRow, ...]) -> tuple[PanelFundingRow, ...]:
+def _admit_funding(
+    funding: tuple[PanelFundingRow, ...],
+) -> tuple[tuple[PanelFundingRow, ...], int]:
     seen: dict[tuple[str, str, int], PanelFundingRow] = {}
+    duplicates = 0
     for row in funding:
-        seen[(row.venue, row.instrument_id, row.calc_time_ns)] = row
+        key = (row.venue, row.instrument_id, row.calc_time_ns)
+        existing = seen.get(key)
+        if existing is not None:
+            if existing != row:
+                raise PanelDatasetError(
+                    "conflicting duplicate funding identity for "
+                    f"{row.instrument_id} at calc_time_ns={row.calc_time_ns}"
+                )
+            duplicates += 1
+            continue
+        seen[key] = row
     ordered = sorted(seen.values(), key=lambda item: (item.instrument_id, item.calc_time_ns))
-    return tuple(ordered)
+    return tuple(ordered), duplicates
 
 
 def _instrument_quality(rows: tuple[PanelCandleRow, ...]) -> tuple[InstrumentQuality, ...]:

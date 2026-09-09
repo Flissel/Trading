@@ -90,6 +90,42 @@ def test_duplicate_rows_are_dropped(tmp_path: Path) -> None:
     assert quality["candle_row_count"] == 2
 
 
+def test_conflicting_candle_rows_raise(tmp_path: Path) -> None:
+    rows = (candle("BTCUSDT", 0), candle("BTCUSDT", 0, close="101"))
+    with pytest.raises(PanelDatasetError):
+        publish_panel_dataset(
+            rows, (), output_directory=tmp_path / "dataset", raw_source_hashes=SOURCE_HASHES
+        )
+
+
+def test_conflicting_funding_rows_raise(tmp_path: Path) -> None:
+    conflicting = PanelFundingRow(
+        venue="BINANCE_UM",
+        instrument_id="BTCUSDT",
+        calc_time_ns=0,
+        funding_interval_hours=8,
+        rate=Decimal("0.0002"),
+    )
+    with pytest.raises(PanelDatasetError):
+        publish_panel_dataset(
+            (candle("BTCUSDT", 0),),
+            (funding("BTCUSDT", 0), conflicting),
+            output_directory=tmp_path / "dataset",
+            raw_source_hashes=SOURCE_HASHES,
+        )
+
+
+def test_identical_funding_repeat_is_counted_as_duplicate(tmp_path: Path) -> None:
+    artifact = publish_panel_dataset(
+        (candle("BTCUSDT", 0),),
+        (funding("BTCUSDT", 0), funding("BTCUSDT", 0)),
+        output_directory=tmp_path / "dataset",
+        raw_source_hashes=SOURCE_HASHES,
+    )
+    quality = json.loads(artifact.quality_report_path.read_text(encoding="utf-8"))
+    assert quality["funding_duplicate_rows"] == 1
+
+
 def test_output_is_immutable(tmp_path: Path) -> None:
     target = tmp_path / "dataset"
     publish_panel_dataset(
