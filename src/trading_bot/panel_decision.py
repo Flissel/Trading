@@ -64,6 +64,28 @@ def build_panel_decision(
     indices = [_int_field(document, "fold_index") for document in documents]
     if len(set(indices)) != len(indices):
         raise PanelDecisionError("fold reports must have distinct fold indices")
+    declared_fold_counts = {_int_field(document, "fold_count") for document in documents}
+    if len(declared_fold_counts) != 1:
+        raise PanelDecisionError("fold reports do not agree on the declared fold count")
+    declared_fold_count = next(iter(declared_fold_counts))
+    expected_indices = set(range(declared_fold_count))
+    actual_indices = set(indices)
+    missing_indices = sorted(expected_indices - actual_indices)
+    unexpected_indices = sorted(actual_indices - expected_indices)
+    if missing_indices or unexpected_indices:
+        details = []
+        if missing_indices:
+            details.append(
+                "missing fold index(es) " + ", ".join(str(index) for index in missing_indices)
+            )
+        if unexpected_indices:
+            details.append(
+                "unexpected fold index(es) "
+                + ", ".join(str(index) for index in unexpected_indices)
+            )
+        raise PanelDecisionError(
+            "fold report family is not complete: " + "; ".join(details)
+        )
     linkage = {
         (
             str(document["family_spec_hash"]),

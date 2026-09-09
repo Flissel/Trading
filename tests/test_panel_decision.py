@@ -146,6 +146,23 @@ def test_duplicate_fold_indices_are_rejected(tmp_path: Path) -> None:
         )
 
 
+def test_missing_fold_index_is_rejected(tmp_path: Path) -> None:
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        write_fold(path, fold_index, {})
+        paths.append(path)
+    incomplete = tuple(path for index, path in enumerate(paths) if index != 3)
+    with pytest.raises(PanelDecisionError) as excinfo:
+        build_panel_decision(
+            incomplete,
+            family_spec_path=SPEC_PATH,
+            output_path=tmp_path / "decision.json",
+            registry_path=tmp_path / "registry.sqlite3",
+        )
+    assert "missing fold index(es) 3" in str(excinfo.value)
+
+
 def test_tampered_report_is_rejected(tmp_path: Path) -> None:
     path = tmp_path / "fold0.json"
     write_fold(path, 0, {})
