@@ -11,6 +11,7 @@ from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
 from trading_bot.panel_capture import capture_panel
 from trading_bot.panel_config import load_panel_family_spec
+from trading_bot.panel_fold_run import run_panel_fold
 from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
 from trading_bot.storage import StoragePolicy
@@ -75,6 +76,14 @@ def main(arguments: list[str] | None = None) -> int:
     panel_manifest.add_argument("--capture", type=Path, required=True)
     panel_manifest.add_argument("--output", type=Path, required=True)
     panel_manifest.add_argument("--family-spec", type=Path, required=True)
+    panel_fold = commands.add_parser("panel-fold")
+    panel_fold.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    panel_fold.add_argument("--capture", type=Path, required=True)
+    panel_fold.add_argument("--manifest", type=Path, required=True)
+    panel_fold.add_argument("--family-spec", type=Path, required=True)
+    panel_fold.add_argument("--output", type=Path, required=True)
+    panel_fold.add_argument("--registry", type=Path, required=True)
+    panel_fold.add_argument("--fold-index", type=int, required=True)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -204,6 +213,26 @@ def main(arguments: list[str] | None = None) -> int:
             output_path=manifest_paths[1],
             spec=spec,
             family_spec_hash=spec_hash,
+        )
+        return 0
+    if parsed.command == "panel-fold":
+        workspace = parsed.workspace_root.resolve()
+        fold_paths = (
+            parsed.capture.resolve(),
+            parsed.manifest.resolve(),
+            parsed.family_spec.resolve(),
+            parsed.output.resolve(),
+            parsed.registry.resolve(),
+        )
+        if any(not path.is_relative_to(workspace) for path in fold_paths):
+            raise ValueError("panel fold paths must stay inside workspace")
+        run_panel_fold(
+            fold_paths[0],
+            manifest_path=fold_paths[1],
+            family_spec_path=fold_paths[2],
+            output_path=fold_paths[3],
+            registry_path=fold_paths[4],
+            fold_index=parsed.fold_index,
         )
         return 0
     raise AssertionError("unreachable command")
