@@ -57,9 +57,12 @@ def test_contract_id_is_bound_to_the_first_bar(tmp_path: Path) -> None:
     assert [bar.open_time_ns for bar in btc] == [0, DAY_NS, 2 * DAY_NS]
 
 
-def test_availability_boundary_is_applied(tmp_path: Path) -> None:
-    bars = load_panel_bars(dataset(tmp_path), available_before_ns=2 * DAY_NS)
-    assert max(bar.open_time_ns for bar in bars) == DAY_NS
+def test_availability_boundary_is_strict(tmp_path: Path) -> None:
+    root = dataset(tmp_path)
+    included = load_panel_bars(root, available_before_ns=2 * DAY_NS + 1)
+    assert max(bar.open_time_ns for bar in included) == DAY_NS
+    excluded = load_panel_bars(root, available_before_ns=2 * DAY_NS)
+    assert max(bar.open_time_ns for bar in excluded) == 0
 
 
 def test_funding_events_carry_contract_ids(tmp_path: Path) -> None:

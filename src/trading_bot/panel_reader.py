@@ -43,7 +43,7 @@ def load_panel_bars(
     """
     parameters: list[object] = [glob]
     if available_before_ns is not None:
-        query += " WHERE available_time_ns <= ?"
+        query += " WHERE available_time_ns < ?"
         parameters.append(available_before_ns)
     query += " ORDER BY instrument_id, open_time_ns"
     rows = duckdb.sql(query, params=parameters).fetchall()
