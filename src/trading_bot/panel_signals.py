@@ -9,8 +9,6 @@ from trading_bot.panel_config import PanelFamilySpec, PanelWeightRules
 from trading_bot.panel_universe import ContractHistory, UniverseSnapshot
 
 DAY_NS = 86_400_000_000_000
-_TOLERANCE = Decimal("0.0000000001")
-_MAX_CAP_ROUNDS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +47,7 @@ def build_weight_vectors(
     vectors["passive_long_ew"] = WeightVector(
         decision,
         "passive_long_ew",
-        tuple((contract_id, share) for contract_id in eligible),
+        tuple((contract_id, share) for contract_id in sorted(eligible)),
         (),
     )
     rng = Random(spec.statistics.random_seed ^ decision)
@@ -120,15 +118,43 @@ def _time_series_weights(
     if not raw:
         return ()
     cap = rules.time_series_cap_numerator / Decimal(len(raw))
-    weights = _normalise(raw)
-    for _ in range(_MAX_CAP_ROUNDS):
-        clipped = {
-            contract_id: max(-cap, min(cap, value)) for contract_id, value in weights.items()
-        }
-        weights = _normalise(clipped)
-        if all(abs(value) <= cap + _TOLERANCE for value in weights.values()):
-            break
+    weights = _water_fill(_normalise(raw), cap)
     return tuple(sorted(weights.items(), key=lambda item: item[0]))
+
+
+def _water_fill(weights: dict[str, Decimal], cap: Decimal) -> dict[str, Decimal]:
+    """Clip every weight to `cap`, redistributing the rest so gross stays exactly one.
+
+    Uncapped entries absorb whatever gross the capped ("violator") entries give up,
+    so the result satisfies both constraints exactly: no weight's absolute value
+    exceeds `cap`, and the absolute values sum to exactly one. Each round either
+    stops (no violators) or strictly grows the violator set, so this terminates
+    within `len(weights)` rounds. A violator keeps its own sign.
+    """
+    current = dict(weights)
+    for _ in range(len(current)):
+        violators = [key for key, value in current.items() if abs(value) > cap]
+        if not violators:
+            break
+        frozen = Decimal(len(violators)) * cap
+        if frozen >= 1:
+            # Every contract at the cap would already meet or exceed unit gross;
+            # equal weights are always feasible because cap == 2/n and 1/n <= 2/n.
+            current = {
+                key: (Decimal(1) if value >= 0 else Decimal(-1)) / Decimal(len(current))
+                for key, value in current.items()
+            }
+            break
+        others = [key for key in current if key not in violators]
+        others_gross = sum(abs(current[key]) for key in others)
+        scale = (Decimal(1) - frozen) / others_gross if others_gross else Decimal(0)
+        current = {
+            key: (
+                (cap if current[key] >= 0 else -cap) if key in violators else current[key] * scale
+            )
+            for key in current
+        }
+    return current
 
 
 def _normalise(weights: dict[str, Decimal]) -> dict[str, Decimal]:
