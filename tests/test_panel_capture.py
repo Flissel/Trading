@@ -421,3 +421,148 @@ def test_capture_bounds_filter_the_discovered_months(tmp_path: Path) -> None:
         ("2024-02", "klines"),
         ("2024-02", "fundingRate"),
     }
+
+
+def _deterministic_fetch() -> Callable[[str], PanelPayload]:
+    def fetch(url: str) -> PanelPayload:
+        if "fundingRate" in url:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("f.csv", funding_csv()), received_time_ns=1
+            )
+        month = "2024-01" if "2024-01" in url else "2024-02"
+        return PanelPayload(
+            url=url,
+            raw_bytes=zip_bytes("k.csv", kline_csv(3, start_day=MONTH_START_DAY[month])),
+            received_time_ns=1,
+        )
+
+    return fetch
+
+
+def test_capture_resumes_after_an_interruption_and_matches_an_uninterrupted_run(
+    tmp_path: Path,
+) -> None:
+    control = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "control",
+        reserve_bytes=0,
+        symbols=("BTCUSDT", "ETHUSDT"),
+        months=("2024-01", "2024-02"),
+        fetch=_deterministic_fetch(),
+    )
+
+    target = tmp_path / "resumable"
+    calls = {"count": 0}
+    base_fetch = _deterministic_fetch()
+
+    def flaky_fetch(url: str) -> PanelPayload:
+        calls["count"] += 1
+        if calls["count"] > 3:
+            raise PanelCaptureError("simulated crash")
+        return base_fetch(url)
+
+    with pytest.raises(PanelCaptureError, match="simulated crash"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT", "ETHUSDT"),
+            months=("2024-01", "2024-02"),
+            fetch=flaky_fetch,
+        )
+    assert not (target / "capture-manifest.json").exists()
+    assert (target / "capture-progress.jsonl").exists()
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT", "ETHUSDT"),
+        months=("2024-01", "2024-02"),
+        fetch=_deterministic_fetch(),
+    )
+    assert not (target / "capture-progress.jsonl").exists()
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+    control_manifest = json.loads(control.capture_manifest_path.read_text(encoding="utf-8"))
+    resumed_manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert control_manifest["dataset_root_hash"] == resumed_manifest["dataset_root_hash"]
+    assert {
+        (e["symbol"], e["month"], e["kind"], e["status"]) for e in control_manifest["sources"]
+    } == {
+        (e["symbol"], e["month"], e["kind"], e["status"]) for e in resumed_manifest["sources"]
+    }
+
+
+def test_capture_with_a_manifest_present_still_refuses(tmp_path: Path) -> None:
+    target = tmp_path / "capture"
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    with pytest.raises(PanelCaptureError, match="immutable"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_deletes_the_progress_file_after_success(tmp_path: Path) -> None:
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    assert not (artifact.capture_root / "capture-progress.jsonl").exists()
+
+
+def test_capture_resumes_when_a_dataset_directory_is_left_without_a_manifest(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "capture"
+    first = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    manifest = json.loads(first.capture_manifest_path.read_text(encoding="utf-8"))
+    old_dataset_hash = manifest["dataset_root_hash"]
+
+    # Simulate a crash between publishing the dataset and writing the
+    # manifest: the progress file from that run is still present (recording
+    # every source that was fetched), but the manifest never got written.
+    progress_path = target / "capture-progress.jsonl"
+    with progress_path.open("w", encoding="utf-8") as handle:
+        for record in manifest["sources"]:
+            handle.write(json.dumps(record) + "\n")
+    first.capture_manifest_path.unlink()
+    assert (target / "dataset").exists()
+
+    def fetch_never(url: str) -> PanelPayload:
+        raise AssertionError(f"unexpected network fetch during resume: {url}")
+
+    resumed = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=fetch_never,
+    )
+    assert resumed.dataset_root_hash == old_dataset_hash
+    assert not progress_path.exists()
+    assert verify_panel_capture(resumed.capture_root) == (True, ())

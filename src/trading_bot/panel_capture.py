@@ -16,6 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_dataset import (
@@ -230,60 +231,115 @@ def capture_panel(
         free_bytes=shutil.disk_usage(workspace).free,
         worst_case_required_bytes=500_000_000,
     )
-    if target.exists():
+    manifest_path = target / "capture-manifest.json"
+    if manifest_path.exists():
         raise PanelCaptureError("panel capture already exists and is immutable")
+    target.mkdir(parents=True, exist_ok=True)
+
+    # A previous run may have died between publishing the dataset and writing
+    # the manifest above, leaving a `dataset` directory behind with no
+    # manifest over it. That directory is entirely derived from the raw
+    # payloads under `raw/`, every one of which is still on disk (and, if the
+    # fetch phase itself finished, recorded in the progress file read below),
+    # so it is safe -- and, since publish_panel_dataset refuses to write over
+    # an existing directory, necessary -- to remove it narrowly here and let
+    # this resumed run republish it from scratch. This only ever runs when
+    # capture-manifest.json is absent, i.e. the capture never completed.
+    dataset_directory = target / "dataset"
+    if dataset_directory.exists():
+        shutil.rmtree(dataset_directory)
+
     download = fetch if fetch is not None else PanelZipClient().fetch
 
-    raw_root = target / "raw"
+    progress_path = target / "capture-progress.jsonl"
     sources: list[dict[str, object]] = []
+    already_done: dict[tuple[str, str, str], dict[str, Any]] = {}
+    if progress_path.exists():
+        for line in progress_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            sources.append(entry)
+            already_done[(entry["symbol"], entry["month"], entry["kind"])] = entry
+
+    raw_root = target / "raw"
     candles: list[PanelCandleRow] = []
     funding: list[PanelFundingRow] = []
-    for symbol in symbols:
-        symbol_candle_row_count = 0
-        if months is not None:
-            kline_months: tuple[str, ...] = months
-            funding_months: tuple[str, ...] = months
-            ordered_months: tuple[str, ...] = months
-        else:
-            kline_months = _bounded_months(
-                discover_panel_months(download, symbol=symbol, kind="klines"),
-                month_from,
-                month_to,
-            )
-            funding_months = _bounded_months(
-                discover_panel_months(download, symbol=symbol, kind="fundingRate"),
-                month_from,
-                month_to,
-            )
-            ordered_months = tuple(sorted(set(kline_months) | set(funding_months)))
-        for month in ordered_months:
-            for kind, url_builder, kind_months in (
-                ("klines", build_kline_zip_url, kline_months),
-                ("fundingRate", build_funding_zip_url, funding_months),
-            ):
-                if month not in kind_months:
-                    continue
-                url = url_builder(symbol, month)
-                try:
-                    payload = download(url)
-                except PanelSourceAbsent:
-                    sources.append(
-                        {
+    with progress_path.open("a", encoding="utf-8") as progress_handle:
+        for symbol in symbols:
+            symbol_candle_row_count = 0
+            if months is not None:
+                kline_months: tuple[str, ...] = months
+                funding_months: tuple[str, ...] = months
+                ordered_months: tuple[str, ...] = months
+            else:
+                kline_months = _bounded_months(
+                    discover_panel_months(download, symbol=symbol, kind="klines"),
+                    month_from,
+                    month_to,
+                )
+                funding_months = _bounded_months(
+                    discover_panel_months(download, symbol=symbol, kind="fundingRate"),
+                    month_from,
+                    month_to,
+                )
+                ordered_months = tuple(sorted(set(kline_months) | set(funding_months)))
+            for month in ordered_months:
+                for kind, url_builder, kind_months in (
+                    ("klines", build_kline_zip_url, kline_months),
+                    ("fundingRate", build_funding_zip_url, funding_months),
+                ):
+                    if month not in kind_months:
+                        continue
+                    key = (symbol, month, kind)
+                    done = already_done.get(key)
+                    if done is not None:
+                        # Already recorded by a prior, interrupted run: don't
+                        # refetch it (that would also mint a fresh
+                        # received_time_ns, losing the original provenance),
+                        # just re-derive its rows from the raw payload that
+                        # run already wrote to disk.
+                        if done.get("status") == "present":
+                            relative = str(done["raw_relative_path"])
+                            raw_bytes = (target / relative).read_bytes()
+                            if hashlib.sha256(raw_bytes).hexdigest() != done.get("raw_sha256"):
+                                raise PanelCaptureError(
+                                    f"resumed raw payload hash mismatch: {relative}"
+                                )
+                            payload = PanelPayload(
+                                url=str(done["url"]),
+                                raw_bytes=raw_bytes,
+                                received_time_ns=int(done["received_time_ns"]),
+                            )
+                            if kind == "klines":
+                                rows = parse_kline_zip(payload, symbol=symbol)
+                                candles.extend(rows)
+                                symbol_candle_row_count += len(rows)
+                            else:
+                                funding.extend(parse_funding_zip(payload, symbol=symbol))
+                        continue
+                    url = url_builder(symbol, month)
+                    try:
+                        payload = download(url)
+                    except PanelSourceAbsent:
+                        absent_record: dict[str, object] = {
                             "symbol": symbol,
                             "month": month,
                             "kind": kind,
                             "url": url,
                             "status": "absent",
                         }
-                    )
-                    continue
-                _validate_panel_url(payload.url)
-                relative = f"raw/{symbol}/{kind}-{month}.zip"
-                path = target / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(payload.raw_bytes)
-                sources.append(
-                    {
+                        sources.append(absent_record)
+                        progress_handle.write(canonical_json(absent_record).decode("utf-8"))
+                        progress_handle.write("\n")
+                        progress_handle.flush()
+                        continue
+                    _validate_panel_url(payload.url)
+                    relative = f"raw/{symbol}/{kind}-{month}.zip"
+                    path = target / relative
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(payload.raw_bytes)
+                    present_record: dict[str, object] = {
                         "symbol": symbol,
                         "month": month,
                         "kind": kind,
@@ -293,17 +349,20 @@ def capture_panel(
                         "raw_sha256": hashlib.sha256(payload.raw_bytes).hexdigest(),
                         "status": "present",
                     }
+                    sources.append(present_record)
+                    progress_handle.write(canonical_json(present_record).decode("utf-8"))
+                    progress_handle.write("\n")
+                    progress_handle.flush()
+                    if kind == "klines":
+                        rows = parse_kline_zip(payload, symbol=symbol)
+                        candles.extend(rows)
+                        symbol_candle_row_count += len(rows)
+                    else:
+                        funding.extend(parse_funding_zip(payload, symbol=symbol))
+            if symbol_candle_row_count == 0:
+                raise PanelCaptureError(
+                    f"symbol {symbol} produced no candle rows across every requested month"
                 )
-                if kind == "klines":
-                    rows = parse_kline_zip(payload, symbol=symbol)
-                    candles.extend(rows)
-                    symbol_candle_row_count += len(rows)
-                else:
-                    funding.extend(parse_funding_zip(payload, symbol=symbol))
-        if symbol_candle_row_count == 0:
-            raise PanelCaptureError(
-                f"symbol {symbol} produced no candle rows across every requested month"
-            )
     if not raw_root.is_dir():
         raise PanelCaptureError("panel capture produced no raw payloads")
 
@@ -331,10 +390,11 @@ def capture_panel(
     capture_root_hash = content_sha256(material)
     document = dict(material)
     document["capture_root_hash"] = capture_root_hash
-    (target / "capture-manifest.json").write_bytes(canonical_json(document))
+    manifest_path.write_bytes(canonical_json(document))
+    progress_path.unlink(missing_ok=True)
     return PanelCaptureArtifact(
         capture_root=target,
-        capture_manifest_path=target / "capture-manifest.json",
+        capture_manifest_path=manifest_path,
         dataset_root=dataset.dataset_root,
         capture_root_hash=capture_root_hash,
         dataset_root_hash=dataset.root_hash,
