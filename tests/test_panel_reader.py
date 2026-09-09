@@ -75,3 +75,42 @@ def test_funding_events_carry_contract_ids(tmp_path: Path) -> None:
 def test_invalid_boundary_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(PanelReaderError):
         load_panel_bars(dataset(tmp_path), available_before_ns=0)
+
+
+def test_no_funding_partition_returns_empty(tmp_path: Path) -> None:
+    artifact = publish_panel_dataset(
+        tuple(row("BTCUSDT", index) for index in range(2)),
+        (),
+        output_directory=tmp_path / "dataset",
+        raw_source_hashes=("a" * 64,),
+    )
+    events = load_funding_events(artifact.dataset_root)
+    assert events == ()
+
+
+def test_orphan_funding_is_skipped(tmp_path: Path) -> None:
+    artifact = publish_panel_dataset(
+        tuple(row("BTCUSDT", index) for index in range(2)),
+        (
+            PanelFundingRow(
+                venue="BINANCE_UM",
+                instrument_id="BTCUSDT",
+                calc_time_ns=DAY_NS,
+                funding_interval_hours=8,
+                rate=Decimal("0.0001"),
+            ),
+            PanelFundingRow(
+                venue="BINANCE_UM",
+                instrument_id="XRPUSDT",
+                calc_time_ns=DAY_NS,
+                funding_interval_hours=8,
+                rate=Decimal("0.0002"),
+            ),
+        ),
+        output_directory=tmp_path / "dataset",
+        raw_source_hashes=("a" * 64,),
+    )
+    events = load_funding_events(artifact.dataset_root)
+    assert len(events) == 1
+    assert events[0].instrument_id == "BTCUSDT"
+    assert events[0].rate == Decimal("0.0001")

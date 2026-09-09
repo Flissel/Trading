@@ -80,6 +80,8 @@ def load_funding_events(dataset_root: Path) -> tuple[FundingEvent, ...]:
     first_open = _first_open_times(dataset_root)
     events: list[FundingEvent] = []
     for record in rows:
+        if len(record) != 3:
+            raise PanelReaderError("unexpected funding event schema")
         instrument_id = str(record[0])
         if instrument_id not in first_open:
             continue
@@ -100,4 +102,9 @@ def _first_open_times(dataset_root: Path) -> dict[str, int]:
         "SELECT instrument_id, MIN(open_time_ns) FROM read_parquet(?) GROUP BY instrument_id",
         params=[glob],
     ).fetchall()
-    return {str(record[0]): int(record[1]) for record in rows}
+    result = {}
+    for record in rows:
+        if len(record) != 2:
+            raise PanelReaderError("unexpected first open times schema")
+        result[str(record[0])] = int(record[1])
+    return result
