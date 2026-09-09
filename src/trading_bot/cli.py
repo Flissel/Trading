@@ -10,6 +10,8 @@ from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
 from trading_bot.panel_capture import capture_panel
+from trading_bot.panel_config import load_panel_family_spec
+from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
 from trading_bot.storage import StoragePolicy
 from trading_bot.strategy import CostScenario
@@ -68,6 +70,11 @@ def main(arguments: list[str] | None = None) -> int:
     panel_capture.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
     panel_capture.add_argument("--symbols", required=True, help="comma-separated symbol list")
     panel_capture.add_argument("--months", required=True, help="comma-separated YYYY-MM list")
+    panel_manifest = commands.add_parser("panel-manifest")
+    panel_manifest.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    panel_manifest.add_argument("--capture", type=Path, required=True)
+    panel_manifest.add_argument("--output", type=Path, required=True)
+    panel_manifest.add_argument("--family-spec", type=Path, required=True)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -180,6 +187,23 @@ def main(arguments: list[str] | None = None) -> int:
             reserve_bytes=parsed.reserve_bytes,
             symbols=tuple(item for item in parsed.symbols.split(",") if item),
             months=tuple(item for item in parsed.months.split(",") if item),
+        )
+        return 0
+    if parsed.command == "panel-manifest":
+        workspace = parsed.workspace_root.resolve()
+        manifest_paths = (
+            parsed.capture.resolve(),
+            parsed.output.resolve(),
+            parsed.family_spec.resolve(),
+        )
+        if any(not path.is_relative_to(workspace) for path in manifest_paths):
+            raise ValueError("panel manifest paths must stay inside workspace")
+        spec, spec_hash = load_panel_family_spec(manifest_paths[2])
+        publish_panel_walk_forward(
+            manifest_paths[0],
+            output_path=manifest_paths[1],
+            spec=spec,
+            family_spec_hash=spec_hash,
         )
         return 0
     raise AssertionError("unreachable command")
