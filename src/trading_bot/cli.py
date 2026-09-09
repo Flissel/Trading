@@ -9,6 +9,7 @@ from trading_bot.backtest import BacktestCase, BacktestRunner, write_report
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
+from trading_bot.panel_capture import capture_panel
 from trading_bot.research_run import run_capture_research
 from trading_bot.storage import StoragePolicy
 from trading_bot.strategy import CostScenario
@@ -61,6 +62,12 @@ def main(arguments: list[str] | None = None) -> int:
     fold_evaluation.add_argument("--random-seed", type=int, default=17)
     fold_evaluation.add_argument("--block-length", type=int, default=16)
     fold_evaluation.add_argument("--bootstrap-repetitions", type=int, default=2000)
+    panel_capture = commands.add_parser("panel-capture")
+    panel_capture.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    panel_capture.add_argument("--output", type=Path, required=True)
+    panel_capture.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
+    panel_capture.add_argument("--symbols", required=True, help="comma-separated symbol list")
+    panel_capture.add_argument("--months", required=True, help="comma-separated YYYY-MM list")
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -160,6 +167,19 @@ def main(arguments: list[str] | None = None) -> int:
             random_seed=parsed.random_seed,
             block_length=parsed.block_length,
             bootstrap_repetitions=parsed.bootstrap_repetitions,
+        )
+        return 0
+    if parsed.command == "panel-capture":
+        workspace = parsed.workspace_root.resolve()
+        output = parsed.output.resolve()
+        if not output.is_relative_to(workspace):
+            raise ValueError("panel capture paths must stay inside workspace")
+        capture_panel(
+            workspace_root=workspace,
+            output_directory=output,
+            reserve_bytes=parsed.reserve_bytes,
+            symbols=tuple(item for item in parsed.symbols.split(",") if item),
+            months=tuple(item for item in parsed.months.split(",") if item),
         )
         return 0
     raise AssertionError("unreachable command")
