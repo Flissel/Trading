@@ -55,8 +55,15 @@ class _FakeUrlopenResponse:
 
 def zip_bytes(name: str, text: str) -> bytes:
     buffer = io.BytesIO()
-    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr(name, text)
+    # A bare filename makes ZipFile.writestr stamp the entry with
+    # time.localtime() at two-second resolution, which makes the resulting
+    # bytes -- and therefore raw_sha256 -- nondeterministic across two calls
+    # that straddle a boundary. Pin a fixed date_time so identical (name,
+    # text) always produces byte-identical zips.
+    info = zipfile.ZipInfo(filename=name, date_time=(2024, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_DEFLATED
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr(info, text)
     return buffer.getvalue()
 
 
@@ -691,12 +698,12 @@ def test_capture_resumes_after_an_interruption_and_matches_an_uninterrupted_run(
 
     control_manifest = json.loads(control.capture_manifest_path.read_text(encoding="utf-8"))
     resumed_manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    # The properties that actually matter: the exact, ordered source list and
+    # the capture root hash it feeds into -- not just a same-elements set.
+    assert control_manifest["sources"] == resumed_manifest["sources"]
     assert control_manifest["dataset_root_hash"] == resumed_manifest["dataset_root_hash"]
-    assert {
-        (e["symbol"], e["month"], e["kind"], e["status"]) for e in control_manifest["sources"]
-    } == {
-        (e["symbol"], e["month"], e["kind"], e["status"]) for e in resumed_manifest["sources"]
-    }
+    assert control.capture_root_hash == artifact.capture_root_hash
+    assert control_manifest["capture_root_hash"] == resumed_manifest["capture_root_hash"]
 
 
 def test_capture_with_a_manifest_present_still_refuses(tmp_path: Path) -> None:
