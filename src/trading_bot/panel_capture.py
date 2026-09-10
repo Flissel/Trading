@@ -37,6 +37,7 @@ _MAX_ZIP_BYTES = 32_000_000
 _MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_]{2,32}$")
 _LISTING_MAX_KEYS = 1000
+_CAPTURE_VERSION = "1.0.0"
 
 
 class PanelCaptureError(RuntimeError):
@@ -275,22 +276,67 @@ def capture_panel(
     download = fetch if fetch is not None else PanelZipClient().fetch
     discovery_mode = months is None
 
+    # Recorded at the top of the progress file and re-checked on resume (see
+    # below): a resumed run must be continuing *this exact* request, not a
+    # narrowed or widened one -- otherwise sources seeded from the old run
+    # (e.g. a symbol or month range the operator just dropped) would still
+    # land in the manifest and raw_source_hashes without their rows ever
+    # being parsed into the dataset.
+    capture_parameters: dict[str, object] = {
+        "capture_version": _CAPTURE_VERSION,
+        "symbols": list(symbols),
+        "months": list(months) if months is not None else None,
+        "month_from": month_from,
+        "month_to": month_to,
+    }
+
     progress_path = target / "capture-progress.jsonl"
     sources: list[dict[str, object]] = []
     already_done: dict[tuple[str, str, str], dict[str, Any]] = {}
+    need_header = True
     if progress_path.exists():
-        for line in progress_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
+        non_blank = [
+            line for line in progress_path.read_text(encoding="utf-8").splitlines() if line.strip()
+        ]
+        for index, line in enumerate(non_blank):
+            is_last = index == len(non_blank) - 1
+            try:
+                record: Any = json.loads(line)
+            except json.JSONDecodeError as error:
+                if is_last:
+                    # A hard kill can only ever tear the final line -- every
+                    # earlier one was flushed complete before the next write
+                    # began. Drop it; its payload will simply be refetched,
+                    # which is lossless.
+                    break
+                raise PanelCaptureError(
+                    f"panel capture progress file is corrupt: {progress_path}"
+                ) from error
+            if index == 0:
+                if not (isinstance(record, dict) and "capture_parameters" in record):
+                    raise PanelCaptureError(
+                        f"panel capture progress file is corrupt: {progress_path}"
+                    )
+                if record["capture_parameters"] != capture_parameters:
+                    raise PanelCaptureError(
+                        "panel capture parameters differ from the interrupted run recorded "
+                        f"in {progress_path}"
+                    )
+                need_header = False
                 continue
-            entry = json.loads(line)
-            sources.append(entry)
-            already_done[(entry["symbol"], entry["month"], entry["kind"])] = entry
+            sources.append(record)
+            already_done[(record["symbol"], record["month"], record["kind"])] = record
 
     raw_root = target / "raw"
     candles: list[PanelCandleRow] = []
     funding: list[PanelFundingRow] = []
     discovered_months: dict[str, dict[str, list[str]]] = {}
     with progress_path.open("a", encoding="utf-8") as progress_handle:
+        if need_header:
+            header_record = {"capture_parameters": capture_parameters}
+            progress_handle.write(canonical_json(header_record).decode("utf-8"))
+            progress_handle.write("\n")
+            progress_handle.flush()
         for symbol in symbols:
             symbol_candle_row_count = 0
             if months is not None:
@@ -409,7 +455,7 @@ def capture_panel(
         ),
     )
     material: dict[str, object] = {
-        "capture_version": "1.0.0",
+        "capture_version": _CAPTURE_VERSION,
         "venue": _VENUE,
         "interval": "1d",
         "symbols": list(symbols),
