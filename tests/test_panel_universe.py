@@ -124,6 +124,65 @@ def test_even_liquidity_window_averages_the_two_middle_volumes() -> None:
     assert snapshot.reason_codes == ("UNIVERSE_TOO_SMALL",)
 
 
+def _close_time_ns(day_index: int) -> int:
+    return (day_index + 1) * DAY_NS - 1_000_000
+
+
+def bars_on_days(symbol: str, day_volumes: dict[int, str]) -> list[PanelBar]:
+    """One bar per (day index, volume) pair, at whatever days are given -- unlike
+    `bars`/`daily_volume_bars`, the day indices need not be consecutive, so
+    callers can construct a series with an interior hole."""
+    output: list[PanelBar] = []
+    for index, volume in sorted(day_volumes.items()):
+        open_time_ns = index * DAY_NS
+        close_time_ns = _close_time_ns(index)
+        output.append(
+            PanelBar(
+                contract_id=f"{symbol}:0",
+                instrument_id=symbol,
+                open_time_ns=open_time_ns,
+                close_time_ns=close_time_ns,
+                available_time_ns=close_time_ns + 1,
+                close=Decimal(100 + index),
+                quote_volume=Decimal(volume),
+            )
+        )
+    return output
+
+
+def test_liquidity_median_is_calendar_bound_not_observation_count_bound() -> None:
+    """Spec 7.1 item 3's "trailing 30-day median quote_volume" is a calendar
+    span ending at the decision, the same divergence as `_annualised_
+    volatility`'s pre-fix behaviour: `select_universe` used to take the last
+    `liquidity_window_days` *observations* regardless of the calendar span
+    they covered. Eight days of low volume (1,000,000), then an eight-day
+    interior hole, then two days of high volume (10,000,000) ending at the
+    decision, under a ten-calendar-day window: an observation-count window
+    still finds ten observations by reaching back into the low-volume days
+    the window was never meant to include, for a median of 1,000,000 --
+    below a 5,000,000 floor. Bounded by calendar days instead, the window
+    holds only the two high-volume days actually inside it, for a median of
+    10,000,000 -- above the floor. This is the ten-million-to-one-million
+    flip across a five-million threshold that motivated the fix, reproduced
+    from first principles rather than from a captured fixture."""
+    day_volumes = {day: "1000000" for day in range(8)}
+    day_volumes[16] = "10000000"
+    day_volumes[17] = "10000000"
+    rules = PanelUniverseRules(
+        minimum_history_days=10,
+        liquidity_window_days=10,
+        minimum_median_quote_volume=Decimal("5000000"),
+        maximum_contracts=1,
+        minimum_contracts=1,
+        tier_one_rank_limit=1,
+    )
+    histories = build_contract_histories(tuple(bars_on_days("AAAUSDT", day_volumes)))
+    decision = _close_time_ns(17)
+    snapshot = select_universe(histories, decision_close_ns=decision, rules=rules)
+    assert [item.contract_id for item in snapshot.contracts] == ["AAAUSDT:0"]
+    assert snapshot.contracts[0].median_quote_volume == Decimal("10000000")
+
+
 def test_equal_medians_break_ties_by_contract_id() -> None:
     # All three contracts carry the same volume, so their medians tie exactly; the
     # rows are added out of alphabetical order so the assertion cannot pass merely

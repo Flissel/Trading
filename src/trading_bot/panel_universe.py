@@ -6,6 +6,8 @@ from decimal import Decimal
 from trading_bot.panel_config import PanelUniverseRules
 from trading_bot.panel_reader import PanelBar
 
+DAY_NS = 86_400_000_000_000
+
 
 @dataclass(frozen=True, slots=True)
 class ContractHistory:
@@ -62,11 +64,25 @@ def select_universe(
     for contract_id in sorted(histories):
         history = histories[contract_id]
         observed = [value for value in history.close_times if value <= decision_close_ns]
+        # Spec 7.1 item 1's "at least 91 daily bars" is explicitly a bar
+        # count, not a calendar span -- unlike the liquidity window below,
+        # this stays a plain observation count.
         if len(observed) < rules.minimum_history_days:
             continue
         if not observed or observed[-1] != decision_close_ns:
             continue
-        window = observed[-rules.liquidity_window_days :]
+        # Spec 7.1 item 3's "trailing 30-day median" is a calendar span ending
+        # at the decision, not the last `liquidity_window_days` *observations*
+        # regardless of span. Bounding by calendar day (rather than slicing
+        # the last N observed values) means a hole inside the window simply
+        # yields fewer values for the median -- it never reaches outside the
+        # window to replace them, the way an observation-count slice would on
+        # a series with a gap. That reach-outside behaviour, not the median
+        # having fewer points, was the bug: a five-day hole let this window
+        # span 35 calendar days instead of 30 and pull in volume the window
+        # was never meant to see.
+        window_start_ns = decision_close_ns - (rules.liquidity_window_days - 1) * DAY_NS
+        window = [value for value in observed if value >= window_start_ns]
         median = _median(tuple(history.quote_volumes[value] for value in window))
         if median < rules.minimum_median_quote_volume:
             continue
