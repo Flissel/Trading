@@ -8,6 +8,7 @@ import pytest
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_decision import PanelDecisionError, build_panel_decision
+from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
 
 SPEC_PATH = Path("configs/xs-momentum-panel-v1.json")
 SPEC, SPEC_HASH = load_panel_family_spec(SPEC_PATH)
@@ -520,3 +521,116 @@ def test_tampered_report_is_rejected(tmp_path: Path) -> None:
             output_path=tmp_path / "decision.json",
             registry_path=tmp_path / "registry.sqlite3",
         )
+
+
+def write_fold_with_held_nothing(
+    path: Path,
+    fold_index: int,
+    returns: dict[str, tuple[str, str]],
+    *,
+    held_nothing_candidate: str,
+    held_nothing_index: int = 0,
+) -> None:
+    """Like `write_fold`, but one episode of `held_nothing_candidate`, in both
+    scenarios, is marked the way `panel_fold_run.py` marks a week where a member's
+    own construction produced no weights while the universe was not too small."""
+    candidates = []
+    for name in MEMBERS + CONTROLS:
+        base_value, adverse_value = returns.get(name, ("0", "0"))
+        base_episodes = episodes(f"f{fold_index}", base_value, EPISODES_PER_FOLD)
+        adverse_episodes = episodes(f"f{fold_index}", adverse_value, EPISODES_PER_FOLD)
+        if name == held_nothing_candidate:
+            base_episodes[held_nothing_index]["reason_codes"] = [MEMBER_HELD_NOTHING_REASON_CODE]
+            adverse_episodes[held_nothing_index]["reason_codes"] = [
+                MEMBER_HELD_NOTHING_REASON_CODE
+            ]
+        candidates.append(
+            {
+                "candidate_name": name,
+                "role": "member" if name in MEMBERS else "control",
+                "episode_count": EPISODES_PER_FOLD,
+                "base": {
+                    "total_net_return": str(
+                        Decimal(base_value) * Decimal(EPISODES_PER_FOLD)
+                    ),
+                    "episodes": base_episodes,
+                },
+                "adverse": {
+                    "total_net_return": str(
+                        Decimal(adverse_value) * Decimal(EPISODES_PER_FOLD)
+                    ),
+                    "episodes": adverse_episodes,
+                },
+            }
+        )
+    material = {
+        "report_version": "1.0.0",
+        "status": "development_only",
+        "reason_codes": [],
+        "family_name": SPEC.family_name,
+        "family_spec_hash": SPEC_HASH,
+        "capture_root_hash": "c" * 64,
+        "dataset_root_hash": "d" * 64,
+        "split_manifest_hash": "e" * 64,
+        "manifest_hash": "f" * 64,
+        "fold_index": fold_index,
+        "fold_count": 6,
+        "train_sample_count": 10,
+        "validation_sample_count": 10,
+        "test_sample_count": EPISODES_PER_FOLD,
+        "train_membership_hash": "0" * 64,
+        "validation_membership_hash": "1" * 64,
+        "test_membership_hash": "2" * 64,
+        "random_seed": 17,
+        "block_length": 4,
+        "bootstrap_repetitions": 2000,
+        "skipped_sample_ids": [],
+        "code_hash": "3" * 64,
+        "candidates": candidates,
+    }
+    document = dict(material)
+    document["report_hash"] = content_sha256(material)
+    path.write_bytes(canonical_json(document))
+
+
+def test_member_held_nothing_episode_is_excluded_from_pooling(tmp_path: Path) -> None:
+    # Fold 0 marks one of xs_mom_4w's 40 episodes MEMBER_HELD_NOTHING in both
+    # scenarios; every other fold and every other candidate is a plain uniform
+    # profile. The marked episode must be dropped from xs_mom_4w's own pooled
+    # series and episode count -- not merely zeroed -- while every other
+    # candidate's pooled count is untouched, and the shared-episode-count
+    # invariant (now checked on the *raw*, pre-exclusion count) does not fire even
+    # though the post-exclusion counts now differ across candidates.
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        if fold_index == 0:
+            write_fold_with_held_nothing(
+                path,
+                fold_index,
+                {"xs_mom_4w": ("0.01", "0.001")},
+                held_nothing_candidate="xs_mom_4w",
+            )
+        else:
+            write_fold(path, fold_index, {"xs_mom_4w": ("0.01", "0.001")})
+        paths.append(path)
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=SPEC_PATH,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    assert momentum["episode_count"] == 6 * EPISODES_PER_FOLD - 1
+    assert momentum["base_total_net_return"] == str(
+        Decimal("0.01") * (6 * EPISODES_PER_FOLD - 1)
+    )
+    # The top-level pooled count reports the shared raw decision calendar, not any
+    # one member's post-exclusion count.
+    assert document["pooled_episode_count"] == 6 * EPISODES_PER_FOLD
+    # An untouched candidate's own pooled count is unaffected.
+    control = next(item for item in document["controls"] if item["candidate_name"] == "no_trade")
+    assert control["episode_count"] == 6 * EPISODES_PER_FOLD

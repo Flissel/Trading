@@ -10,12 +10,22 @@ import pytest
 from trading_bot import panel_fold_run as panel_fold_run_module
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_capture import PanelPayload, capture_panel
-from trading_bot.panel_config import load_panel_family_spec
-from trading_bot.panel_fold_run import PanelFoldError, run_panel_fold, verify_panel_fold_report
+from trading_bot.panel_config import PanelFamilySpec, load_panel_family_spec
+from trading_bot.panel_fold_run import (
+    MEMBER_HELD_NOTHING_REASON_CODE,
+    PanelFoldError,
+    run_panel_fold,
+    verify_panel_fold_report,
+)
 from trading_bot.panel_reader import load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
-from trading_bot.panel_signals import build_weight_vectors
-from trading_bot.panel_universe import build_contract_histories, select_universe
+from trading_bot.panel_signals import WeightVector, build_weight_vectors
+from trading_bot.panel_universe import (
+    ContractHistory,
+    UniverseSnapshot,
+    build_contract_histories,
+    select_universe,
+)
 from trading_bot.registry import MetadataRegistry
 
 DAY_MS = 86_400_000
@@ -514,3 +524,66 @@ def test_fold_wide_bars_are_bounded_exactly_at_the_test_end_boundary(
         fold_index=0,
     )
     assert captured_boundaries == [test_end_ns + 1]
+
+
+def test_member_held_nothing_is_marked_and_controls_are_never_marked(
+    workspace: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member's own construction can legitimately return no weights (too few
+    rankable contracts to form both cross-sectional quintiles, or none with a full
+    volatility window) even though the week's universe was not too small. Such an
+    episode must be visibly marked MEMBER_HELD_NOTHING, not recorded as an ordinary,
+    unremarkable zero-return episode -- and a control whose weights are also empty
+    by design (`no_trade`, always) must never be marked, since its emptiness is a
+    deliberate baseline, not a data-insufficiency artifact."""
+    root, capture_root, config_path = workspace
+    original_build_weight_vectors = build_weight_vectors
+    calls = {"count": 0}
+
+    def flaky_vectors(
+        histories: dict[str, ContractHistory],
+        snapshot: UniverseSnapshot,
+        *,
+        spec: PanelFamilySpec,
+    ) -> dict[str, WeightVector]:
+        vectors = original_build_weight_vectors(histories, snapshot, spec=spec)
+        calls["count"] += 1
+        if calls["count"] == 1:
+            # Force xs_mom_1w to have produced no weights on the fold's first
+            # decision only, as if too few contracts were rankable -- without
+            # touching the universe snapshot itself, which stays non-empty.
+            existing = vectors["xs_mom_1w"]
+            forced = dict(vectors)
+            forced["xs_mom_1w"] = WeightVector(
+                existing.decision_close_ns, existing.member, (), existing.reason_codes
+            )
+            return forced
+        return vectors
+
+    monkeypatch.setattr(panel_fold_run_module, "build_weight_vectors", flaky_vectors)
+
+    artifact = run_panel_fold(
+        capture_root,
+        manifest_path=root / "manifest.json",
+        family_spec_path=config_path,
+        output_path=root / "fold0.json",
+        registry_path=root / "registry.sqlite3",
+        fold_index=0,
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["candidates"] if item["candidate_name"] == "xs_mom_1w"
+    )
+    base_reason_codes = [episode["reason_codes"] for episode in momentum["base"]["episodes"]]
+    adverse_reason_codes = [episode["reason_codes"] for episode in momentum["adverse"]["episodes"]]
+    assert base_reason_codes[0] == [MEMBER_HELD_NOTHING_REASON_CODE]
+    assert adverse_reason_codes[0] == [MEMBER_HELD_NOTHING_REASON_CODE]
+    assert all(codes == [] for codes in base_reason_codes[1:])
+    assert all(codes == [] for codes in adverse_reason_codes[1:])
+    # Every decision this fold reached build_weight_vectors, confirming the forced
+    # override above actually landed on the fold's very first decision.
+    assert calls["count"] == len(momentum["base"]["episodes"])
+
+    no_trade = next(item for item in document["candidates"] if item["candidate_name"] == "no_trade")
+    assert all(episode["reason_codes"] == [] for episode in no_trade["base"]["episodes"])
+    assert all(episode["reason_codes"] == [] for episode in no_trade["adverse"]["episodes"])

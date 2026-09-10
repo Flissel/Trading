@@ -8,9 +8,13 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from trading_bot.canonical import canonical_json, content_sha256
-from trading_bot.evaluation import BootstrapMeanTest, benjamini_hochberg, block_bootstrap_mean_test
+from trading_bot.evaluation import (
+    BootstrapMeanTest,
+    benjamini_hochberg,
+    block_bootstrap_mean_test,
+)
 from trading_bot.panel_config import PanelFamilySpec, load_panel_family_spec
-from trading_bot.panel_fold_run import verify_panel_fold_report
+from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE, verify_panel_fold_report
 from trading_bot.panel_statistics import (
     PanelStatisticsError,
     annualised_sharpe,
@@ -41,6 +45,12 @@ class _Pooled:
     fold_base_totals: tuple[Decimal, ...]
     contract_totals: dict[str, Decimal]
     episode_count: int
+    # Episode count before excluding MEMBER_HELD_NOTHING-marked episodes --
+    # the same for every candidate in one decision (it reflects how many
+    # decisions were not skipped for UNIVERSE_TOO_SMALL, independent of any
+    # one member's own holding pattern) and used only for the cross-candidate
+    # linkage check and the top-level `pooled_episode_count` report field.
+    raw_episode_count: int
 
 
 def build_panel_decision(
@@ -106,9 +116,17 @@ def build_panel_decision(
     pooled: dict[str, _Pooled] = {
         name: _pool(documents, name) for name in member_names + control_names
     }
-    episode_counts = {pooled[name].episode_count for name in member_names + control_names}
-    if len(episode_counts) != 1:
+    # This checks the *raw* per-candidate episode count, from before any
+    # MEMBER_HELD_NOTHING episode is excluded below -- that raw count is what
+    # every candidate must share (it reflects the fold-report family's own
+    # decision calendar), whereas the post-exclusion `episode_count` now
+    # legitimately differs member by member.
+    raw_episode_counts = {
+        pooled[name].raw_episode_count for name in member_names + control_names
+    }
+    if len(raw_episode_counts) != 1:
         raise PanelDecisionError("candidates do not share one pooled episode count")
+    pooled_raw_episode_count = next(iter(raw_episode_counts))
     fold_count = len(documents)
 
     tests: dict[str, BootstrapMeanTest] = {}
@@ -185,7 +203,7 @@ def build_panel_decision(
         "dataset_root_hash": str(documents[0]["dataset_root_hash"]),
         "split_manifest_hash": str(documents[0]["split_manifest_hash"]),
         "fold_count": fold_count,
-        "pooled_episode_count": pooled[member_names[0]].episode_count,
+        "pooled_episode_count": pooled_raw_episode_count,
         "source_report_hashes": [str(document["report_hash"]) for document in documents],
         "skipped_sample_ids": sorted(
             {
@@ -234,11 +252,31 @@ def _register_artifact(registry_path: Path, *, output_path: Path, report_hash: s
         )
 
 
+def _held_nothing(episode: object) -> bool:
+    """True if the fold report marked this episode MEMBER_HELD_NOTHING.
+
+    A member's own weight construction can return no weights (too few
+    rankable contracts to form both cross-sectional quintiles, or none with a
+    full volatility window) even though the week's universe was not too
+    small. Such an episode holds no position and must be excluded from the
+    pooled series and the episode floor the same way a UNIVERSE_TOO_SMALL
+    week already is (spec section 7.1), one level down. Older-shaped episode
+    dicts with no `reason_codes` key at all are simply never held-nothing.
+    """
+    if not isinstance(episode, dict):
+        return False
+    codes = episode.get("reason_codes", ())
+    if not isinstance(codes, list | tuple):
+        return False
+    return MEMBER_HELD_NOTHING_REASON_CODE in codes
+
+
 def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     base: list[Decimal] = []
     adverse: list[Decimal] = []
     fold_totals: list[Decimal] = []
     contracts: dict[str, Decimal] = {}
+    raw_episode_count = 0
     for document in documents:
         candidates = document["candidates"]
         if not isinstance(candidates, list):
@@ -248,8 +286,12 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         )
         if record is None:
             raise PanelDecisionError(f"fold report is missing candidate {name}")
+        base_episodes = record["base"]["episodes"]
+        raw_episode_count += len(base_episodes)
         fold_total = Decimal(0)
-        for episode in record["base"]["episodes"]:
+        for episode in base_episodes:
+            if _held_nothing(episode):
+                continue
             value = Decimal(str(episode["net_return"]))
             base.append(value)
             fold_total += value
@@ -259,6 +301,8 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
                 ) + Decimal(str(contribution))
         fold_totals.append(fold_total)
         for episode in record["adverse"]["episodes"]:
+            if _held_nothing(episode):
+                continue
             adverse.append(Decimal(str(episode["net_return"])))
     return _Pooled(
         base_returns=tuple(base),
@@ -268,6 +312,7 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         fold_base_totals=tuple(fold_totals),
         contract_totals=contracts,
         episode_count=len(base),
+        raw_episode_count=raw_episode_count,
     )
 
 
