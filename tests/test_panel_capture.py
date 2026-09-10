@@ -1202,6 +1202,95 @@ def test_capture_resume_refuses_when_a_symbol_is_dropped(tmp_path: Path) -> None
         )
 
 
+def test_capture_bounded_window_tolerates_a_symbol_not_yet_listed(tmp_path: Path) -> None:
+    """FTTUSDT-style repro: the FTT perpetual first listed 2022-04, so a pilot window
+    of 2022-01..2022-03 (given as bounds, months omitted) discovers a kline month for
+    it that does not survive the bounds. That is legitimate emptiness -- the contract
+    had not started trading inside the window -- and must not abort the whole run, as
+    long as another symbol (BTCUSDT here) has real data inside the window. FTTUSDT's
+    own dump URLs must never even be requested, since none of its months are in
+    bounds."""
+
+    def fetch(url: str) -> PanelPayload:
+        if "list-type=2" in url:
+            kind = "fundingRate" if "fundingRate" in url else "klines"
+            months: tuple[str, ...]
+            if "FTTUSDT" in url:
+                symbol, months = "FTTUSDT", ("2022-04",)
+            else:
+                symbol, months = "BTCUSDT", ("2022-01", "2022-02", "2022-03")
+            if kind == "klines":
+                keys = tuple(
+                    f"data/futures/um/monthly/klines/{symbol}/1d/{symbol}-1d-{m}.zip"
+                    for m in months
+                )
+            else:
+                keys = tuple(
+                    f"data/futures/um/monthly/fundingRate/{symbol}/{symbol}-fundingRate-{m}.zip"
+                    for m in months
+                )
+            return PanelPayload(url=url, raw_bytes=_listing_xml(keys=keys), received_time_ns=1)
+        if "FTTUSDT" in url:
+            raise AssertionError(f"FTTUSDT dump should never be fetched: {url}")
+        if "fundingRate" in url:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("f.csv", funding_csv()), received_time_ns=1
+            )
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT", "FTTUSDT"),
+        month_from="2022-01",
+        month_to="2022-03",
+        fetch=fetch,
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["discovered_months"]["FTTUSDT"]["klines"] == []
+    assert all(entry["symbol"] != "FTTUSDT" for entry in manifest["sources"])
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+
+def test_capture_bounded_window_still_rejects_a_symbol_with_no_history_at_all(
+    tmp_path: Path,
+) -> None:
+    """Distinguishes the two empty-row cases month bounds create: a symbol that
+    discovered months but none survive the bounds (tolerated, above) from a symbol
+    that discovered nothing at all in the bucket, at any date -- still a wrong
+    symbol, and the guard must still fire even though bounds were given."""
+
+    def fetch(url: str) -> PanelPayload:
+        if "list-type=2" in url:
+            if "GHOSTUSDT" in url:
+                keys: tuple[str, ...] = ()
+            elif "fundingRate" in url:
+                keys = (
+                    "data/futures/um/monthly/fundingRate/BTCUSDT/"
+                    "BTCUSDT-fundingRate-2022-01.zip",
+                )
+            else:
+                keys = ("data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2022-01.zip",)
+            return PanelPayload(url=url, raw_bytes=_listing_xml(keys=keys), received_time_ns=1)
+        if "fundingRate" in url:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("f.csv", funding_csv()), received_time_ns=1
+            )
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    with pytest.raises(PanelCaptureError, match="GHOSTUSDT"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=tmp_path / "capture",
+            reserve_bytes=0,
+            symbols=("BTCUSDT", "GHOSTUSDT"),
+            month_from="2022-01",
+            month_to="2022-03",
+            fetch=fetch,
+        )
+
+
 def test_capture_resume_refuses_when_the_month_window_narrows(tmp_path: Path) -> None:
     target = tmp_path / "resumable"
     calls = {"count": 0}

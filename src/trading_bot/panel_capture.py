@@ -371,26 +371,35 @@ def capture_panel(
             progress_handle.flush()
         for symbol in symbols:
             symbol_candle_row_count = 0
+            # Only meaningful in discovery mode (see the empty-row guard
+            # below): true when the bucket does list kline months for this
+            # symbol, but every one of them falls outside [month_from,
+            # month_to]. That is legitimate emptiness -- a contract that had
+            # not started (or had already ended) trading inside the
+            # requested window, e.g. FTTUSDT first listed 2022-04 against a
+            # 2022-01..2022-03 pilot window -- not a wrong symbol.
+            symbol_has_no_months_inside_bounds = False
             if months is not None:
                 kline_months: tuple[str, ...] = months
                 funding_months: tuple[str, ...] = months
                 ordered_months: tuple[str, ...] = months
             else:
-                kline_months = _bounded_months(
-                    discover_panel_months(download, symbol=symbol, kind="klines"),
-                    month_from,
-                    month_to,
+                discovered_kline_months = discover_panel_months(
+                    download, symbol=symbol, kind="klines"
                 )
-                funding_months = _bounded_months(
-                    discover_panel_months(download, symbol=symbol, kind="fundingRate"),
-                    month_from,
-                    month_to,
+                discovered_funding_months = discover_panel_months(
+                    download, symbol=symbol, kind="fundingRate"
                 )
+                kline_months = _bounded_months(discovered_kline_months, month_from, month_to)
+                funding_months = _bounded_months(discovered_funding_months, month_from, month_to)
                 discovered_months[symbol] = {
                     "klines": list(kline_months),
                     "fundingRate": list(funding_months),
                 }
                 ordered_months = tuple(sorted(set(kline_months) | set(funding_months)))
+                symbol_has_no_months_inside_bounds = (
+                    bool(discovered_kline_months) and not kline_months
+                )
             for month in ordered_months:
                 for kind, url_builder, kind_months in (
                     ("klines", build_kline_zip_url, kline_months),
@@ -471,7 +480,7 @@ def capture_panel(
                         symbol_candle_row_count += len(rows)
                     else:
                         funding.extend(parse_funding_zip(payload, symbol=symbol))
-            if symbol_candle_row_count == 0:
+            if symbol_candle_row_count == 0 and not symbol_has_no_months_inside_bounds:
                 raise PanelCaptureError(
                     f"symbol {symbol} produced no candle rows across every requested month"
                 )
