@@ -1,6 +1,7 @@
 import io
 import json
 import zipfile
+from collections.abc import Callable
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -174,3 +175,80 @@ def test_pooled_sample_floor_is_enforced(tmp_path: Path) -> None:
             spec=spec,
             family_spec_hash=spec_hash,
         )
+
+
+_QUALITY_TEST_MONTH = "2020-01"
+_QUALITY_TEST_MONTH_DAYS = 31
+
+
+def _quality_gap_kline_csv(skip: frozenset[int]) -> str:
+    lines = [_FLOOR_TEST_KLINE_HEADER]
+    for offset in range(_QUALITY_TEST_MONTH_DAYS):
+        if offset in skip:
+            continue
+        open_ms = offset * DAY_MS
+        lines.append(
+            f"{open_ms},100,101,99,100,10,{open_ms + DAY_MS - 1},50000000,100,50,25000000,0"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _quality_gap_fetch(skip: frozenset[int]) -> Callable[[str], PanelPayload]:
+    def fetch(url: str) -> PanelPayload:
+        if "fundingRate" in url:
+            text = "calc_time,funding_interval_hours,last_funding_rate\n0,8,0.0001\n"
+            return PanelPayload(url=url, raw_bytes=_zip_bytes("f.csv", text), received_time_ns=1)
+        return PanelPayload(
+            url=url,
+            raw_bytes=_zip_bytes("k.csv", _quality_gap_kline_csv(skip)),
+            received_time_ns=1,
+        )
+
+    return fetch
+
+
+def test_capture_quality_stop_is_enforced(tmp_path: Path) -> None:
+    # BTCUSDT's January dump is missing five interior days (offsets 10-14): the
+    # instrument's listed span still runs the full month, so `missing_days` for it
+    # is exactly 5 -- over the 3-day threshold spec section 12 step 3 sets. Building
+    # a manifest on top of this capture must stop before any fold work happens.
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=(_QUALITY_TEST_MONTH,),
+        fetch=_quality_gap_fetch(frozenset({10, 11, 12, 13, 14})),
+    )
+    with pytest.raises(PanelSamplesError, match="CAPTURE_QUALITY_FAILED") as excinfo:
+        publish_panel_walk_forward(
+            tmp_path / "capture",
+            output_path=tmp_path / "manifest.json",
+            spec=SPEC,
+            family_spec_hash="a" * 64,
+        )
+    assert "BTCUSDT" in str(excinfo.value)
+    assert "5 missing days" in str(excinfo.value)
+    assert not (tmp_path / "manifest.json").exists()
+
+
+def test_capture_quality_stop_does_not_misfire_at_the_threshold(tmp_path: Path) -> None:
+    # Exactly 3 missing days (offsets 10-12) is at, not over, the threshold -- the
+    # quality gate must not fire. The run still fails downstream (one month of one
+    # symbol cannot satisfy the real fold geometry), but not for CAPTURE_QUALITY_FAILED.
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=(_QUALITY_TEST_MONTH,),
+        fetch=_quality_gap_fetch(frozenset({10, 11, 12})),
+    )
+    with pytest.raises(PanelSamplesError) as excinfo:
+        publish_panel_walk_forward(
+            tmp_path / "capture",
+            output_path=tmp_path / "manifest.json",
+            spec=SPEC,
+            family_spec_hash="a" * 64,
+        )
+    assert "CAPTURE_QUALITY_FAILED" not in str(excinfo.value)
