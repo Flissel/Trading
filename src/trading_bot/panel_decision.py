@@ -3,7 +3,7 @@
 import json
 import time
 from dataclasses import dataclass
-from decimal import Context, Decimal, localcontext
+from decimal import Context, Decimal, Inexact, localcontext
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -69,7 +69,14 @@ _DECLARED_DEVIATIONS: tuple[dict[str, object], ...] = (
 # See the comment at its point of use for why that is what actually makes
 # `sum(contract_totals)` and `base_total` -- two different groupings of the
 # same underlying money -- agree exactly rather than approximately.
+#
+# Real inputs need roughly 32 digits of headroom (measured); prec=50 leaves
+# ample margin. Inexact is trapped so that margin is an enforced guarantee,
+# not an assumption: if it is ever exceeded, this raises immediately rather
+# than silently rounding to a wrong total that nothing downstream would
+# notice -- the exact failure mode this precision work exists to remove.
 _POOLING_CONTEXT = Context(prec=50)
+_POOLING_CONTEXT.traps[Inexact] = True
 
 
 class PanelDecisionError(RuntimeError):
@@ -91,6 +98,17 @@ class _Pooled:
     base_total: Decimal
     adverse_total: Decimal
     fold_base_totals: tuple[Decimal, ...]
+    # How many episodes this member actually retained from each fold, in
+    # fold-index order -- surfaces the case the R1 backward-roll fallback
+    # cannot fix on its own: a fold where the member retained zero episodes
+    # (every one of that fold's decisions was MEMBER_HELD_NOTHING). That fold
+    # then contributes only to `fold_base_totals`/`base_total`, never to
+    # `base_returns`, `base_turnovers` or the bootstrap series they feed --
+    # authorised (there is no episode within that fold to roll the cost onto)
+    # but otherwise invisible, since a fold like that looks identical to a
+    # healthy one everywhere else in the report.
+    base_fold_retained_episode_counts: tuple[int, ...]
+    adverse_fold_retained_episode_counts: tuple[int, ...]
     contract_totals: dict[str, Decimal]
     episode_count: int
     # Episode count before excluding MEMBER_HELD_NOTHING-marked episodes --
@@ -474,6 +492,8 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     base: list[Decimal] = []
     adverse: list[Decimal] = []
     fold_totals: list[Decimal] = []
+    base_fold_retained_counts: list[int] = []
+    adverse_fold_retained_counts: list[int] = []
     contracts: dict[str, Decimal] = {}
     base_turnovers: list[Decimal] = []
     adverse_turnovers: list[Decimal] = []
@@ -507,56 +527,68 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     # and mathematically exact sums are associative -- any two correct
     # regroupings of the same numbers then agree to the last digit, not by
     # coincidence of accumulation order.
-    with localcontext(_POOLING_CONTEXT):
-        for document in documents:
-            candidates = document["candidates"]
-            if not isinstance(candidates, list):
-                raise PanelDecisionError("fold report candidates are malformed")
-            record = next(
-                (item for item in candidates if item.get("candidate_name") == name), None
-            )
-            if record is None:
-                raise PanelDecisionError(f"fold report is missing candidate {name}")
-            base_episodes = record["base"]["episodes"]
-            adverse_episodes = record["adverse"]["episodes"]
-            if not isinstance(base_episodes, list) or not isinstance(adverse_episodes, list):
-                raise PanelDecisionError("fold report episodes are malformed")
-            raw_episode_count += len(base_episodes)
+    try:
+        with localcontext(_POOLING_CONTEXT):
+            for document in documents:
+                candidates = document["candidates"]
+                if not isinstance(candidates, list):
+                    raise PanelDecisionError("fold report candidates are malformed")
+                record = next(
+                    (item for item in candidates if item.get("candidate_name") == name), None
+                )
+                if record is None:
+                    raise PanelDecisionError(f"fold report is missing candidate {name}")
+                base_episodes = record["base"]["episodes"]
+                adverse_episodes = record["adverse"]["episodes"]
+                if not isinstance(base_episodes, list) or not isinstance(adverse_episodes, list):
+                    raise PanelDecisionError("fold report episodes are malformed")
+                raw_episode_count += len(base_episodes)
 
-            base_result = _pool_scenario_fold(
-                base_episodes,
-                values=base,
-                turnovers=base_turnovers,
-                gross_exposures=base_gross_exposures,
-                net_exposures=base_net_exposures,
-                contract_totals=contracts,
-            )
-            fold_totals.append(base_result.fold_total)
-            base_total += base_result.fold_total
-            base_held_nothing_count += base_result.held_nothing_count
-            base_held_nothing_rolled += base_result.held_nothing_net_return
-            base_held_nothing_turnover_rolled += base_result.held_nothing_turnover
-            base_forced_close_count += base_result.forced_close_count
+                base_retained_before = len(base)
+                base_result = _pool_scenario_fold(
+                    base_episodes,
+                    values=base,
+                    turnovers=base_turnovers,
+                    gross_exposures=base_gross_exposures,
+                    net_exposures=base_net_exposures,
+                    contract_totals=contracts,
+                )
+                fold_totals.append(base_result.fold_total)
+                base_fold_retained_counts.append(len(base) - base_retained_before)
+                base_total += base_result.fold_total
+                base_held_nothing_count += base_result.held_nothing_count
+                base_held_nothing_rolled += base_result.held_nothing_net_return
+                base_held_nothing_turnover_rolled += base_result.held_nothing_turnover
+                base_forced_close_count += base_result.forced_close_count
 
-            adverse_result = _pool_scenario_fold(
-                adverse_episodes,
-                values=adverse,
-                turnovers=adverse_turnovers,
-                gross_exposures=adverse_gross_exposures,
-                net_exposures=adverse_net_exposures,
-                contract_totals=None,
-            )
-            adverse_total += adverse_result.fold_total
-            adverse_held_nothing_count += adverse_result.held_nothing_count
-            adverse_held_nothing_rolled += adverse_result.held_nothing_net_return
-            adverse_held_nothing_turnover_rolled += adverse_result.held_nothing_turnover
-            adverse_forced_close_count += adverse_result.forced_close_count
+                adverse_retained_before = len(adverse)
+                adverse_result = _pool_scenario_fold(
+                    adverse_episodes,
+                    values=adverse,
+                    turnovers=adverse_turnovers,
+                    gross_exposures=adverse_gross_exposures,
+                    net_exposures=adverse_net_exposures,
+                    contract_totals=None,
+                )
+                adverse_fold_retained_counts.append(len(adverse) - adverse_retained_before)
+                adverse_total += adverse_result.fold_total
+                adverse_held_nothing_count += adverse_result.held_nothing_count
+                adverse_held_nothing_rolled += adverse_result.held_nothing_net_return
+                adverse_held_nothing_turnover_rolled += adverse_result.held_nothing_turnover
+                adverse_forced_close_count += adverse_result.forced_close_count
+    except Inexact as error:
+        raise PanelDecisionError(
+            "pooling summation exceeded its precision headroom (_POOLING_CONTEXT) -- "
+            "the pooled total can no longer be guaranteed exact"
+        ) from error
     return _Pooled(
         base_returns=tuple(base),
         adverse_returns=tuple(adverse),
         base_total=base_total,
         adverse_total=adverse_total,
         fold_base_totals=tuple(fold_totals),
+        base_fold_retained_episode_counts=tuple(base_fold_retained_counts),
+        adverse_fold_retained_episode_counts=tuple(adverse_fold_retained_counts),
         contract_totals=contracts,
         episode_count=len(base),
         raw_episode_count=raw_episode_count,
@@ -575,6 +607,15 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         base_held_nothing_turnover_rolled_forward=base_held_nothing_turnover_rolled,
         adverse_held_nothing_turnover_rolled_forward=adverse_held_nothing_turnover_rolled,
     )
+
+
+def _folds_with_no_retained_episodes(counts: tuple[int, ...]) -> list[int]:
+    """Fold indices (positional, which is also fold_index -- documents are
+    sorted by fold_index before pooling) where a member retained zero
+    episodes: the R1 backward-roll fallback for a fold that retains nothing
+    at all, made visible rather than indistinguishable from a healthy fold.
+    """
+    return [index for index, count in enumerate(counts) if count == 0]
 
 
 def _mean(values: tuple[Decimal, ...]) -> Decimal:
@@ -705,6 +746,10 @@ def _member_record(
         "base_held_nothing_turnover_rolled_forward": (
             pooled.base_held_nothing_turnover_rolled_forward
         ),
+        "base_fold_retained_episode_counts": list(pooled.base_fold_retained_episode_counts),
+        "base_folds_with_no_retained_episodes": _folds_with_no_retained_episodes(
+            pooled.base_fold_retained_episode_counts
+        ),
         "adverse_total_net_return": pooled.adverse_total,
         "adverse_mean_net_return": adverse_mean,
         "adverse_median_net_return": _median(pooled.adverse_returns),
@@ -720,6 +765,12 @@ def _member_record(
         ),
         "adverse_held_nothing_turnover_rolled_forward": (
             pooled.adverse_held_nothing_turnover_rolled_forward
+        ),
+        "adverse_fold_retained_episode_counts": list(
+            pooled.adverse_fold_retained_episode_counts
+        ),
+        "adverse_folds_with_no_retained_episodes": _folds_with_no_retained_episodes(
+            pooled.adverse_fold_retained_episode_counts
         ),
         "universe_too_small_week_count": universe_too_small_week_count,
         "positive_base_fold_count": positive_folds,

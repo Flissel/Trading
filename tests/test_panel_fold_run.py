@@ -766,8 +766,12 @@ def test_member_held_nothing_last_in_fold_is_rolled_backward(
         adverse_returns_sum = sum(pooled.adverse_returns, Decimal(0))
         base_turnovers_sum = sum(pooled.base_turnovers, Decimal(0))
         contract_totals_sum = sum(pooled.contract_totals.values(), Decimal(0))
-        base_mean_from_total = pooled.base_total / Decimal(pooled.episode_count)
-        base_mean_from_series = base_returns_sum / Decimal(len(pooled.base_returns))
+    # Division is expected to round (most quotients are not exact in Decimal),
+    # so -- like `_member_record` itself -- these means are computed outside
+    # the Inexact-trapped pooling context; only the summations above are
+    # expected to be exact.
+    base_mean_from_total = pooled.base_total / Decimal(pooled.episode_count)
+    base_mean_from_series = base_returns_sum / Decimal(len(pooled.base_returns))
 
     # R1: the fold's last episode (held-nothing, a genuine unwind) is no longer
     # missing from the per-episode series -- it was rolled backward onto the

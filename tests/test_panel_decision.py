@@ -1,14 +1,15 @@
 import json
 import random
-from decimal import Decimal
+from decimal import Context, Decimal, Inexact
 from pathlib import Path
 
 import pytest
 
+import trading_bot.panel_decision as panel_decision_module
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.evaluation import _maximum_drawdown, evaluate_signals
 from trading_bot.panel_config import load_panel_family_spec
-from trading_bot.panel_decision import PanelDecisionError, _win_rate, build_panel_decision
+from trading_bot.panel_decision import PanelDecisionError, _pool, _win_rate, build_panel_decision
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
 from trading_bot.strategy import CostScenario
 
@@ -797,3 +798,85 @@ def test_win_rate_matches_evaluate_signals_across_series() -> None:
             scenario,
         )
         assert _win_rate(series) == evaluation.win_rate
+
+
+def test_pooling_precision_headroom_is_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "never itself needs to round" guarantee behind exact pooled totals
+    is only real if exceeding it is loud. Shrinking _POOLING_CONTEXT to one
+    significant digit of precision (Inexact still trapped) turns the very
+    first addition of two two-digit values into a real rounding event, and
+    that must now raise PanelDecisionError instead of silently returning a
+    wrong total."""
+    insufficient = Context(prec=1)
+    insufficient.traps[Inexact] = True
+    monkeypatch.setattr(panel_decision_module, "_POOLING_CONTEXT", insufficient)
+
+    document: dict[str, object] = {
+        "candidates": [
+            {
+                "candidate_name": "xs_mom_4w",
+                "base": {"episodes": episodes_with_values("f0", ["0.12", "0.34"])},
+                "adverse": {"episodes": episodes_with_values("f0", ["0", "0"])},
+            }
+        ]
+    }
+    with pytest.raises(PanelDecisionError, match="precision headroom"):
+        _pool([document], "xs_mom_4w")
+
+
+def test_folds_where_a_member_retained_nothing_are_reported(tmp_path: Path) -> None:
+    # Fold 2 marks every one of xs_mom_4w's 40 episodes MEMBER_HELD_NOTHING in
+    # both scenarios -- the fold-retains-nothing fallback R1's backward roll
+    # cannot fix, since there is no retained episode in that fold to roll onto.
+    # That fold must still be visible: a per-fold retained-episode-count list
+    # and a distinct list naming which fold(s) retained zero.
+    all_held_nothing = episodes_with_values("f2", ["0.01"] * EPISODES_PER_FOLD)
+    for episode in all_held_nothing:
+        episode["reason_codes"] = [MEMBER_HELD_NOTHING_REASON_CODE]
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        if fold_index == 2:
+            write_fold_with_episodes(
+                path,
+                fold_index,
+                {},
+                {},
+            )
+            document = json.loads(path.read_text(encoding="utf-8"))
+            for candidate in document["candidates"]:
+                if candidate["candidate_name"] == "xs_mom_4w":
+                    candidate["base"]["episodes"] = all_held_nothing
+                    candidate["adverse"]["episodes"] = all_held_nothing
+            material = {key: value for key, value in document.items() if key != "report_hash"}
+            document["report_hash"] = content_sha256(material)
+            path.write_bytes(canonical_json(document))
+        else:
+            write_fold(path, fold_index, {"xs_mom_4w": ("0.01", "0.001")})
+        paths.append(path)
+
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=SPEC_PATH,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    assert momentum["base_fold_retained_episode_counts"] == [
+        EPISODES_PER_FOLD,
+        EPISODES_PER_FOLD,
+        0,
+        EPISODES_PER_FOLD,
+        EPISODES_PER_FOLD,
+        EPISODES_PER_FOLD,
+    ]
+    assert momentum["base_folds_with_no_retained_episodes"] == [2]
+    assert momentum["adverse_folds_with_no_retained_episodes"] == [2]
+    # An untouched candidate never retains nothing anywhere.
+    other = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_1w"
+    )
+    assert other["base_folds_with_no_retained_episodes"] == []
