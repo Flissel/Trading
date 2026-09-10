@@ -620,14 +620,15 @@ directly rather than only argued: neither the calendar-aware volatility
 window nor the completeness requirement on the liquidity median changes a
 single universe snapshot or weight vector anywhere in it. At the five
 weekly rebalances whose 30-day volatility window straddles ICPUSDT's absent
-days, ICPUSDT is outside the eligible universe at all five — excluded by
-the liquidity floor at three of them, and by the top-100 rank cutoff at the
-other two (2022-10-16 and 2022-10-23, where its median `quote_volume`,
-6,963,751 and 9,853,035, clears the five-million floor but not the rank
-cutoff). The pre-registered gate was, in this capture, blocking the entire
-family over a contract already outside the eligible universe at every
-decision where the fix could matter. The fix is a correctness guard for
-every future capture, not a change to any result reported from this one.
+days, ICPUSDT is outside the eligible universe at all five: its liquidity
+window is itself incomplete at four of them (2022-10-02, 2022-10-09, and
+2022-10-16 with five missing days each, 2022-10-23 with three), and at the
+fifth, 2022-09-25, it has no bar at the decision close at all, because that
+Sunday falls inside the gap. The pre-registered gate was, in this capture,
+blocking the entire family over a contract already outside the eligible
+universe at every decision where the fix could matter. The fix is a
+correctness guard for every future capture, not a change to any result
+reported from this one.
 
 ## 13. Protocol Addendum (prospective, to be appended to `PHASE_0_EVALUATION_PROTOCOL.md`)
 
