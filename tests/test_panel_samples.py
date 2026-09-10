@@ -224,11 +224,14 @@ def test_capture_quality_gate_forgives_days_the_daily_dump_also_lacks(tmp_path: 
     `capture_panel` records each as `klines_daily_fill` / "absent". These are
     proven absent at the source, not a defect this capture could have
     prevented, so the quality gate must not stop the family over them, unlike
-    before this fix. (The real-world instance is ICPUSDT: a dead contract --
-    flat at 6.44 USDT with zero `quote_volume` for the 104 days before it --
-    whose final five days, 2022-09-22 through 2022-09-26, are absent from
-    both Binance dumps; its zero volume already excludes it from the
-    eligible universe regardless of this gate, see `panel_universe.py`.)"""
+    before this fix. (The real-world instance is ICPUSDT: a dormant contract
+    -- flat at 6.44 USDT with `quote_volume` exactly zero for 103 of the 104
+    days before the gap -- whose final five days, 2022-09-22 through
+    2022-09-26, are absent from both Binance dumps; it is not delisted and
+    resumes trading on 2022-09-27. It is outside the eligible universe at
+    every decision whose volatility window straddles the gap regardless of
+    this gate, by the liquidity floor or the rank cutoff, see
+    `panel_universe.py`.)"""
     capture_panel(
         workspace_root=tmp_path,
         output_directory=tmp_path / "capture",
@@ -334,8 +337,9 @@ def _floor_test_fetch_with_forgiven_gap(url: str) -> PanelPayload:
     if "/daily/klines/" in url:
         # Attempted and proven absent at source too -- the shape of ICPUSDT's
         # final five days (2022-09-22 through 2022-09-26). Not modelled here:
-        # ICPUSDT was already a dead contract (flat price, zero volume) by
-        # that point, which is what actually excludes it from the universe.
+        # ICPUSDT was dormant (flat price, quote_volume exactly zero) for the
+        # 103 days before that point, which is what actually excludes it from
+        # the universe there -- it is not delisted and resumes on 2022-09-27.
         raise PanelSourceAbsent("404: no daily dump for this day either")
     month = next(item for item in _FLOOR_TEST_MONTHS if item in url)
     if "fundingRate" in url:
