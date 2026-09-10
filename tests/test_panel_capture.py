@@ -1027,6 +1027,126 @@ def test_capture_resume_raises_on_a_progress_line_missing_a_required_field(
         )
 
 
+def test_capture_resume_raises_on_a_present_progress_line_missing_its_own_fields(
+    tmp_path: Path,
+) -> None:
+    # The reviewer's exact record: passes a symbol/month/kind/status check,
+    # but a "present" entry also needs raw_relative_path, raw_sha256,
+    # received_time_ns and url -- without them, resuming a capture that
+    # re-requests this exact source raises a raw KeyError where the seeded
+    # record is read back from disk, not PanelCaptureError.
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    lines = [
+        _progress_header(symbols=("BTCUSDT",), months=("2024-01",)),
+        json.dumps(
+            {"symbol": "BTCUSDT", "month": "2024-01", "kind": "klines", "status": "present"}
+        ),
+    ]
+    progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_resume_raises_on_an_absent_progress_line_missing_url(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    lines = [
+        _progress_header(symbols=("BTCUSDT",), months=("2024-01",)),
+        json.dumps({"symbol": "BTCUSDT", "month": "2024-01", "kind": "klines", "status": "absent"}),
+    ]
+    progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_resume_raises_on_a_present_progress_line_with_a_wrongly_typed_field(
+    tmp_path: Path,
+) -> None:
+    # received_time_ns as a JSON bool: technically an int subclass in
+    # Python, but never a valid nanosecond timestamp.
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    lines = [
+        _progress_header(symbols=("BTCUSDT",), months=("2024-01",)),
+        json.dumps(
+            {
+                "symbol": "BTCUSDT",
+                "month": "2024-01",
+                "kind": "klines",
+                "status": "present",
+                "url": "u",
+                "received_time_ns": True,
+                "raw_relative_path": "raw/BTCUSDT/klines-2024-01.zip",
+                "raw_sha256": "x",
+            }
+        ),
+    ]
+    progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_resume_raises_on_a_progress_line_with_an_unrecognized_status(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    lines = [
+        _progress_header(symbols=("BTCUSDT",), months=("2024-01",)),
+        json.dumps(
+            {
+                "symbol": "BTCUSDT",
+                "month": "2024-01",
+                "kind": "klines",
+                "status": "bogus",
+                "url": "u",
+            }
+        ),
+    ]
+    progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
 def test_capture_resume_raises_on_non_utf8_bytes_in_the_progress_file(
     tmp_path: Path,
 ) -> None:

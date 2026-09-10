@@ -327,16 +327,14 @@ def capture_panel(
                 need_header = False
                 continue
             # A record can be syntactically valid JSON yet structurally
-            # wrong (a list, or a dict missing a required field) -- that is
-            # never reachable from a torn write (truncated JSON never parses
-            # at all), but it must still fail closed rather than raise a
-            # raw TypeError/KeyError once indexed below.
-            if not (
-                isinstance(record, dict)
-                and isinstance(record.get("symbol"), str)
-                and isinstance(record.get("month"), str)
-                and isinstance(record.get("kind"), str)
-            ):
+            # wrong (a list, a dict missing a required field, or a
+            # "present" entry missing the fields only present entries
+            # carry) -- that is never reachable from a torn write
+            # (truncated JSON never parses at all), but it must still fail
+            # closed rather than raise a raw TypeError/KeyError once
+            # indexed below or when a resumed "present" source is re-read
+            # from disk.
+            if not _is_valid_progress_record(record):
                 raise PanelCaptureError(
                     f"panel capture progress file is corrupt: {progress_path}"
                 )
@@ -646,6 +644,38 @@ def _bounded_months(
         for month in months
         if (month_from is None or month >= month_from) and (month_to is None or month <= month_to)
     )
+
+
+def _is_valid_progress_record(record: object) -> bool:
+    """Check a parsed progress-file record has the shape its status needs.
+
+    Every record, regardless of status, carries symbol/month/kind/url as
+    strings. A "present" record additionally carries raw_relative_path and
+    raw_sha256 as strings and received_time_ns as an int (not a bool --
+    JSON's `true`/`false` decode to Python bools, which are technically
+    `int` instances but never a valid nanosecond timestamp): those are the
+    fields read back when a resumed "present" source is re-derived from the
+    raw payload already on disk, and a record missing one would otherwise
+    raise a raw KeyError there instead of failing closed here. Any other
+    status must be one this reader itself ever writes.
+    """
+    if not (
+        isinstance(record, dict)
+        and isinstance(record.get("symbol"), str)
+        and isinstance(record.get("month"), str)
+        and isinstance(record.get("kind"), str)
+        and isinstance(record.get("url"), str)
+    ):
+        return False
+    if record.get("status") == "present":
+        received_time_ns = record.get("received_time_ns")
+        return (
+            isinstance(record.get("raw_relative_path"), str)
+            and isinstance(record.get("raw_sha256"), str)
+            and isinstance(received_time_ns, int)
+            and not isinstance(received_time_ns, bool)
+        )
+    return record.get("status") in ("absent", "absent_after_discovery")
 
 
 def _rewrite_progress_file(
