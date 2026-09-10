@@ -16,12 +16,14 @@ from trading_bot.panel_capture import (
     PanelPayload,
     PanelSourceAbsent,
     PanelZipClient,
+    build_daily_kline_zip_url,
     build_funding_zip_url,
     build_kline_zip_url,
     capture_panel,
     discover_panel_months,
     parse_funding_zip,
     parse_kline_zip,
+    repair_panel_capture,
     verify_panel_capture,
 )
 
@@ -30,7 +32,12 @@ KLINE_HEADER = (
     "taker_buy_volume,taker_buy_quote_volume,ignore"
 )
 DAY_MS = 86_400_000
-MONTH_START_DAY = {"2024-01": 0, "2024-02": 31}
+# Deliberately contiguous (3 rows exactly, back to back) rather than aligned
+# to the real length of January: these fixtures only ever cover 3 days per
+# month, and a real gap between the two chunks (e.g. Feb starting at day 31)
+# would now be an interior hole `capture_panel` tries to daily-fill, which
+# these tests are not about and do not stub a daily-dump fetch for.
+MONTH_START_DAY = {"2024-01": 0, "2024-02": 3}
 
 
 class _FakeUrlopenResponse:
@@ -90,6 +97,13 @@ def test_urls_are_pinned_to_the_public_bucket() -> None:
     assert build_funding_zip_url("BTCUSDT", "2024-01") == (
         "https://data.binance.vision/data/futures/um/monthly/fundingRate/BTCUSDT/"
         "BTCUSDT-fundingRate-2024-01.zip"
+    )
+
+
+def test_daily_dump_url_is_pinned_to_the_public_bucket() -> None:
+    assert build_daily_kline_zip_url("BTCUSDT", "2022-02-26") == (
+        "https://data.binance.vision/data/futures/um/daily/klines/BTCUSDT/1d/"
+        "BTCUSDT-1d-2022-02-26.zip"
     )
 
 
@@ -1323,3 +1337,517 @@ def test_capture_resume_refuses_when_the_month_window_narrows(tmp_path: Path) ->
             months=("2024-01",),
             fetch=_deterministic_fetch(),
         )
+
+
+# --- Gap-filling: a hole in the monthly aggregate, closed from the daily dumps. ---
+
+_GAP_KLINE_ROWS = (0, 1, 3)  # day index 2 is missing
+
+
+def _gap_monthly_csv() -> str:
+    lines = [KLINE_HEADER]
+    for index in _GAP_KLINE_ROWS:
+        open_ms = index * DAY_MS
+        lines.append(
+            f"{open_ms},100,101,99,{100 + index},10,{open_ms + DAY_MS - 1},1000,5,6,600,0"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _daily_row_csv(day_index: int) -> str:
+    open_ms = day_index * DAY_MS
+    return (
+        KLINE_HEADER
+        + "\n"
+        + f"{open_ms},100,101,99,{100 + day_index},10,{open_ms + DAY_MS - 1},1000,5,6,600,0\n"
+    )
+
+
+def _daily_malformed_csv(day_index: int) -> str:
+    # A daily dump with two rows instead of exactly one -- malformed, but not
+    # a shape `parse_kline_zip` itself rejects; only the single-day check
+    # inside `_fill_gap_days` catches it.
+    lines = [KLINE_HEADER]
+    for offset in (0, 1):
+        day = day_index + offset
+        open_ms = day * DAY_MS
+        lines.append(
+            f"{open_ms},100,101,99,{100 + day},10,{open_ms + DAY_MS - 1},1000,5,6,600,0"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _gap_capture_fetch(
+    *, daily_fetch: Callable[[str], PanelPayload]
+) -> Callable[[str], PanelPayload]:
+    def fetch(url: str) -> PanelPayload:
+        if "/daily/klines/" in url:
+            return daily_fetch(url)
+        if "fundingRate" in url:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("f.csv", funding_csv()), received_time_ns=1
+            )
+        return PanelPayload(
+            url=url, raw_bytes=zip_bytes("k.csv", _gap_monthly_csv()), received_time_ns=1
+        )
+
+    return fetch
+
+
+def _daily_fill_success(url: str) -> PanelPayload:
+    # Day index 2 is 1970-01-03 (epoch day 2); asserting the exact URL pins
+    # down that the missing day, not some other day, is what gets requested.
+    assert url == build_daily_kline_zip_url("BTCUSDT", "1970-01-03")
+    return PanelPayload(
+        url=url, raw_bytes=zip_bytes("d.csv", _daily_row_csv(2)), received_time_ns=2
+    )
+
+
+def test_capture_fills_a_monthly_gap_from_the_daily_dump(tmp_path: Path) -> None:
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(daily_fetch=_daily_fill_success),
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    fill_entries = [entry for entry in manifest["sources"] if entry["kind"] == "klines_daily_fill"]
+    assert len(fill_entries) == 1
+    assert fill_entries[0]["status"] == "present"
+    assert fill_entries[0]["symbol"] == "BTCUSDT"
+    assert fill_entries[0]["month"] == "1970-01-03"
+    quality = json.loads(
+        (artifact.dataset_root / "quality-report.json").read_text(encoding="utf-8")
+    )
+    btc = next(item for item in quality["instruments"] if item["instrument_id"] == "BTCUSDT")
+    assert btc["missing_days"] == 0
+    assert btc["row_count"] == 4
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+
+def test_capture_records_an_unfillable_gap_as_absent_and_continues(tmp_path: Path) -> None:
+    def daily_absent(url: str) -> PanelPayload:
+        raise PanelSourceAbsent("404: no daily dump for this day either")
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(daily_fetch=daily_absent),
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    fill_entries = [entry for entry in manifest["sources"] if entry["kind"] == "klines_daily_fill"]
+    assert len(fill_entries) == 1
+    assert fill_entries[0]["status"] == "absent"
+    assert "raw_relative_path" not in fill_entries[0]
+    quality = json.loads(
+        (artifact.dataset_root / "quality-report.json").read_text(encoding="utf-8")
+    )
+    btc = next(item for item in quality["instruments"] if item["instrument_id"] == "BTCUSDT")
+    assert btc["missing_days"] == 1
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+
+def test_capture_resumes_mid_gap_fill_and_matches_an_uninterrupted_run(tmp_path: Path) -> None:
+    base_fetch = _gap_capture_fetch(daily_fetch=_daily_fill_success)
+    control = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "control",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=base_fetch,
+    )
+
+    target = tmp_path / "resumable"
+
+    def daily_crash(url: str) -> PanelPayload:
+        raise PanelCaptureError("simulated crash during gap-fill")
+
+    with pytest.raises(PanelCaptureError, match="simulated crash during gap-fill"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_gap_capture_fetch(daily_fetch=daily_crash),
+        )
+    assert not (target / "capture-manifest.json").exists()
+
+    def refetch_forbidden(url: str) -> PanelPayload:
+        raise AssertionError(f"resume must not refetch an already-recorded monthly source: {url}")
+
+    def resume_fetch(url: str) -> PanelPayload:
+        if "/daily/klines/" in url:
+            return _daily_fill_success(url)
+        return refetch_forbidden(url)
+
+    resumed = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=resume_fetch,
+    )
+    assert verify_panel_capture(resumed.capture_root) == (True, ())
+    control_manifest = json.loads(control.capture_manifest_path.read_text(encoding="utf-8"))
+    resumed_manifest = json.loads(resumed.capture_manifest_path.read_text(encoding="utf-8"))
+    assert control_manifest["sources"] == resumed_manifest["sources"]
+    assert control_manifest["capture_root_hash"] == resumed_manifest["capture_root_hash"]
+
+
+# --- Repair: heal a completed capture's gaps into a new capture, without
+# refetching any of its monthly sources. ---
+
+
+def test_repair_refuses_when_the_source_capture_does_not_verify(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir(parents=True)
+    (source / "capture-manifest.json").write_text("not json", encoding="utf-8")
+    with pytest.raises(PanelCaptureError, match="failed verification"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=source,
+            output_directory=tmp_path / "repaired",
+            reserve_bytes=0,
+        )
+
+
+def test_repair_fills_the_sources_gap_without_refetching_its_monthly_sources(
+    tmp_path: Path,
+) -> None:
+    # The source capture never managed to fill its own gap (the daily dump
+    # 404s at capture time -- a genuine absence back then); the repair is run
+    # later, when the daily dump does have the day, and must fetch only that
+    # one day, never any of the monthly sources already on disk.
+    source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(
+            daily_fetch=lambda url: (_ for _ in ()).throw(
+                PanelSourceAbsent("404: not yet published")
+            )
+        ),
+    )
+    source_quality = json.loads(
+        (source.dataset_root / "quality-report.json").read_text(encoding="utf-8")
+    )
+    assert source_quality["instruments"][0]["missing_days"] == 1
+
+    def guarded_repair_fetch(url: str) -> PanelPayload:
+        if "/daily/klines/" in url:
+            return _daily_fill_success(url)
+        raise AssertionError(f"repair must not refetch a monthly source: {url}")
+
+    repaired = repair_panel_capture(
+        workspace_root=tmp_path,
+        source_capture_root=source.capture_root,
+        output_directory=tmp_path / "repaired",
+        reserve_bytes=0,
+        fetch=guarded_repair_fetch,
+    )
+    assert verify_panel_capture(repaired.capture_root) == (True, ())
+    # The source stays exactly as it was: untouched and still verifying.
+    assert verify_panel_capture(source.capture_root) == (True, ())
+
+    manifest = json.loads(repaired.capture_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_capture_root_hash"] == source.capture_root_hash
+    kinds = {entry["kind"] for entry in manifest["sources"]}
+    assert kinds == {"klines", "fundingRate", "klines_daily_fill"}
+    fill_entries = [entry for entry in manifest["sources"] if entry["kind"] == "klines_daily_fill"]
+    assert len(fill_entries) == 1
+    assert fill_entries[0]["status"] == "present"
+
+    repaired_quality = json.loads(
+        (repaired.dataset_root / "quality-report.json").read_text(encoding="utf-8")
+    )
+    assert repaired_quality["instruments"][0]["missing_days"] == 0
+    assert repaired.capture_root_hash != source.capture_root_hash
+
+
+def test_repair_refuses_when_the_output_already_exists(tmp_path: Path) -> None:
+    source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    existing = tmp_path / "repaired"
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=existing,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    with pytest.raises(PanelCaptureError, match="immutable"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=source.capture_root,
+            output_directory=existing,
+            reserve_bytes=0,
+        )
+
+
+def test_repair_resumes_after_an_interruption_and_matches_an_uninterrupted_run(
+    tmp_path: Path,
+) -> None:
+    source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(
+            daily_fetch=lambda url: (_ for _ in ()).throw(
+                PanelSourceAbsent("404: not yet published")
+            )
+        ),
+    )
+
+    control = repair_panel_capture(
+        workspace_root=tmp_path,
+        source_capture_root=source.capture_root,
+        output_directory=tmp_path / "control",
+        reserve_bytes=0,
+        fetch=_daily_fill_success,
+    )
+
+    target = tmp_path / "resumable"
+
+    def daily_crash(url: str) -> PanelPayload:
+        raise PanelCaptureError("simulated crash during repair fill")
+
+    with pytest.raises(PanelCaptureError, match="simulated crash during repair fill"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=source.capture_root,
+            output_directory=target,
+            reserve_bytes=0,
+            fetch=daily_crash,
+        )
+    assert not (target / "capture-manifest.json").exists()
+    assert (target / "capture-progress.jsonl").exists()
+
+    resumed = repair_panel_capture(
+        workspace_root=tmp_path,
+        source_capture_root=source.capture_root,
+        output_directory=target,
+        reserve_bytes=0,
+        fetch=_daily_fill_success,
+    )
+    assert verify_panel_capture(resumed.capture_root) == (True, ())
+    control_manifest = json.loads(control.capture_manifest_path.read_text(encoding="utf-8"))
+    resumed_manifest = json.loads(resumed.capture_manifest_path.read_text(encoding="utf-8"))
+    assert control_manifest["sources"] == resumed_manifest["sources"]
+    assert control_manifest["capture_root_hash"] == resumed_manifest["capture_root_hash"]
+
+
+def test_repair_resume_refuses_when_the_source_capture_differs(tmp_path: Path) -> None:
+    first_source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source-a",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(
+            daily_fetch=lambda url: (_ for _ in ()).throw(
+                PanelSourceAbsent("404: not yet published")
+            )
+        ),
+    )
+    second_source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source-b",
+        reserve_bytes=0,
+        symbols=("ETHUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+
+    target = tmp_path / "resumable"
+
+    def daily_crash(url: str) -> PanelPayload:
+        raise PanelCaptureError("simulated crash during repair fill")
+
+    with pytest.raises(PanelCaptureError, match="simulated crash during repair fill"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=first_source.capture_root,
+            output_directory=target,
+            reserve_bytes=0,
+            fetch=daily_crash,
+        )
+
+    with pytest.raises(PanelCaptureError, match="differ"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=second_source.capture_root,
+            output_directory=target,
+            reserve_bytes=0,
+            fetch=_deterministic_fetch(),
+        )
+
+
+# --- Hardening: a malformed daily payload must not wedge resume. ---
+
+
+def test_capture_recovers_after_a_malformed_daily_payload_is_rejected(tmp_path: Path) -> None:
+    # A payload with more than one row is rejected by `_fill_gap_days`'
+    # single-day check -- but that must happen *before* the raw bytes are
+    # written to disk and the source recorded present. Otherwise a resume
+    # would find the poisoned bytes already on disk and the (symbol, date,
+    # kind) key already in `already_done`, and would keep re-reading and
+    # re-rejecting the same bad payload forever without ever asking
+    # `download` for the URL again.
+    calls = {"count": 0}
+
+    def daily_fetch(url: str) -> PanelPayload:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("d.csv", _daily_malformed_csv(2)), received_time_ns=2
+            )
+        return _daily_fill_success(url)
+
+    target = tmp_path / "capture"
+    with pytest.raises(PanelCaptureError, match="did not contain exactly the requested day"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_gap_capture_fetch(daily_fetch=daily_fetch),
+        )
+    assert calls["count"] == 1
+    assert not (target / "raw" / "BTCUSDT" / "klines_daily_fill-1970-01-03.zip").exists()
+    progress_text = (target / "capture-progress.jsonl").read_text(encoding="utf-8")
+    assert "klines_daily_fill" not in progress_text
+
+    resumed = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(daily_fetch=daily_fetch),
+    )
+    # The daily URL was asked for again on resume, not skipped as
+    # already-done: proof the poisoned attempt left no trace to wedge on.
+    assert calls["count"] == 2
+    quality = json.loads(
+        (resumed.dataset_root / "quality-report.json").read_text(encoding="utf-8")
+    )
+    btc = next(item for item in quality["instruments"] if item["instrument_id"] == "BTCUSDT")
+    assert btc["missing_days"] == 0
+    assert verify_panel_capture(resumed.capture_root) == (True, ())
+
+
+def test_repair_recovers_after_a_malformed_daily_payload_is_rejected(tmp_path: Path) -> None:
+    source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_gap_capture_fetch(
+            daily_fetch=lambda url: (_ for _ in ()).throw(
+                PanelSourceAbsent("404: not yet published")
+            )
+        ),
+    )
+
+    calls = {"count": 0}
+
+    def daily_fetch(url: str) -> PanelPayload:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return PanelPayload(
+                url=url, raw_bytes=zip_bytes("d.csv", _daily_malformed_csv(2)), received_time_ns=2
+            )
+        return _daily_fill_success(url)
+
+    target = tmp_path / "repaired"
+    with pytest.raises(PanelCaptureError, match="did not contain exactly the requested day"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=source.capture_root,
+            output_directory=target,
+            reserve_bytes=0,
+            fetch=daily_fetch,
+        )
+    assert calls["count"] == 1
+    assert not (target / "raw" / "BTCUSDT" / "klines_daily_fill-1970-01-03.zip").exists()
+    progress_text = (target / "capture-progress.jsonl").read_text(encoding="utf-8")
+    assert "klines_daily_fill" not in progress_text
+
+    repaired = repair_panel_capture(
+        workspace_root=tmp_path,
+        source_capture_root=source.capture_root,
+        output_directory=target,
+        reserve_bytes=0,
+        fetch=daily_fetch,
+    )
+    assert calls["count"] == 2
+    quality = json.loads(
+        (repaired.dataset_root / "quality-report.json").read_text(encoding="utf-8")
+    )
+    assert quality["instruments"][0]["missing_days"] == 0
+    assert verify_panel_capture(repaired.capture_root) == (True, ())
+
+
+# --- Hardening: repair must refuse when source and output nest. ---
+
+
+def test_repair_refuses_when_the_output_is_nested_inside_the_source(tmp_path: Path) -> None:
+    source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "source",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    with pytest.raises(PanelCaptureError, match="nested"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=source.capture_root,
+            output_directory=source.capture_root / "repaired-inside",
+            reserve_bytes=0,
+        )
+    assert not (source.capture_root / "repaired-inside").exists()
+    assert verify_panel_capture(source.capture_root) == (True, ())
+
+
+def test_repair_refuses_when_the_source_is_nested_inside_the_output(tmp_path: Path) -> None:
+    outer = tmp_path / "outer"
+    source = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=outer / "nested-source",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=_deterministic_fetch(),
+    )
+    with pytest.raises(PanelCaptureError, match="nested"):
+        repair_panel_capture(
+            workspace_root=tmp_path,
+            source_capture_root=source.capture_root,
+            output_directory=outer,
+            reserve_bytes=0,
+        )
+    assert not (outer / "capture-manifest.json").exists()
+    assert verify_panel_capture(source.capture_root) == (True, ())

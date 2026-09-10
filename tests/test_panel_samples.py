@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from trading_bot.panel_capture import PanelPayload, capture_panel
+from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_panel
 from trading_bot.panel_config import PanelFoldGeometry, load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
 from trading_bot.panel_samples import (
@@ -196,6 +196,12 @@ def _quality_gap_kline_csv(skip: frozenset[int]) -> str:
 
 def _quality_gap_fetch(skip: frozenset[int]) -> Callable[[str], PanelPayload]:
     def fetch(url: str) -> PanelPayload:
+        if "/daily/klines/" in url:
+            # The point of this fixture is a defect a capture cannot repair:
+            # the daily dumps are missing these days too (a genuine absence),
+            # not merely the monthly aggregate, so the quality gate must
+            # still fire after `capture_panel`'s own gap-filling gives up.
+            raise PanelSourceAbsent("404: no daily dump for this day either")
         if "fundingRate" in url:
             text = "calc_time,funding_interval_hours,last_funding_rate\n0,8,0.0001\n"
             return PanelPayload(url=url, raw_bytes=_zip_bytes("f.csv", text), received_time_ns=1)

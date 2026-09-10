@@ -106,7 +106,7 @@ def publish_panel_dataset(
         raise PanelDatasetError("panel dataset already exists and is immutable")
     if not raw_source_hashes or any(len(value) != 64 for value in raw_source_hashes):
         raise PanelDatasetError("raw source hashes are required")
-    admitted, duplicate_rows = _admit_candles(candles)
+    admitted, duplicate_rows = admit_candles(candles)
     if not admitted:
         raise PanelDatasetError("panel dataset has no candle rows")
     admitted_funding, funding_duplicate_rows = _admit_funding(funding)
@@ -214,7 +214,7 @@ def verify_panel_dataset(dataset_root: Path) -> tuple[bool, tuple[str, ...]]:
     return not errors, tuple(errors)
 
 
-def _admit_candles(
+def admit_candles(
     candles: tuple[PanelCandleRow, ...],
 ) -> tuple[tuple[PanelCandleRow, ...], int]:
     seen: dict[tuple[str, str, int], PanelCandleRow] = {}
@@ -222,6 +222,19 @@ def _admit_candles(
     for row in candles:
         if row.interval_ns != DAY_NS:
             raise PanelDatasetError("panel candles must be daily")
+        if row.open_time_ns % DAY_NS != 0:
+            # `_instrument_quality` and `find_missing_days` both walk the
+            # span from an instrument's first to its last admitted row in
+            # fixed `DAY_NS` steps; an open_time_ns that is not itself a
+            # whole number of days off that lattice would make the two
+            # disagree about how many days are missing, silently. Real
+            # Binance klines are always day-aligned, so this is
+            # unreachable with real data -- it exists to fail loudly if a
+            # future source ever violates the assumption.
+            raise PanelDatasetError(
+                "panel candle open_time_ns is not aligned to a whole day: "
+                f"{row.instrument_id} at open_time_ns={row.open_time_ns}"
+            )
         key = (row.venue, row.instrument_id, row.open_time_ns)
         existing = seen.get(key)
         if existing is not None:
@@ -278,6 +291,31 @@ def _instrument_quality(rows: tuple[PanelCandleRow, ...]) -> tuple[InstrumentQua
             )
         )
     return tuple(quality)
+
+
+def find_missing_days(rows: tuple[PanelCandleRow, ...]) -> dict[str, tuple[int, ...]]:
+    """Return, per instrument, the `open_time_ns` of every day missing inside
+    that instrument's own first-to-last observed span.
+
+    `rows` must already be admitted (deduplicated) candle rows -- the exact
+    input `_instrument_quality` counts `missing_days` from -- so the length of
+    each instrument's tuple here always agrees with that field exactly. A
+    delisting or a late listing contributes nothing: only interior holes
+    between an instrument's own first and last observed day are returned.
+    """
+    grouped: dict[str, list[PanelCandleRow]] = {}
+    for row in rows:
+        grouped.setdefault(row.instrument_id, []).append(row)
+    result: dict[str, tuple[int, ...]] = {}
+    for instrument_id, series in grouped.items():
+        series.sort(key=lambda item: item.open_time_ns)
+        present = {item.open_time_ns for item in series}
+        first = series[0].open_time_ns
+        last = series[-1].open_time_ns
+        result[instrument_id] = tuple(
+            day for day in range(first, last + DAY_NS, DAY_NS) if day not in present
+        )
+    return result
 
 
 def _write_candle_partitions(

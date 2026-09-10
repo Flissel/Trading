@@ -242,6 +242,8 @@ attempt is a new family with a new name.
 - Funding: `https://data.binance.vision/data/futures/um/monthly/fundingRate/<SYMBOL>/<SYMBOL>-fundingRate-<YYYY-MM>.zip`.
 - Contract list: one snapshot of `https://fapi.binance.com/fapi/v1/exchangeInfo` at capture time, used only to enumerate symbols and to record `onboardDate`. Its `status` field is current, not historical, and is **not** used for eligibility (section 7.1).
 
+**Clarification (2026-09-10, after approval):** the daily kline dumps are also used to patch interior holes in a completed capture's historical monthly aggregates -- a documented gap in Binance's monthly klines, not a defect in the capture or a symptom of a bad fetch -- not only to cover the current month before its own monthly file is published. This widens the scope of the daily-dump clause above; it changes no pre-registered parameter of the family. The source host, CSV schema, venue, and interval are unchanged, a 404 on the daily dump is recorded as a genuine absence exactly like an absent monthly source, and every gap-filled row is recorded under its own source kind (`klines_daily_fill`), distinct from the monthly `klines` kind, so the manifest's provenance stays auditable.
+
 `_ALLOWED_HOSTS` (`market_capture.py:27`) gains `data.binance.vision` and
 `s3-ap-northeast-1.amazonaws.com` for the bucket listing.
 
