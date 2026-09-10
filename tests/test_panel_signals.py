@@ -375,9 +375,14 @@ def test_time_series_weights_exclude_a_contract_with_a_hole_in_its_volatility_wi
     """End-to-end regression through `build_weight_vectors`, not just the helper in
     isolation: a contract that is otherwise eligible and trending, but is missing
     one bar inside the 30-day span ending at the decision, must drop out of every
-    time-series member at that decision -- this is the ICPUSDT-shaped case (a hole
-    the daily dumps never fill either), reproduced from first principles rather
-    than from a fixture file."""
+    time-series member at that decision. This exercises the mechanics of the
+    real-world instance that motivated the fix -- a calendar hole the daily
+    dumps never fill either -- reproduced from first principles rather than
+    from a fixture file. It does not reproduce that instance's own price
+    action: ICPUSDT was a dead contract by the time of its hole (flat price,
+    zero `quote_volume` for the preceding 104 days), which is a separate,
+    additional reason it never reaches this code path at all -- see
+    `panel_universe.py`'s liquidity filter."""
     decision = 99 * DAY_NS - 1_000_000
     bars = volatility_window_sensitive_panel()
     gap_index = 90  # well inside the 30-day window ending at day 98 (indices 68..98)

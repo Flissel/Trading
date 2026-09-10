@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from trading_bot.canonical import content_sha256
 from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_panel
 from trading_bot.panel_config import PanelFoldGeometry, load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
@@ -222,9 +223,12 @@ def test_capture_quality_gate_forgives_days_the_daily_dump_also_lacks(tmp_path: 
     the daily dump 404s on every one of them too (see `_quality_gap_fetch`) --
     `capture_panel` records each as `klines_daily_fill` / "absent". These are
     proven absent at the source, not a defect this capture could have
-    prevented (the real-world case is ICPUSDT, 2022-09-22 through 2022-09-26,
-    absent from both Binance dumps), so the quality gate must not stop the
-    family over them, unlike before this fix."""
+    prevented, so the quality gate must not stop the family over them, unlike
+    before this fix. (The real-world instance is ICPUSDT: a dead contract --
+    flat at 6.44 USDT with zero `quote_volume` for the 104 days before it --
+    whose final five days, 2022-09-22 through 2022-09-26, are absent from
+    both Binance dumps; its zero volume already excludes it from the
+    eligible universe regardless of this gate, see `panel_universe.py`.)"""
     capture_panel(
         workspace_root=tmp_path,
         output_directory=tmp_path / "capture",
@@ -328,7 +332,10 @@ def _floor_test_kline_csv_with_gap(month: str, skip: frozenset[int]) -> str:
 
 def _floor_test_fetch_with_forgiven_gap(url: str) -> PanelPayload:
     if "/daily/klines/" in url:
-        # Attempted and proven absent at source too -- the ICPUSDT shape.
+        # Attempted and proven absent at source too -- the shape of ICPUSDT's
+        # final five days (2022-09-22 through 2022-09-26). Not modelled here:
+        # ICPUSDT was already a dead contract (flat price, zero volume) by
+        # that point, which is what actually excludes it from the universe.
         raise PanelSourceAbsent("404: no daily dump for this day either")
     month = next(item for item in _FLOOR_TEST_MONTHS if item in url)
     if "fundingRate" in url:
@@ -382,9 +389,99 @@ def test_manifest_names_the_absent_at_source_days_it_forgave(tmp_path: Path) -> 
     assert manifest["absent_at_source_days"] == {"BTCUSDT": expected_dates}
 
 
+def test_manifest_rejects_a_capture_claiming_days_that_were_never_missing(
+    tmp_path: Path,
+) -> None:
+    """Reproduces the exact attack that broke a count-only subtraction: rewrite
+    a real capture's proven-absent dates to ones that were never actually
+    missing, then recompute `capture_root_hash` over the tampered content so
+    the file still verifies internally -- `content_sha256` proves only that a
+    file agrees with its own declared hash, not that its claims agree with
+    the dataset. Before the per-day cross-check, this tampered manifest
+    published, naming fabricated days as BTCUSDT's limitation; it must now
+    fail closed instead."""
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=_FLOOR_TEST_MONTHS,
+        fetch=_floor_test_fetch_with_forgiven_gap,
+    )
+    manifest_path = tmp_path / "capture" / "capture-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    fill_entries = [
+        entry
+        for entry in manifest["sources"]
+        if entry.get("kind") == "klines_daily_fill" and entry.get("status") == "absent"
+    ]
+    assert fill_entries  # sanity: the fixture actually produced absent entries
+    for index, entry in enumerate(fill_entries):
+        entry["month"] = f"1999-01-{index + 1:02d}"  # never missing in this dataset
+    material = {key: value for key, value in manifest.items() if key != "capture_root_hash"}
+    manifest["capture_root_hash"] = content_sha256(material)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    document = json.loads(Path("configs/xs-momentum-panel-v1.json").read_text(encoding="utf-8"))
+    document["folds"] = {
+        "train_duration_ns": 20 * DAY_NS,
+        "validation_duration_ns": 7 * DAY_NS,
+        "test_duration_ns": 14 * DAY_NS,
+        "step_ns": 14 * DAY_NS,
+        "embargo_ns": 7 * DAY_NS,
+        "holdout_duration_ns": 14 * DAY_NS,
+    }
+    document["statistics"]["pooled_episode_floor"] = 1
+    config_path = tmp_path / "tiny-panel.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    spec, spec_hash = load_panel_family_spec(config_path)
+
+    with pytest.raises(PanelSamplesError, match="inconsistent with the published dataset"):
+        publish_panel_walk_forward(
+            tmp_path / "capture",
+            output_path=tmp_path / "manifest.json",
+            spec=spec,
+            family_spec_hash=spec_hash,
+        )
+    assert not (tmp_path / "manifest.json").exists()
+
+
 def _write_json(path: Path, document: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document), encoding="utf-8")
+
+
+def _bars_for_dataset(
+    symbol: str, *, first: str, last: str, missing: frozenset[str]
+) -> tuple[PanelBar, ...]:
+    """One `PanelBar` per calendar day for `symbol` from `first` through `last`
+    (inclusive, ISO dates), skipping every date in `missing` -- exactly the
+    shape `panel_samples._missing_day_strings` needs to recompute the
+    instrument's own real interior missing days, so a unit test can construct
+    a capture-manifest claim and check it against a dataset that either
+    supports or contradicts it."""
+    epoch = date(1970, 1, 1)
+    start = date.fromisoformat(first)
+    end = date.fromisoformat(last)
+    bars: list[PanelBar] = []
+    current = start
+    while current <= end:
+        if current.isoformat() not in missing:
+            open_time_ns = (current - epoch).days * DAY_NS
+            close_time_ns = open_time_ns + DAY_NS - 1_000_000
+            bars.append(
+                PanelBar(
+                    contract_id=f"{symbol}:0",
+                    instrument_id=symbol,
+                    open_time_ns=open_time_ns,
+                    close_time_ns=close_time_ns,
+                    available_time_ns=close_time_ns + 1,
+                    close=Decimal("100"),
+                    quote_volume=Decimal("1000"),
+                )
+            )
+        current += timedelta(days=1)
+    return tuple(bars)
 
 
 def _daily_fill_sources(symbol: str, dates: tuple[str, ...], *, status: str) -> dict[str, object]:
@@ -402,22 +499,38 @@ def _daily_fill_sources(symbol: str, dates: tuple[str, ...], *, status: str) -> 
     }
 
 
+_ICPUSDT_GAP = (
+    "2022-09-22",
+    "2022-09-23",
+    "2022-09-24",
+    "2022-09-25",
+    "2022-09-26",
+)
+# ICPUSDT trades again shortly after the gap (2022-09-27 through 2022-10-05
+# here): the gap must be genuinely interior -- bars on both sides -- or
+# `_missing_day_strings` would read it as a trailing censor (a delisting) and
+# count it as zero missing days, the same way `find_missing_days` documents.
+_ICPUSDT_BARS = _bars_for_dataset(
+    "ICPUSDT", first="2022-09-01", last="2022-10-05", missing=frozenset(_ICPUSDT_GAP)
+)
+
+_BTCUSDT_FIVE_DAY_GAP = frozenset(
+    {"2020-01-11", "2020-01-12", "2020-01-13", "2020-01-14", "2020-01-15"}
+)
+_BTCUSDT_BARS = _bars_for_dataset(
+    "BTCUSDT", first="2020-01-01", last="2020-01-31", missing=_BTCUSDT_FIVE_DAY_GAP
+)
+
+
 def test_enforce_capture_quality_forgives_days_proven_absent_at_source(tmp_path: Path) -> None:
     quality_report = tmp_path / "quality-report.json"
     _write_json(
         quality_report,
         {"instruments": [{"instrument_id": "ICPUSDT", "missing_days": 5, "row_count": 1}]},
     )
-    icpusdt_gap = (
-        "2022-09-22",
-        "2022-09-23",
-        "2022-09-24",
-        "2022-09-25",
-        "2022-09-26",
-    )
-    capture_manifest = _daily_fill_sources("ICPUSDT", icpusdt_gap, status="absent")
-    absent = _enforce_capture_quality(quality_report, capture_manifest)
-    assert absent == {"ICPUSDT": icpusdt_gap}
+    capture_manifest = _daily_fill_sources("ICPUSDT", _ICPUSDT_GAP, status="absent")
+    absent = _enforce_capture_quality(quality_report, capture_manifest, _ICPUSDT_BARS)
+    assert absent == {"ICPUSDT": _ICPUSDT_GAP}
 
 
 def test_enforce_capture_quality_still_trips_on_an_unattempted_gap(tmp_path: Path) -> None:
@@ -433,9 +546,9 @@ def test_enforce_capture_quality_still_trips_on_an_unattempted_gap(tmp_path: Pat
     )
     capture_manifest: dict[str, object] = {"sources": []}
     with pytest.raises(PanelSamplesError, match="CAPTURE_QUALITY_FAILED") as excinfo:
-        _enforce_capture_quality(quality_report, capture_manifest)
+        _enforce_capture_quality(quality_report, capture_manifest, _BTCUSDT_BARS)
     assert "BTCUSDT" in str(excinfo.value)
-    assert "5 missing days" in str(excinfo.value)
+    assert "5 unexplained missing days" in str(excinfo.value)
 
 
 def test_enforce_capture_quality_ignores_an_attempt_still_marked_present(tmp_path: Path) -> None:
@@ -448,12 +561,32 @@ def test_enforce_capture_quality_ignores_an_attempt_still_marked_present(tmp_pat
         {"instruments": [{"instrument_id": "BTCUSDT", "missing_days": 5, "row_count": 1}]},
     )
     capture_manifest = _daily_fill_sources(
-        "BTCUSDT", ("2020-01-11", "2020-01-12", "2020-01-13", "2020-01-14", "2020-01-15"),
-        status="present",
+        "BTCUSDT", tuple(sorted(_BTCUSDT_FIVE_DAY_GAP)), status="present"
     )
     with pytest.raises(PanelSamplesError, match="CAPTURE_QUALITY_FAILED") as excinfo:
-        _enforce_capture_quality(quality_report, capture_manifest)
-    assert "5 missing days" in str(excinfo.value)
+        _enforce_capture_quality(quality_report, capture_manifest, _BTCUSDT_BARS)
+    assert "5 unexplained missing days" in str(excinfo.value)
+
+
+def test_enforce_capture_quality_ignores_an_attempt_recorded_absent_after_discovery(
+    tmp_path: Path,
+) -> None:
+    """`absent_after_discovery` means the bucket's own listing contradicted
+    itself inside one run -- the opposite of proof the day is genuinely
+    absent -- so it must not count, even though it is a status other than
+    `present`. Only the literal `absent` status this codebase's daily-fill
+    path ever writes counts as proof."""
+    quality_report = tmp_path / "quality-report.json"
+    _write_json(
+        quality_report,
+        {"instruments": [{"instrument_id": "BTCUSDT", "missing_days": 5, "row_count": 1}]},
+    )
+    capture_manifest = _daily_fill_sources(
+        "BTCUSDT", tuple(sorted(_BTCUSDT_FIVE_DAY_GAP)), status="absent_after_discovery"
+    )
+    with pytest.raises(PanelSamplesError, match="CAPTURE_QUALITY_FAILED") as excinfo:
+        _enforce_capture_quality(quality_report, capture_manifest, _BTCUSDT_BARS)
+    assert "5 unexplained missing days" in str(excinfo.value)
 
 
 def test_enforce_capture_quality_only_credits_proven_absent_days(tmp_path: Path) -> None:
@@ -467,14 +600,18 @@ def test_enforce_capture_quality_only_credits_proven_absent_days(tmp_path: Path)
     )
     capture_manifest = _daily_fill_sources("BTCUSDT", ("2020-01-11",), status="absent")
     with pytest.raises(PanelSamplesError, match="CAPTURE_QUALITY_FAILED") as excinfo:
-        _enforce_capture_quality(quality_report, capture_manifest)
-    assert "4 missing days" in str(excinfo.value)
+        _enforce_capture_quality(quality_report, capture_manifest, _BTCUSDT_BARS)
+    assert "4 unexplained missing days" in str(excinfo.value)
 
 
 def test_enforce_capture_quality_rejects_more_proven_absent_than_missing(tmp_path: Path) -> None:
     """Defensive guard: the capture-manifest and quality-report describe the same
     capture, so more proven-absent days than missing days for an instrument is
-    an inconsistency to fail closed on, not a case to silently clamp at zero."""
+    an inconsistency to fail closed on, not a case to silently clamp at zero.
+    Both claimed days are genuinely missing in `bars` (2020-01-11 and
+    2020-01-12 are inside `_BTCUSDT_FIVE_DAY_GAP`) -- the inconsistency here
+    is deliberately only the report's stale `missing_days` count, isolating
+    this check from the day-existence check below."""
     quality_report = tmp_path / "quality-report.json"
     _write_json(
         quality_report,
@@ -484,4 +621,27 @@ def test_enforce_capture_quality_rejects_more_proven_absent_than_missing(tmp_pat
         "BTCUSDT", ("2020-01-11", "2020-01-12"), status="absent"
     )
     with pytest.raises(PanelSamplesError, match="inconsistent"):
-        _enforce_capture_quality(quality_report, capture_manifest)
+        _enforce_capture_quality(quality_report, capture_manifest, _BTCUSDT_BARS)
+
+
+def test_enforce_capture_quality_rejects_a_day_that_was_never_actually_missing(
+    tmp_path: Path,
+) -> None:
+    """The subtraction in `_enforce_capture_quality` is by count; this is the
+    check that keeps it honest by day. A capture-manifest entry can name any
+    date at all and still re-hash cleanly (the hash only proves internal
+    self-consistency, not agreement with the dataset) -- so a claimed absence
+    that is not actually one of the instrument's own interior missing days
+    (recomputed here from `bars`, which do not have a gap at all) must fail
+    closed rather than be trusted by count alone."""
+    quality_report = tmp_path / "quality-report.json"
+    _write_json(
+        quality_report,
+        {"instruments": [{"instrument_id": "BTCUSDT", "missing_days": 5, "row_count": 1}]},
+    )
+    capture_manifest = _daily_fill_sources("BTCUSDT", ("1999-01-01",), status="absent")
+    gapless_bars = _bars_for_dataset(
+        "BTCUSDT", first="2020-01-01", last="2020-01-31", missing=frozenset()
+    )
+    with pytest.raises(PanelSamplesError, match="inconsistent with the published dataset"):
+        _enforce_capture_quality(quality_report, capture_manifest, gapless_bars)
