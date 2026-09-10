@@ -9,7 +9,7 @@ from trading_bot.backtest import BacktestCase, BacktestRunner, write_report
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
-from trading_bot.panel_capture import capture_panel
+from trading_bot.panel_capture import capture_panel, repair_panel_capture
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_decision import build_panel_decision
 from trading_bot.panel_fold_run import run_panel_fold
@@ -82,6 +82,11 @@ def main(arguments: list[str] | None = None) -> int:
     panel_capture.add_argument(
         "--month-to", default=None, help="latest YYYY-MM to keep when discovering months"
     )
+    panel_capture_repair = commands.add_parser("panel-capture-repair")
+    panel_capture_repair.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    panel_capture_repair.add_argument("--source-capture", type=Path, required=True)
+    panel_capture_repair.add_argument("--output", type=Path, required=True)
+    panel_capture_repair.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
     panel_manifest = commands.add_parser("panel-manifest")
     panel_manifest.add_argument("--workspace-root", type=Path, default=Path.cwd())
     panel_manifest.add_argument("--capture", type=Path, required=True)
@@ -220,6 +225,19 @@ def main(arguments: list[str] | None = None) -> int:
             months=months,
             month_from=parsed.month_from,
             month_to=parsed.month_to,
+        )
+        return 0
+    if parsed.command == "panel-capture-repair":
+        workspace = parsed.workspace_root.resolve()
+        source_capture = parsed.source_capture.resolve()
+        output = parsed.output.resolve()
+        if not source_capture.is_relative_to(workspace) or not output.is_relative_to(workspace):
+            raise ValueError("panel capture repair paths must stay inside workspace")
+        repair_panel_capture(
+            workspace_root=workspace,
+            source_capture_root=source_capture,
+            output_directory=output,
+            reserve_bytes=parsed.reserve_bytes,
         )
         return 0
     if parsed.command == "panel-manifest":

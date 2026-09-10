@@ -15,15 +15,18 @@ import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_dataset import (
     DAY_NS,
     PanelCandleRow,
     PanelFundingRow,
+    admit_candles,
+    find_missing_days,
     publish_panel_dataset,
     verify_panel_dataset,
 )
@@ -35,9 +38,15 @@ _ALLOWED_PANEL_HOSTS = frozenset(
 _VENUE = "BINANCE_UM"
 _MAX_ZIP_BYTES = 32_000_000
 _MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_]{2,32}$")
 _LISTING_MAX_KEYS = 1000
 _CAPTURE_VERSION = "1.0.0"
+# Source "kind" recorded for a candle fetched from the daily dump to patch a
+# gap in the monthly aggregates -- distinct from "klines" (the monthly dump
+# itself) so the manifest keeps provenance explicit: a reader can always tell
+# a monthly row from a gap-filled one.
+_DAILY_FILL_KIND = "klines_daily_fill"
 
 
 class PanelCaptureError(RuntimeError):
@@ -133,6 +142,17 @@ def build_kline_zip_url(symbol: str, month: str) -> str:
     return (
         "https://data.binance.vision/data/futures/um/monthly/klines/"
         f"{symbol}/1d/{symbol}-1d-{month}.zip"
+    )
+
+
+def build_daily_kline_zip_url(symbol: str, date: str) -> str:
+    """URL of one day's kline dump -- used only to patch a gap in the monthly
+    aggregate, never as the primary source for a month already covered."""
+    _validate_symbol(symbol)
+    _validate_date(date)
+    return (
+        "https://data.binance.vision/data/futures/um/daily/klines/"
+        f"{symbol}/1d/{symbol}-1d-{date}.zip"
     )
 
 
@@ -289,75 +309,7 @@ def capture_panel(
     }
 
     progress_path = target / "capture-progress.jsonl"
-    sources: list[dict[str, object]] = []
-    already_done: dict[tuple[str, str, str], dict[str, Any]] = {}
-    need_header = True
-    if progress_path.exists():
-        try:
-            raw_text = progress_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError as error:
-            raise PanelCaptureError(
-                f"panel capture progress file is corrupt: {progress_path}"
-            ) from error
-        non_blank = [line for line in raw_text.splitlines() if line.strip()]
-        for index, line in enumerate(non_blank):
-            is_last = index == len(non_blank) - 1
-            try:
-                record: Any = json.loads(line)
-            except json.JSONDecodeError as error:
-                if is_last:
-                    # A hard kill can only ever tear the final line -- every
-                    # earlier one was flushed complete before the next write
-                    # began. Drop it; its payload will simply be refetched,
-                    # which is lossless.
-                    break
-                raise PanelCaptureError(
-                    f"panel capture progress file is corrupt: {progress_path}"
-                ) from error
-            if index == 0:
-                if not (isinstance(record, dict) and "capture_parameters" in record):
-                    raise PanelCaptureError(
-                        f"panel capture progress file is corrupt: {progress_path}"
-                    )
-                if record["capture_parameters"] != capture_parameters:
-                    raise PanelCaptureError(
-                        "panel capture parameters differ from the interrupted run recorded "
-                        f"in {progress_path}"
-                    )
-                need_header = False
-                continue
-            # A record can be syntactically valid JSON yet structurally
-            # wrong (a list, a dict missing a required field, or a
-            # "present" entry missing the fields only present entries
-            # carry) -- that is never reachable from a torn write
-            # (truncated JSON never parses at all), but it must still fail
-            # closed rather than raise a raw TypeError/KeyError once
-            # indexed below or when a resumed "present" source is re-read
-            # from disk.
-            if not _is_valid_progress_record(record):
-                raise PanelCaptureError(
-                    f"panel capture progress file is corrupt: {progress_path}"
-                )
-            sources.append(record)
-            already_done[(record["symbol"], record["month"], record["kind"])] = record
-
-        if raw_text and not raw_text.endswith("\n"):
-            # The file's tail is not cleanly newline-terminated: either the
-            # final record was torn (dropped above) or it was complete JSON
-            # that lost only its own trailing newline to the same kind of
-            # crash (the JSON and its newline are two separate writes).
-            # Rewrite the file to exactly the header and sources recovered
-            # above. A bare "append a newline" here would leave the
-            # abandoned bytes in place; once anything is appended after
-            # them they become an unparseable *earlier* line on the next
-            # resume, permanently blocking the capture rather than merely
-            # losing one already-lossless refetch.
-            _rewrite_progress_file(
-                progress_path,
-                need_header=need_header,
-                capture_parameters=capture_parameters,
-                sources=sources,
-            )
+    sources, already_done, need_header = _load_progress(progress_path, capture_parameters)
 
     raw_root = target / "raw"
     candles: list[PanelCandleRow] = []
@@ -484,6 +436,22 @@ def capture_panel(
                 raise PanelCaptureError(
                     f"symbol {symbol} produced no candle rows across every requested month"
                 )
+        # The monthly aggregates can have interior holes the daily dumps do
+        # not (see `_fill_gap_days`): patch them here, once, so a completed
+        # capture starts clean rather than tripping the downstream capture
+        # quality gate every time.
+        admitted_candles, _ = admit_candles(tuple(candles))
+        missing_days = find_missing_days(admitted_candles)
+        candles.extend(
+            _fill_gap_days(
+                missing_days,
+                target=target,
+                download=download,
+                sources=sources,
+                already_done=already_done,
+                progress_handle=progress_handle,
+            )
+        )
     if not raw_root.is_dir():
         raise PanelCaptureError("panel capture produced no raw payloads")
 
@@ -508,6 +476,207 @@ def capture_panel(
         material["month_from"] = month_from
     if month_to is not None:
         material["month_to"] = month_to
+    if discovered_months:
+        material["discovered_months"] = discovered_months
+    capture_root_hash = content_sha256(material)
+    document = dict(material)
+    document["capture_root_hash"] = capture_root_hash
+    manifest_path.write_bytes(canonical_json(document))
+    progress_path.unlink(missing_ok=True)
+    return PanelCaptureArtifact(
+        capture_root=target,
+        capture_manifest_path=manifest_path,
+        dataset_root=dataset.dataset_root,
+        capture_root_hash=capture_root_hash,
+        dataset_root_hash=dataset.root_hash,
+    )
+
+
+def repair_panel_capture(
+    *,
+    workspace_root: Path,
+    source_capture_root: Path,
+    output_directory: Path,
+    reserve_bytes: int,
+    fetch: PanelFetch | None = None,
+) -> PanelCaptureArtifact:
+    """Repair a completed capture's gaps into a new, immutable capture,
+    without refetching a single one of its monthly sources.
+
+    Verifies `source_capture_root`, copies every one of its raw payloads
+    byte-for-byte (re-verifying each copy against its recorded hash),
+    reconstructs its candle and funding rows from those copies, then runs
+    the same gap-finding and daily-dump gap-filling `capture_panel` runs at
+    the end of a fresh capture (`_fill_gap_days`) against the reconstructed
+    rows. The source capture is only ever read, never written to, so both
+    it and the new, repaired capture stay immutable. The new manifest
+    records `source_capture_root_hash` -- the source capture's own root
+    hash -- so the derivation is auditable, and its `sources` list carries
+    both the copied sources and the newly filled ones, told apart by
+    `kind`.
+    """
+    workspace = workspace_root.resolve()
+    source_root = source_capture_root.resolve()
+    target = output_directory.resolve()
+
+    valid, verify_errors = verify_panel_capture(source_root)
+    if not valid:
+        raise PanelCaptureError(
+            "source panel capture failed verification: " + ",".join(verify_errors)
+        )
+    source_manifest = _load_capture_manifest(source_root)
+    source_capture_root_hash = str(source_manifest["capture_root_hash"])
+    source_sources = source_manifest.get("sources")
+    if not isinstance(source_sources, list):
+        raise PanelCaptureError("source panel capture manifest is malformed")
+
+    StoragePolicy(workspace, reserve_bytes).authorize(
+        target=target,
+        temporary_directory=target.parent,
+        free_bytes=shutil.disk_usage(workspace).free,
+        worst_case_required_bytes=500_000_000,
+    )
+    manifest_path = target / "capture-manifest.json"
+    if manifest_path.exists():
+        raise PanelCaptureError("panel capture already exists and is immutable")
+    target.mkdir(parents=True, exist_ok=True)
+
+    dataset_directory = target / "dataset"
+    if dataset_directory.exists():
+        shutil.rmtree(dataset_directory)
+
+    download = fetch if fetch is not None else PanelZipClient().fetch
+
+    # Bound the same way a fresh capture binds capture_parameters: a resumed
+    # repair must be repairing *this exact* source capture, identified by
+    # its own root hash, not a different one that happens to share a
+    # directory.
+    repair_parameters: dict[str, object] = {
+        "capture_version": _CAPTURE_VERSION,
+        "source_capture_root_hash": source_capture_root_hash,
+    }
+
+    progress_path = target / "capture-progress.jsonl"
+    sources, already_done, need_header = _load_progress(progress_path, repair_parameters)
+
+    raw_root = target / "raw"
+    candles: list[PanelCandleRow] = []
+    funding: list[PanelFundingRow] = []
+    with progress_path.open("a", encoding="utf-8") as progress_handle:
+        if need_header:
+            header_record = {"capture_parameters": repair_parameters}
+            progress_handle.write(canonical_json(header_record).decode("utf-8"))
+            progress_handle.write("\n")
+            progress_handle.flush()
+        for entry in source_sources:
+            if not isinstance(entry, dict):
+                raise PanelCaptureError("source panel capture manifest is malformed")
+            symbol = str(entry.get("symbol"))
+            month = str(entry.get("month"))
+            kind = str(entry.get("kind"))
+            if kind == _DAILY_FILL_KIND and entry.get("status") != "present":
+                # An earlier, unresolved gap-fill attempt from the source
+                # capture -- not carried forward. The fresh gap computation
+                # below rediscovers this same day from the reconstructed
+                # candle rows, and this repair gets its own, current attempt
+                # at it (the whole reason to run a repair later), recorded
+                # once under this same (symbol, date, kind) key. Carrying the
+                # stale attempt forward too would collide with that record.
+                continue
+            key = (symbol, month, kind)
+            done = already_done.get(key)
+            if done is None:
+                record: dict[str, Any]
+                if entry.get("status") != "present":
+                    # No raw payload to copy -- carry the absence forward
+                    # verbatim, exactly as the source recorded it.
+                    record = {
+                        "symbol": symbol,
+                        "month": month,
+                        "kind": kind,
+                        "url": str(entry.get("url")),
+                        "status": str(entry.get("status")),
+                    }
+                else:
+                    relative = str(entry["raw_relative_path"])
+                    expected_hash = str(entry["raw_sha256"])
+                    source_bytes = (source_root / relative).read_bytes()
+                    if hashlib.sha256(source_bytes).hexdigest() != expected_hash:
+                        raise PanelCaptureError(f"source raw payload hash mismatch: {relative}")
+                    copy_path = target / relative
+                    copy_path.parent.mkdir(parents=True, exist_ok=True)
+                    copy_path.write_bytes(source_bytes)
+                    if hashlib.sha256(copy_path.read_bytes()).hexdigest() != expected_hash:
+                        raise PanelCaptureError(f"copied raw payload hash mismatch: {relative}")
+                    record = {
+                        "symbol": symbol,
+                        "month": month,
+                        "kind": kind,
+                        "url": str(entry["url"]),
+                        "received_time_ns": int(entry["received_time_ns"]),
+                        "raw_relative_path": relative,
+                        "raw_sha256": expected_hash,
+                        "status": "present",
+                    }
+                sources.append(record)
+                progress_handle.write(canonical_json(record).decode("utf-8"))
+                progress_handle.write("\n")
+                progress_handle.flush()
+                done = record
+            if done.get("status") == "present":
+                relative = str(done["raw_relative_path"])
+                payload = PanelPayload(
+                    url=str(done["url"]),
+                    raw_bytes=(target / relative).read_bytes(),
+                    received_time_ns=int(done["received_time_ns"]),
+                )
+                # A capture repaired once already can itself be the source of
+                # a later repair, so a klines-shaped row can arrive under
+                # either kind.
+                if kind in ("klines", _DAILY_FILL_KIND):
+                    candles.extend(parse_kline_zip(payload, symbol=symbol))
+                elif kind == "fundingRate":
+                    funding.extend(parse_funding_zip(payload, symbol=symbol))
+        admitted_candles, _ = admit_candles(tuple(candles))
+        missing_days = find_missing_days(admitted_candles)
+        candles.extend(
+            _fill_gap_days(
+                missing_days,
+                target=target,
+                download=download,
+                sources=sources,
+                already_done=already_done,
+                progress_handle=progress_handle,
+            )
+        )
+    if not raw_root.is_dir():
+        raise PanelCaptureError("panel capture repair produced no raw payloads")
+
+    dataset = publish_panel_dataset(
+        tuple(candles),
+        tuple(funding),
+        output_directory=target / "dataset",
+        raw_source_hashes=tuple(
+            str(item["raw_sha256"]) for item in sources if item.get("status") == "present"
+        ),
+    )
+    material: dict[str, object] = {
+        "capture_version": _CAPTURE_VERSION,
+        "venue": _VENUE,
+        "interval": "1d",
+        "symbols": source_manifest.get("symbols"),
+        "months": source_manifest.get("months"),
+        "sources": sources,
+        "dataset_root_hash": dataset.root_hash,
+        "source_capture_root_hash": source_capture_root_hash,
+    }
+    month_from = source_manifest.get("month_from")
+    if month_from is not None:
+        material["month_from"] = month_from
+    month_to = source_manifest.get("month_to")
+    if month_to is not None:
+        material["month_to"] = month_to
+    discovered_months = source_manifest.get("discovered_months")
     if discovered_months:
         material["discovered_months"] = discovered_months
     capture_root_hash = content_sha256(material)
@@ -581,6 +750,20 @@ def _zip_rows(raw: bytes) -> list[list[str]]:
     except (zipfile.BadZipFile, UnicodeDecodeError) as error:
         raise PanelCaptureError(f"panel dump is unreadable: {error}") from error
     return [row for row in csv.reader(io.StringIO(text)) if row]
+
+
+def _load_capture_manifest(capture_root: Path) -> dict[str, object]:
+    try:
+        manifest = json.loads(
+            (capture_root / "capture-manifest.json").read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError) as error:
+        raise PanelCaptureError(
+            f"source panel capture manifest is unreadable: {capture_root}"
+        ) from error
+    if not isinstance(manifest, dict):
+        raise PanelCaptureError(f"source panel capture manifest is malformed: {capture_root}")
+    return manifest
 
 
 def _listing_prefix(symbol: str, kind: str) -> str:
@@ -713,6 +896,187 @@ def _rewrite_progress_file(
     progress_path.write_bytes(content)
 
 
+def _load_progress(
+    progress_path: Path, parameters: dict[str, object]
+) -> tuple[list[dict[str, object]], dict[tuple[str, str, str], dict[str, Any]], bool]:
+    """Recover `sources`/`already_done`/`need_header` from a prior run's
+    progress file, or start empty if there is none.
+
+    Shared, unmodified, by both `capture_panel` and `repair_panel_capture`:
+    the recovery, corruption, and torn-write-repair rules are identical
+    either way, and `parameters` is simply whatever the caller's own
+    resume-binding record is (a fresh capture's `capture_parameters`, or a
+    repair's own binding to its source capture).
+    """
+    sources: list[dict[str, object]] = []
+    already_done: dict[tuple[str, str, str], dict[str, Any]] = {}
+    need_header = True
+    if not progress_path.exists():
+        return sources, already_done, need_header
+    try:
+        raw_text = progress_path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as error:
+        raise PanelCaptureError(
+            f"panel capture progress file is corrupt: {progress_path}"
+        ) from error
+    non_blank = [line for line in raw_text.splitlines() if line.strip()]
+    for index, line in enumerate(non_blank):
+        is_last = index == len(non_blank) - 1
+        try:
+            record: Any = json.loads(line)
+        except json.JSONDecodeError as error:
+            if is_last:
+                # A hard kill can only ever tear the final line -- every
+                # earlier one was flushed complete before the next write
+                # began. Drop it; its payload will simply be refetched,
+                # which is lossless.
+                break
+            raise PanelCaptureError(
+                f"panel capture progress file is corrupt: {progress_path}"
+            ) from error
+        if index == 0:
+            if not (isinstance(record, dict) and "capture_parameters" in record):
+                raise PanelCaptureError(f"panel capture progress file is corrupt: {progress_path}")
+            if record["capture_parameters"] != parameters:
+                raise PanelCaptureError(
+                    "panel capture parameters differ from the interrupted run recorded "
+                    f"in {progress_path}"
+                )
+            need_header = False
+            continue
+        # A record can be syntactically valid JSON yet structurally wrong (a
+        # list, a dict missing a required field, or a "present" entry
+        # missing the fields only present entries carry) -- that is never
+        # reachable from a torn write (truncated JSON never parses at all),
+        # but it must still fail closed rather than raise a raw
+        # TypeError/KeyError once indexed below or when a resumed "present"
+        # source is re-read from disk.
+        if not _is_valid_progress_record(record):
+            raise PanelCaptureError(f"panel capture progress file is corrupt: {progress_path}")
+        sources.append(record)
+        already_done[(record["symbol"], record["month"], record["kind"])] = record
+
+    if raw_text and not raw_text.endswith("\n"):
+        # The file's tail is not cleanly newline-terminated: either the
+        # final record was torn (dropped above) or it was complete JSON that
+        # lost only its own trailing newline to the same kind of crash (the
+        # JSON and its newline are two separate writes). Rewrite the file to
+        # exactly the header and sources recovered above. A bare "append a
+        # newline" here would leave the abandoned bytes in place; once
+        # anything is appended after them they become an unparseable
+        # *earlier* line on the next resume, permanently blocking the
+        # capture rather than merely losing one already-lossless refetch.
+        _rewrite_progress_file(
+            progress_path,
+            need_header=need_header,
+            capture_parameters=parameters,
+            sources=sources,
+        )
+    return sources, already_done, need_header
+
+
+def _fill_gap_days(
+    missing: dict[str, tuple[int, ...]],
+    *,
+    target: Path,
+    download: PanelFetch,
+    sources: list[dict[str, object]],
+    already_done: dict[tuple[str, str, str], dict[str, Any]],
+    progress_handle: TextIO,
+) -> list[PanelCandleRow]:
+    """Fetch every missing interior day from the daily kline dumps and
+    return the resulting candle rows.
+
+    Shared by both entry points: a fresh capture calls this once, right
+    after its monthly fetch loop, against the gaps in what it just
+    downloaded; `repair_panel_capture` calls it against the gaps in a
+    capture it copied rather than fetched. Either way, `download` already
+    carries the retry/failure behaviour (`PanelZipClient`, or an injected
+    test double) -- this function adds only the daily-dump URL, the
+    (symbol, date, kind) progress key, and the absent/present recording a
+    404 here is a genuine absence (the day never traded, or Binance itself
+    never published it), so it is recorded exactly the way an absent
+    monthly source is recorded, and capture continues rather than aborts.
+    Anything else `download` raises propagates unchanged.
+    """
+    filled: list[PanelCandleRow] = []
+    for symbol in sorted(missing):
+        for day_open_time_ns in missing[symbol]:
+            date = _date_from_open_time_ns(day_open_time_ns)
+            key = (symbol, date, _DAILY_FILL_KIND)
+            done = already_done.get(key)
+            if done is not None:
+                if done.get("status") == "present":
+                    relative = str(done["raw_relative_path"])
+                    raw_bytes = (target / relative).read_bytes()
+                    if hashlib.sha256(raw_bytes).hexdigest() != done.get("raw_sha256"):
+                        raise PanelCaptureError(f"resumed raw payload hash mismatch: {relative}")
+                    payload = PanelPayload(
+                        url=str(done["url"]),
+                        raw_bytes=raw_bytes,
+                        received_time_ns=int(done["received_time_ns"]),
+                    )
+                    filled.append(
+                        _parse_single_daily_fill_row(
+                            payload, symbol=symbol, expected_open_time_ns=day_open_time_ns
+                        )
+                    )
+                continue
+            url = build_daily_kline_zip_url(symbol, date)
+            try:
+                payload = download(url)
+            except PanelSourceAbsent:
+                absent_record: dict[str, object] = {
+                    "symbol": symbol,
+                    "month": date,
+                    "kind": _DAILY_FILL_KIND,
+                    "url": url,
+                    "status": "absent",
+                }
+                sources.append(absent_record)
+                progress_handle.write(canonical_json(absent_record).decode("utf-8"))
+                progress_handle.write("\n")
+                progress_handle.flush()
+                continue
+            _validate_panel_url(payload.url)
+            relative = f"raw/{symbol}/{_DAILY_FILL_KIND}-{date}.zip"
+            path = target / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload.raw_bytes)
+            present_record: dict[str, object] = {
+                "symbol": symbol,
+                "month": date,
+                "kind": _DAILY_FILL_KIND,
+                "url": payload.url,
+                "received_time_ns": payload.received_time_ns,
+                "raw_relative_path": relative,
+                "raw_sha256": hashlib.sha256(payload.raw_bytes).hexdigest(),
+                "status": "present",
+            }
+            sources.append(present_record)
+            progress_handle.write(canonical_json(present_record).decode("utf-8"))
+            progress_handle.write("\n")
+            progress_handle.flush()
+            filled.append(
+                _parse_single_daily_fill_row(
+                    payload, symbol=symbol, expected_open_time_ns=day_open_time_ns
+                )
+            )
+    return filled
+
+
+def _parse_single_daily_fill_row(
+    payload: PanelPayload, *, symbol: str, expected_open_time_ns: int
+) -> PanelCandleRow:
+    rows = parse_kline_zip(payload, symbol=symbol)
+    if len(rows) != 1 or rows[0].open_time_ns != expected_open_time_ns:
+        raise PanelCaptureError(
+            f"daily kline dump for {symbol} did not contain exactly the requested day "
+            f"{_date_from_open_time_ns(expected_open_time_ns)}"
+        )
+    return rows[0]
+
+
 def _validate_panel_url(url: str) -> None:
     parsed = urllib.parse.urlparse(url)
     if parsed.scheme != "https" or parsed.hostname not in _ALLOWED_PANEL_HOSTS:
@@ -727,3 +1091,12 @@ def _validate_symbol(symbol: str) -> None:
 def _validate_month(month: str) -> None:
     if not _MONTH_PATTERN.match(month):
         raise PanelCaptureError(f"invalid month: {month}")
+
+
+def _validate_date(date: str) -> None:
+    if not _DATE_PATTERN.match(date):
+        raise PanelCaptureError(f"invalid date: {date}")
+
+
+def _date_from_open_time_ns(open_time_ns: int) -> str:
+    return datetime.fromtimestamp(open_time_ns / 1_000_000_000, tz=UTC).date().isoformat()

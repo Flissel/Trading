@@ -8,6 +8,8 @@ from trading_bot.panel_dataset import (
     PanelCandleRow,
     PanelDatasetError,
     PanelFundingRow,
+    admit_candles,
+    find_missing_days,
     publish_panel_dataset,
     verify_panel_dataset,
 )
@@ -78,6 +80,45 @@ def test_missing_day_is_counted(tmp_path: Path) -> None:
     quality = json.loads(artifact.quality_report_path.read_text(encoding="utf-8"))
     btc = quality["instruments"][0]
     assert btc["missing_days"] == 1
+
+
+def test_find_missing_days_agrees_with_the_quality_reports_missing_days_count(
+    tmp_path: Path,
+) -> None:
+    rows = (
+        candle("BTCUSDT", 0),
+        candle("BTCUSDT", 1),
+        candle("BTCUSDT", 4),  # days 2 and 3 missing
+        candle("ETHUSDT", 0),
+        candle("ETHUSDT", 2),  # day 1 missing
+    )
+    admitted, _ = admit_candles(rows)
+    missing = find_missing_days(admitted)
+    artifact = publish_panel_dataset(
+        rows, (), output_directory=tmp_path / "dataset", raw_source_hashes=SOURCE_HASHES
+    )
+    quality = json.loads(artifact.quality_report_path.read_text(encoding="utf-8"))
+    for item in quality["instruments"]:
+        assert len(missing[item["instrument_id"]]) == item["missing_days"]
+    assert missing["BTCUSDT"] == (2 * DAY_NS, 3 * DAY_NS)
+    assert missing["ETHUSDT"] == (1 * DAY_NS,)
+
+
+def test_find_missing_days_is_span_relative_not_calendar_relative() -> None:
+    # BTCUSDT's own span (index 5..7) has no interior gap, and neither does
+    # ETHUSDT's (index 0..2) -- even though BTCUSDT does not exist at index
+    # 0-4 and ETHUSDT does not exist at index 3+. Neither instrument's
+    # absence outside the other's span may count as a missing day for it.
+    rows = (
+        candle("BTCUSDT", 5),
+        candle("BTCUSDT", 6),
+        candle("BTCUSDT", 7),
+        candle("ETHUSDT", 0),
+        candle("ETHUSDT", 1),
+        candle("ETHUSDT", 2),
+    )
+    admitted, _ = admit_candles(rows)
+    assert find_missing_days(admitted) == {"BTCUSDT": (), "ETHUSDT": ()}
 
 
 def test_duplicate_rows_are_dropped(tmp_path: Path) -> None:
