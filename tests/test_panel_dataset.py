@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -119,6 +120,17 @@ def test_find_missing_days_is_span_relative_not_calendar_relative() -> None:
     )
     admitted, _ = admit_candles(rows)
     assert find_missing_days(admitted) == {"BTCUSDT": (), "ETHUSDT": ()}
+
+
+def test_admit_candles_rejects_an_off_lattice_open_time() -> None:
+    # `_instrument_quality` and `find_missing_days` both walk an instrument's
+    # span in fixed DAY_NS steps from its first to its last admitted row; an
+    # open_time_ns even one nanosecond off that lattice would make the two
+    # silently disagree about how many days are missing. Real Binance klines
+    # are always day-aligned -- this only guards a future source that isn't.
+    off_lattice = replace(candle("BTCUSDT", 0), open_time_ns=1)
+    with pytest.raises(PanelDatasetError):
+        admit_candles((off_lattice,))
 
 
 def test_duplicate_rows_are_dropped(tmp_path: Path) -> None:

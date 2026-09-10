@@ -222,6 +222,19 @@ def admit_candles(
     for row in candles:
         if row.interval_ns != DAY_NS:
             raise PanelDatasetError("panel candles must be daily")
+        if row.open_time_ns % DAY_NS != 0:
+            # `_instrument_quality` and `find_missing_days` both walk the
+            # span from an instrument's first to its last admitted row in
+            # fixed `DAY_NS` steps; an open_time_ns that is not itself a
+            # whole number of days off that lattice would make the two
+            # disagree about how many days are missing, silently. Real
+            # Binance klines are always day-aligned, so this is
+            # unreachable with real data -- it exists to fail loudly if a
+            # future source ever violates the assumption.
+            raise PanelDatasetError(
+                "panel candle open_time_ns is not aligned to a whole day: "
+                f"{row.instrument_id} at open_time_ns={row.open_time_ns}"
+            )
         key = (row.venue, row.instrument_id, row.open_time_ns)
         existing = seen.get(key)
         if existing is not None:

@@ -518,6 +518,17 @@ def repair_panel_capture(
     workspace = workspace_root.resolve()
     source_root = source_capture_root.resolve()
     target = output_directory.resolve()
+    # `is_relative_to` is also true of equal paths, so this covers repairing
+    # directly onto the source as well as the neighbouring case: nesting one
+    # inside the other. Either would let the repair write new
+    # raw/dataset/manifest files into the source capture's own directory
+    # tree (or vice versa), silently growing it -- the source must stay
+    # untouched, not merely still verify afterwards.
+    if target.is_relative_to(source_root) or source_root.is_relative_to(target):
+        raise PanelCaptureError(
+            "panel capture repair output must not be nested inside the source capture, "
+            "or the source capture inside the output"
+        )
 
     valid, verify_errors = verify_panel_capture(source_root)
     if not valid:
@@ -1039,6 +1050,16 @@ def _fill_gap_days(
                 progress_handle.flush()
                 continue
             _validate_panel_url(payload.url)
+            # Validate the payload -- exactly one row, on the requested day
+            # -- *before* it is written to disk or recorded as present. A
+            # malformed dump must be refetched on the next attempt, not
+            # wedge every future resume: once poisoned bytes are on disk and
+            # `already_done` points at them, a resume never asks `download`
+            # for this URL again, so it would keep re-reading and
+            # re-rejecting the same bad payload forever.
+            row = _parse_single_daily_fill_row(
+                payload, symbol=symbol, expected_open_time_ns=day_open_time_ns
+            )
             relative = f"raw/{symbol}/{_DAILY_FILL_KIND}-{date}.zip"
             path = target / relative
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -1057,11 +1078,7 @@ def _fill_gap_days(
             progress_handle.write(canonical_json(present_record).decode("utf-8"))
             progress_handle.write("\n")
             progress_handle.flush()
-            filled.append(
-                _parse_single_daily_fill_row(
-                    payload, symbol=symbol, expected_open_time_ns=day_open_time_ns
-                )
-            )
+            filled.append(row)
     return filled
 
 
