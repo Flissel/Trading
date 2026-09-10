@@ -104,7 +104,9 @@ def publish_panel_walk_forward(
     dataset_manifest = _load_object(capture_root / "dataset" / "dataset-manifest.json")
     capture_hash = str(capture_manifest["capture_root_hash"])
     dataset_hash = str(dataset_manifest["root_hash"])
-    _enforce_capture_quality(capture_root / "dataset" / "quality-report.json")
+    absent_at_source_days = _enforce_capture_quality(
+        capture_root / "dataset" / "quality-report.json", capture_manifest
+    )
 
     bars = load_panel_bars(capture_root / "dataset")
     samples = build_rebalance_samples(bars, holding_days=spec.holding_days)
@@ -139,6 +141,10 @@ def publish_panel_walk_forward(
         "final_holdout_ids": list(views.final_holdout_ids),
         "pooled_test_sample_count": pooled,
         "capture_quality_max_missing_days_per_instrument": _MAX_MISSING_DAYS_PER_INSTRUMENT,
+        "absent_at_source_days": {
+            instrument_id: list(days)
+            for instrument_id, days in sorted(absent_at_source_days.items())
+        },
     }
     manifest_hash = content_sha256(material)
     document = dict(material)
@@ -167,7 +173,9 @@ def verify_panel_manifest(path: Path) -> bool:
         return False
 
 
-def _enforce_capture_quality(quality_report_path: Path) -> None:
+def _enforce_capture_quality(
+    quality_report_path: Path, capture_manifest: dict[str, object]
+) -> dict[str, tuple[str, ...]]:
     """Stop the family before a manifest is built on a defective capture.
 
     Spec section 12 step 3: the family stops if any contract's daily series
@@ -175,11 +183,22 @@ def _enforce_capture_quality(quality_report_path: Path) -> None:
     listed span. `panel_dataset.py` already computes `missing_days` per
     instrument span-relative (a delisting does not count, only an interior
     gap does); this is the first and only reader of that field.
+
+    Not every missing day is a capture defect, though: a day the capture
+    itself attempted to patch from Binance's daily dump and recorded as
+    absent there too (`_absent_at_source_days`) is a hole in the published
+    data, not something this capture could have prevented -- it is
+    subtracted from `missing_days` before the threshold is applied. A day
+    never attempted this way, or attempted and missing for any other reason,
+    is not in that mapping and so still counts fully. The mapping is
+    returned so the caller can record exactly what was subtracted in the
+    walk-forward manifest, rather than letting the exemption live only here.
     """
     quality = _load_object(quality_report_path)
     instruments = quality.get("instruments")
     if not isinstance(instruments, list):
         raise PanelSamplesError("quality-report.json is malformed")
+    absent_at_source = _absent_at_source_days(capture_manifest)
     offenders: list[tuple[str, int]] = []
     for item in instruments:
         if not isinstance(item, dict):
@@ -188,10 +207,17 @@ def _enforce_capture_quality(quality_report_path: Path) -> None:
         instrument_id = item.get("instrument_id")
         if not isinstance(missing_days, int) or not isinstance(instrument_id, str):
             raise PanelSamplesError("quality-report.json is malformed")
-        if missing_days > _MAX_MISSING_DAYS_PER_INSTRUMENT:
-            offenders.append((instrument_id, missing_days))
+        proven_absent = len(absent_at_source.get(instrument_id, ()))
+        if proven_absent > missing_days:
+            raise PanelSamplesError(
+                "quality-report.json is inconsistent with capture-manifest.json: "
+                f"{instrument_id} has more days proven absent at source than missing days"
+            )
+        unexplained_missing_days = missing_days - proven_absent
+        if unexplained_missing_days > _MAX_MISSING_DAYS_PER_INSTRUMENT:
+            offenders.append((instrument_id, unexplained_missing_days))
     if not offenders:
-        return
+        return absent_at_source
     offenders.sort(key=lambda pair: (-pair[1], pair[0]))
     shown = offenders[:_MAX_QUALITY_FAILURE_NAMES]
     detail = ", ".join(f"{name} ({count} missing days)" for name, count in shown)
@@ -203,6 +229,42 @@ def _enforce_capture_quality(quality_report_path: Path) -> None:
         f"{len(offenders)} instrument(s) exceed {_MAX_MISSING_DAYS_PER_INSTRUMENT} missing "
         f"days inside their listed span: {detail}"
     )
+
+
+# Must match `trading_bot.panel_capture._DAILY_FILL_KIND`: the "kind" a
+# capture-manifest source entry records for a day fetched from Binance's daily
+# dump to patch a gap in the monthly aggregates. Re-declared here (not
+# imported) because that name is a private module constant of panel_capture.
+_DAILY_FILL_SOURCE_KIND = "klines_daily_fill"
+
+
+def _absent_at_source_days(capture_manifest: dict[str, object]) -> dict[str, tuple[str, ...]]:
+    """Per instrument, the days the capture attempted from Binance's daily dump
+    and recorded as absent there too -- proof the day is missing from the
+    published data itself, not a defect this capture could have avoided.
+
+    Only a `klines_daily_fill` source entry with a status other than `present`
+    counts. A day never attempted this way is simply absent from the returned
+    mapping, so it is not exempted anywhere -- this must not become a way for
+    an unattempted, genuinely defective gap to pass the quality gate.
+    """
+    sources = capture_manifest.get("sources")
+    if not isinstance(sources, list):
+        raise PanelSamplesError("capture-manifest.json is malformed")
+    absent: dict[str, set[str]] = {}
+    for entry in sources:
+        if not isinstance(entry, dict):
+            raise PanelSamplesError("capture-manifest.json is malformed")
+        if entry.get("kind") != _DAILY_FILL_SOURCE_KIND or entry.get("status") == "present":
+            continue
+        symbol = entry.get("symbol")
+        # The daily-fill source record reuses the "month" field for the exact
+        # date it fetched (see `panel_capture._fill_gap_days`), not a month.
+        date = entry.get("month")
+        if not isinstance(symbol, str) or not isinstance(date, str):
+            raise PanelSamplesError("capture-manifest.json is malformed")
+        absent.setdefault(symbol, set()).add(date)
+    return {symbol: tuple(sorted(dates)) for symbol, dates in absent.items()}
 
 
 def _fold_record(fold: WalkForwardFold) -> dict[str, object]:
