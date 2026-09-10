@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.evaluation import _maximum_drawdown
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_decision import PanelDecisionError, build_panel_decision
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
@@ -634,3 +635,88 @@ def test_member_held_nothing_episode_is_excluded_from_pooling(tmp_path: Path) ->
     # An untouched candidate's own pooled count is unaffected.
     control = next(item for item in document["controls"] if item["candidate_name"] == "no_trade")
     assert control["episode_count"] == 6 * EPISODES_PER_FOLD
+
+
+def _alternating(count: int, *, low: str, high: str) -> list[str]:
+    half = count // 2
+    return [low] * half + [high] * (count - half)
+
+
+def test_member_record_reports_the_spec_8_4_fields(tmp_path: Path) -> None:
+    # xs_mom_4w gets the same 40-value alternating base pattern in every one of the
+    # six folds (20 episodes at "-0.01", 20 at "0.02") and a uniformly positive
+    # adverse return; every other candidate stays at the default all-zero profile.
+    # Every quantity asserted below is independently hand-derived (or, for maximum
+    # drawdown, cross-checked against the exact function `evaluation.py` uses) from
+    # that same fixture, so this pins the wiring of every section 8.4 field this
+    # item adds, not just their presence.
+    base_pattern = _alternating(EPISODES_PER_FOLD, low="-0.01", high="0.02")
+    adverse_pattern = ["0.001"] * EPISODES_PER_FOLD
+    per_fold_base = {index: {"xs_mom_4w": base_pattern} for index in range(6)}
+    per_fold_adverse = {index: {"xs_mom_4w": adverse_pattern} for index in range(6)}
+    output_path = build_with_fold_episodes(tmp_path, per_fold_base, per_fold_adverse)
+    document = json.loads(output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+
+    assert momentum["episode_count"] == 6 * EPISODES_PER_FOLD
+    # 120 episodes at -0.01 and 120 at 0.02: the two middle (sorted) values straddle
+    # the boundary between the two groups, so the median is their average.
+    assert Decimal(momentum["base_median_net_return"]) == (Decimal("-0.01") + Decimal("0.02")) / 2
+    assert Decimal(momentum["base_win_rate"]) == Decimal("120") / Decimal("240")
+    assert momentum["base_mean_turnover"] == "1"
+    assert momentum["base_mean_gross_exposure"] == "1"
+    assert momentum["base_mean_net_exposure"] == "0"
+    assert momentum["base_forced_close_count"] == 0
+    pooled_base_series = [Decimal(value) for value in base_pattern] * 6
+    assert Decimal(momentum["base_maximum_drawdown"]) == _maximum_drawdown(pooled_base_series)
+
+    # The adverse series is uniformly positive: every episode is a "win", the
+    # median equals the constant, and there is never a drawdown.
+    assert momentum["adverse_median_net_return"] == "0.001"
+    assert momentum["adverse_win_rate"] == "1"
+    assert momentum["adverse_maximum_drawdown"] == "0"
+    assert momentum["adverse_mean_turnover"] == "1"
+    assert momentum["adverse_forced_close_count"] == 0
+
+    # No week in this fixture is UNIVERSE_TOO_SMALL.
+    assert momentum["universe_too_small_week_count"] == 0
+
+
+def test_universe_too_small_week_count_reflects_skipped_samples(tmp_path: Path) -> None:
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        write_fold(path, fold_index, {})
+        if fold_index == 0:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["skipped_sample_ids"] = ["BINANCE_UM:1:w1", "BINANCE_UM:2:w1"]
+            document["reason_codes"] = ["SKIPPED_WEEK_EXIT_COST_UNCHARGED"]
+            material = {k: v for k, v in document.items() if k != "report_hash"}
+            document["report_hash"] = content_sha256(material)
+            path.write_bytes(canonical_json(document))
+        paths.append(path)
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=SPEC_PATH,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    assert document["skipped_sample_ids"] == ["BINANCE_UM:1:w1", "BINANCE_UM:2:w1"]
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    assert momentum["universe_too_small_week_count"] == 2
+
+
+def test_declared_deviations_are_reported(tmp_path: Path) -> None:
+    output_path = build(tmp_path, {})
+    document = json.loads(output_path.read_text(encoding="utf-8"))
+    deviations = document["declared_deviations"]
+    assert len(deviations) >= 1
+    ids = {item["id"] for item in deviations}
+    assert "RANKABLE_SUBSET_NOT_FULL_UNIVERSE" in ids
+    for item in deviations:
+        assert item["description"]

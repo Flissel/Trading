@@ -13,6 +13,7 @@ from trading_bot.evaluation import (
     benjamini_hochberg,
     block_bootstrap_mean_test,
 )
+from trading_bot.evaluation import _maximum_drawdown as _shared_maximum_drawdown
 from trading_bot.panel_config import PanelFamilySpec, load_panel_family_spec
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE, verify_panel_fold_report
 from trading_bot.panel_statistics import (
@@ -22,6 +23,25 @@ from trading_bot.panel_statistics import (
     sharpe_ratio,
 )
 from trading_bot.registry import ArtifactRecord, MetadataRegistry
+
+# Section 8.1's declared weight construction reads from the *full eligible*
+# universe; the implementation reads from the subset of it that is actually
+# rankable at that decision (has the exact lagged close for the member's
+# lookback, or a full volatility window). This is a known, deliberate
+# reporting departure from the spec text -- not a change to how weights are
+# built -- surfaced in every decision report via `declared_deviations`.
+_DECLARED_DEVIATIONS: tuple[dict[str, object], ...] = (
+    {
+        "id": "RANKABLE_SUBSET_NOT_FULL_UNIVERSE",
+        "description": (
+            "The cross-sectional quintile size and the time-series weight cap are "
+            "computed from the contracts that are actually rankable at a decision, not "
+            "from the full eligible universe as spec section 8.1 states, because a "
+            "contract can be eligible yet lack the exact lagged close or a full "
+            "volatility window."
+        ),
+    },
+)
 
 
 class PanelDecisionError(RuntimeError):
@@ -51,6 +71,14 @@ class _Pooled:
     # one member's own holding pattern) and used only for the cross-candidate
     # linkage check and the top-level `pooled_episode_count` report field.
     raw_episode_count: int
+    base_turnovers: tuple[Decimal, ...]
+    adverse_turnovers: tuple[Decimal, ...]
+    base_gross_exposures: tuple[Decimal, ...]
+    adverse_gross_exposures: tuple[Decimal, ...]
+    base_net_exposures: tuple[Decimal, ...]
+    adverse_net_exposures: tuple[Decimal, ...]
+    base_forced_close_count: int
+    adverse_forced_close_count: int
 
 
 def build_panel_decision(
@@ -165,6 +193,15 @@ def build_panel_decision(
         default=Decimal(0),
     )
 
+    skipped_sample_ids = sorted(
+        {
+            value
+            for document in documents
+            for value in _string_list_field(document, "skipped_sample_ids")
+        }
+    )
+    universe_too_small_week_count = len(skipped_sample_ids)
+
     members: list[dict[str, object]] = []
     eligible: list[str] = []
     for name in member_names:
@@ -178,6 +215,7 @@ def build_panel_decision(
             trial_sharpes=tuple(trial_sharpes),
             strongest_base=strongest_base,
             strongest_adverse=strongest_adverse,
+            universe_too_small_week_count=universe_too_small_week_count,
         )
         members.append(record)
         if status == "eligible_for_further_review":
@@ -205,16 +243,11 @@ def build_panel_decision(
         "fold_count": fold_count,
         "pooled_episode_count": pooled_raw_episode_count,
         "source_report_hashes": [str(document["report_hash"]) for document in documents],
-        "skipped_sample_ids": sorted(
-            {
-                value
-                for document in documents
-                for value in _string_list_field(document, "skipped_sample_ids")
-            }
-        ),
+        "skipped_sample_ids": skipped_sample_ids,
         "block_length": spec.statistics.block_length,
         "bootstrap_repetitions": spec.statistics.bootstrap_repetitions,
         "random_seed": spec.statistics.random_seed,
+        "declared_deviations": list(_DECLARED_DEVIATIONS),
         "members": members,
         "controls": controls,
         "eligible_member_names": eligible,
@@ -276,6 +309,14 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     adverse: list[Decimal] = []
     fold_totals: list[Decimal] = []
     contracts: dict[str, Decimal] = {}
+    base_turnovers: list[Decimal] = []
+    adverse_turnovers: list[Decimal] = []
+    base_gross_exposures: list[Decimal] = []
+    adverse_gross_exposures: list[Decimal] = []
+    base_net_exposures: list[Decimal] = []
+    adverse_net_exposures: list[Decimal] = []
+    base_forced_close_count = 0
+    adverse_forced_close_count = 0
     raw_episode_count = 0
     for document in documents:
         candidates = document["candidates"]
@@ -295,6 +336,10 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
             value = Decimal(str(episode["net_return"]))
             base.append(value)
             fold_total += value
+            base_turnovers.append(Decimal(str(episode["turnover"])))
+            base_gross_exposures.append(Decimal(str(episode["gross_exposure"])))
+            base_net_exposures.append(Decimal(str(episode["net_exposure"])))
+            base_forced_close_count += int(episode["forced_close_count"])
             for contract_id, contribution in episode["contract_net_contributions"]:
                 contracts[str(contract_id)] = contracts.get(
                     str(contract_id), Decimal(0)
@@ -304,6 +349,10 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
             if _held_nothing(episode):
                 continue
             adverse.append(Decimal(str(episode["net_return"])))
+            adverse_turnovers.append(Decimal(str(episode["turnover"])))
+            adverse_gross_exposures.append(Decimal(str(episode["gross_exposure"])))
+            adverse_net_exposures.append(Decimal(str(episode["net_exposure"])))
+            adverse_forced_close_count += int(episode["forced_close_count"])
     return _Pooled(
         base_returns=tuple(base),
         adverse_returns=tuple(adverse),
@@ -313,7 +362,42 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         contract_totals=contracts,
         episode_count=len(base),
         raw_episode_count=raw_episode_count,
+        base_turnovers=tuple(base_turnovers),
+        adverse_turnovers=tuple(adverse_turnovers),
+        base_gross_exposures=tuple(base_gross_exposures),
+        adverse_gross_exposures=tuple(adverse_gross_exposures),
+        base_net_exposures=tuple(base_net_exposures),
+        adverse_net_exposures=tuple(adverse_net_exposures),
+        base_forced_close_count=base_forced_close_count,
+        adverse_forced_close_count=adverse_forced_close_count,
     )
+
+
+def _mean(values: tuple[Decimal, ...]) -> Decimal:
+    return sum(values, Decimal(0)) / Decimal(len(values)) if values else Decimal(0)
+
+
+def _median(values: tuple[Decimal, ...]) -> Decimal:
+    if not values:
+        return Decimal(0)
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+
+
+def _win_rate(values: tuple[Decimal, ...]) -> Decimal:
+    """Wins over count, zero when there is nothing to divide by.
+
+    Mirrors `evaluate_signals`'s win-rate definition in `evaluation.py`
+    (wins among the active trades, divided by the active trade count) so the
+    bar-cadence and panel research lines agree on what "win rate" means.
+    """
+    if not values:
+        return Decimal(0)
+    wins = sum(1 for value in values if value > 0)
+    return Decimal(wins) / Decimal(len(values))
 
 
 def _member_record(
@@ -327,6 +411,7 @@ def _member_record(
     trial_sharpes: tuple[Decimal, ...],
     strongest_base: Decimal,
     strongest_adverse: Decimal,
+    universe_too_small_week_count: int,
 ) -> tuple[dict[str, object], str]:
     evidence: list[str] = []
     economic: list[str] = []
@@ -402,8 +487,23 @@ def _member_record(
         "episode_count": pooled.episode_count,
         "base_total_net_return": pooled.base_total,
         "base_mean_net_return": base_mean,
+        "base_median_net_return": _median(pooled.base_returns),
+        "base_win_rate": _win_rate(pooled.base_returns),
+        "base_maximum_drawdown": _shared_maximum_drawdown(list(pooled.base_returns)),
+        "base_mean_turnover": _mean(pooled.base_turnovers),
+        "base_mean_gross_exposure": _mean(pooled.base_gross_exposures),
+        "base_mean_net_exposure": _mean(pooled.base_net_exposures),
+        "base_forced_close_count": pooled.base_forced_close_count,
         "adverse_total_net_return": pooled.adverse_total,
         "adverse_mean_net_return": adverse_mean,
+        "adverse_median_net_return": _median(pooled.adverse_returns),
+        "adverse_win_rate": _win_rate(pooled.adverse_returns),
+        "adverse_maximum_drawdown": _shared_maximum_drawdown(list(pooled.adverse_returns)),
+        "adverse_mean_turnover": _mean(pooled.adverse_turnovers),
+        "adverse_mean_gross_exposure": _mean(pooled.adverse_gross_exposures),
+        "adverse_mean_net_exposure": _mean(pooled.adverse_net_exposures),
+        "adverse_forced_close_count": pooled.adverse_forced_close_count,
+        "universe_too_small_week_count": universe_too_small_week_count,
         "positive_base_fold_count": positive_folds,
         "required_positive_fold_count": required,
         "base_bootstrap_lower": lower,
