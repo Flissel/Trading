@@ -1,7 +1,7 @@
 """Weekly portfolio accounting for the perpetual panel."""
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal, localcontext
 
 from trading_bot.panel_config import PanelCostTable
 from trading_bot.panel_reader import FundingEvent
@@ -9,6 +9,15 @@ from trading_bot.panel_universe import ContractHistory
 
 DAY_NS = 86_400_000_000_000
 _BPS = Decimal(10_000)
+# Precision for summing net_contributions into net_return only: generous
+# headroom above the default 28 significant digits so that this one summation
+# never itself needs to round. Each per-contract contribution can already
+# carry close to 28-29 significant digits (from weight and return divisions
+# upstream); summing the bounded number of contracts in one episode's universe
+# under the default context can round, silently breaking the invariant (relied
+# on by callers pooling per-contract totals across many episodes) that an
+# episode's own net_contributions sum to its own net_return exactly.
+_NET_RETURN_CONTEXT = Context(prec=50)
 
 
 class PanelAccountingError(RuntimeError):
@@ -126,7 +135,21 @@ def evaluate_episode(
         - forced_by_id.get(contract_id, Decimal(0))
         for contract_id in universe
     }
-    net_return = gross_return - trading_cost - funding_cost - forced_close_cost
+    # Derived from net_contributions rather than computed independently as
+    # `gross_return - trading_cost - funding_cost - forced_close_cost`: the two
+    # forms are mathematically identical, but summing four separately-aggregated
+    # totals is a different order of Decimal additions than summing the same
+    # money grouped per contract, and Decimal addition is not associative at its
+    # default 28-significant-digit precision -- the two forms could round to
+    # values differing by roughly 1e-29, silently breaking the invariant (relied
+    # on by callers pooling per-contract totals across episodes) that an
+    # episode's own net_contributions sum to its own net_return exactly. Summed
+    # under `_NET_RETURN_CONTEXT` so this specific addition never itself needs
+    # to round (see its definition) -- an exact sum is associative, so any
+    # caller regrouping this same per-contract money (by episode or by
+    # contract) later necessarily agrees with it to the last digit too.
+    with localcontext(_NET_RETURN_CONTEXT):
+        net_return = sum(net_contributions.values(), Decimal(0))
     denominator = Decimal(1) + gross_return
     drifted: dict[str, Decimal] = {}
     for contract_id, weight in weight_map.items():
