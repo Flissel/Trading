@@ -634,7 +634,7 @@ def test_member_held_nothing_episode_is_excluded_but_its_cost_is_rolled_forward(
         item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
     )
     # One fewer counted observation than the raw episode count...
-    assert momentum["episode_count"] == 6 * EPISODES_PER_FOLD - 1
+    assert momentum["pooled_retained_episode_count"] == 6 * EPISODES_PER_FOLD - 1
     # ...but the marked episode's money is still fully present in both pooled
     # totals -- equal to the *full* raw total, not short by the excluded episode.
     assert momentum["base_total_net_return"] == str(Decimal("0.01") * 6 * EPISODES_PER_FOLD)
@@ -653,7 +653,7 @@ def test_member_held_nothing_episode_is_excluded_but_its_cost_is_rolled_forward(
     assert document["pooled_raw_episode_count"] == 6 * EPISODES_PER_FOLD
     # An untouched candidate's own pooled count is unaffected.
     control = next(item for item in document["controls"] if item["candidate_name"] == "no_trade")
-    assert control["episode_count"] == 6 * EPISODES_PER_FOLD
+    assert control["pooled_retained_episode_count"] == 6 * EPISODES_PER_FOLD
 
 
 def _alternating(count: int, *, low: str, high: str) -> list[str]:
@@ -679,7 +679,7 @@ def test_member_record_reports_the_spec_8_4_fields(tmp_path: Path) -> None:
         item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
     )
 
-    assert momentum["episode_count"] == 6 * EPISODES_PER_FOLD
+    assert momentum["pooled_retained_episode_count"] == 6 * EPISODES_PER_FOLD
     # 120 episodes at -0.01 and 120 at 0.02: the two middle (sorted) values straddle
     # the boundary between the two groups, so the median is their average.
     assert Decimal(momentum["base_median_net_return"]) == (Decimal("-0.01") + Decimal("0.02")) / 2

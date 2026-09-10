@@ -208,7 +208,7 @@ def build_panel_decision(
         pooled[name].raw_episode_count for name in member_names + control_names
     }
     if len(raw_episode_counts) != 1:
-        raise PanelDecisionError("candidates do not share one pooled episode count")
+        raise PanelDecisionError("candidates do not share one raw pooled episode count")
     pooled_raw_episode_count = next(iter(raw_episode_counts))
     fold_count = len(documents)
 
@@ -279,7 +279,7 @@ def build_panel_decision(
     controls = [
         {
             "candidate_name": name,
-            "episode_count": pooled[name].episode_count,
+            "pooled_retained_episode_count": pooled[name].episode_count,
             "base_total_net_return": pooled[name].base_total,
             "adverse_total_net_return": pooled[name].adverse_total,
         }
@@ -688,7 +688,7 @@ def _member_record(
 
     record: dict[str, object] = {
         "candidate_name": name,
-        "episode_count": pooled.episode_count,
+        "pooled_retained_episode_count": pooled.episode_count,
         "base_total_net_return": pooled.base_total,
         "base_mean_net_return": base_mean,
         "base_median_net_return": _median(pooled.base_returns),
