@@ -36,6 +36,7 @@ _VENUE = "BINANCE_UM"
 _MAX_ZIP_BYTES = 32_000_000
 _MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_]{2,32}$")
+_LISTING_MAX_KEYS = 1000
 
 
 class PanelCaptureError(RuntimeError):
@@ -150,7 +151,7 @@ def build_month_listing_url(symbol: str, kind: str) -> str:
     encoded_prefix = urllib.parse.quote(prefix, safe="")
     url = (
         "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
-        f"?list-type=2&max-keys=1000&prefix={encoded_prefix}"
+        f"?list-type=2&max-keys={_LISTING_MAX_KEYS}&prefix={encoded_prefix}"
     )
     _validate_panel_url(url)
     return url
@@ -160,8 +161,11 @@ def discover_panel_months(fetch: PanelFetch, *, symbol: str, kind: str) -> tuple
     """Ask the bucket which months a symbol actually has for one source kind.
 
     A symbol has at most about eighty months of history, so a single page of
-    up to 1000 keys always suffices; a response that reports itself as
-    truncated is treated as a hard failure rather than a silent partial list.
+    up to `_LISTING_MAX_KEYS` keys always suffices. The response is required
+    to look exactly like a complete, unpaginated listing -- anything else
+    (missing or true `IsTruncated`, a pagination token, a non-listing body,
+    or a key count at the page limit) is a hard failure rather than a silent
+    partial list.
     """
     url = build_month_listing_url(symbol, kind)
     payload = fetch(url)
@@ -503,16 +507,35 @@ def _parse_listing_months(raw: bytes, *, symbol: str, kind: str) -> tuple[str, .
         root = ET.fromstring(raw)
     except ET.ParseError as error:
         raise PanelCaptureError(f"panel month listing is unreadable: {error}") from error
-    truncated = False
+    # A non-2xx S3 error can still arrive as an XML body over HTTP 200 (or
+    # any other body shape entirely); a root that isn't a ListBucketResult
+    # must never be read as "zero keys", so reject it outright.
+    if str(root.tag).rsplit("}", 1)[-1] != "ListBucketResult":
+        raise PanelCaptureError(
+            f"panel month listing for {symbol} {kind} is not a ListBucketResult response"
+        )
+    is_truncated: str | None = None
     keys: list[str] = []
     for element in root.iter():
         tag = str(element.tag).rsplit("}", 1)[-1]
-        if tag == "IsTruncated" and (element.text or "").strip().lower() == "true":
-            truncated = True
+        if tag == "IsTruncated":
+            is_truncated = (element.text or "").strip().lower()
+        elif tag in ("NextContinuationToken", "NextMarker") and (element.text or "").strip():
+            raise PanelCaptureError(
+                f"panel month listing for {symbol} {kind} is paginated"
+            )
         elif tag == "Key" and element.text:
             keys.append(element.text.strip())
-    if truncated:
-        raise PanelCaptureError(f"panel month listing for {symbol} {kind} was truncated")
+    # Require IsTruncated to be present and exactly "false": missing, true,
+    # or any other value is treated as an ambiguous, unsafe-to-trust listing.
+    if is_truncated != "false":
+        raise PanelCaptureError(
+            f"panel month listing for {symbol} {kind} was truncated or ambiguous"
+        )
+    if len(keys) >= _LISTING_MAX_KEYS:
+        raise PanelCaptureError(
+            f"panel month listing for {symbol} {kind} reached the page limit"
+        )
     # The strict pattern re-confirms the exact symbol on every key, so a
     # prefix collision (BTCUSDT vs. BTCUSDTX) can never leak a foreign month.
     pattern = _listing_key_pattern(symbol, kind)

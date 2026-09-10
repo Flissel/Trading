@@ -434,6 +434,62 @@ def test_discover_panel_months_raises_when_the_listing_is_truncated() -> None:
         discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
 
 
+def test_discover_panel_months_raises_when_is_truncated_is_missing() -> None:
+    xml = (
+        b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<Contents><Key>data/futures/um/monthly/klines/BTCUSDT/1d/"
+        b"BTCUSDT-1d-2024-01.zip</Key></Contents>"
+        b"</ListBucketResult>"
+    )
+
+    def fetch(url: str) -> PanelPayload:
+        return PanelPayload(url=url, raw_bytes=xml, received_time_ns=1)
+
+    with pytest.raises(PanelCaptureError):
+        discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
+
+
+def test_discover_panel_months_raises_on_a_continuation_token() -> None:
+    xml = (
+        b'<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
+        b"<IsTruncated>false</IsTruncated>"
+        b"<NextContinuationToken>abc</NextContinuationToken>"
+        b"<Contents><Key>data/futures/um/monthly/klines/BTCUSDT/1d/"
+        b"BTCUSDT-1d-2024-01.zip</Key></Contents>"
+        b"</ListBucketResult>"
+    )
+
+    def fetch(url: str) -> PanelPayload:
+        return PanelPayload(url=url, raw_bytes=xml, received_time_ns=1)
+
+    with pytest.raises(PanelCaptureError):
+        discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
+
+
+def test_discover_panel_months_raises_on_a_non_listing_root() -> None:
+    # An S3 <Error> body can be served with HTTP 200; it must never be read
+    # as a complete, empty listing.
+    xml = b"<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>"
+
+    def fetch(url: str) -> PanelPayload:
+        return PanelPayload(url=url, raw_bytes=xml, received_time_ns=1)
+
+    with pytest.raises(PanelCaptureError):
+        discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
+
+
+def test_discover_panel_months_raises_when_the_key_count_hits_the_page_limit() -> None:
+    keys = tuple(
+        "data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip" for _ in range(1000)
+    )
+
+    def fetch(url: str) -> PanelPayload:
+        return PanelPayload(url=url, raw_bytes=_listing_xml(keys=keys), received_time_ns=1)
+
+    with pytest.raises(PanelCaptureError):
+        discover_panel_months(fetch, symbol="BTCUSDT", kind="klines")
+
+
 def _discovery_and_zip_fetch(
     *, kline_months: tuple[str, ...], funding_months: tuple[str, ...]
 ) -> Callable[[str], PanelPayload]:
