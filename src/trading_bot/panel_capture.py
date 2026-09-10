@@ -101,15 +101,13 @@ class PanelZipClient:
                     last_error = error
                 else:
                     raise PanelCaptureError(f"panel dump request failed: {error}") from error
-            except (
-                urllib.error.URLError,
-                TimeoutError,
-                ConnectionResetError,
-                http.client.IncompleteRead,
-            ) as error:
-                # Covers both the request itself and draining the response
-                # body -- a reset or a short read mid-transfer is exactly as
-                # transient as a failure to connect in the first place.
+            except (OSError, http.client.IncompleteRead) as error:
+                # OSError covers URLError, TimeoutError, ConnectionResetError,
+                # ConnectionAbortedError, BrokenPipeError, and ssl.SSLError --
+                # the whole family of connection- and read-phase transients,
+                # not just the two most obvious members of it.
+                # IncompleteRead is listed separately: it is an
+                # http.client.HTTPException, not an OSError.
                 last_error = error
             except PanelCaptureError:
                 raise
@@ -295,9 +293,13 @@ def capture_panel(
     already_done: dict[tuple[str, str, str], dict[str, Any]] = {}
     need_header = True
     if progress_path.exists():
-        non_blank = [
-            line for line in progress_path.read_text(encoding="utf-8").splitlines() if line.strip()
-        ]
+        try:
+            raw_text = progress_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as error:
+            raise PanelCaptureError(
+                f"panel capture progress file is corrupt: {progress_path}"
+            ) from error
+        non_blank = [line for line in raw_text.splitlines() if line.strip()]
         for index, line in enumerate(non_blank):
             is_last = index == len(non_blank) - 1
             try:
@@ -324,8 +326,40 @@ def capture_panel(
                     )
                 need_header = False
                 continue
+            # A record can be syntactically valid JSON yet structurally
+            # wrong (a list, or a dict missing a required field) -- that is
+            # never reachable from a torn write (truncated JSON never parses
+            # at all), but it must still fail closed rather than raise a
+            # raw TypeError/KeyError once indexed below.
+            if not (
+                isinstance(record, dict)
+                and isinstance(record.get("symbol"), str)
+                and isinstance(record.get("month"), str)
+                and isinstance(record.get("kind"), str)
+            ):
+                raise PanelCaptureError(
+                    f"panel capture progress file is corrupt: {progress_path}"
+                )
             sources.append(record)
             already_done[(record["symbol"], record["month"], record["kind"])] = record
+
+        if raw_text and not raw_text.endswith("\n"):
+            # The file's tail is not cleanly newline-terminated: either the
+            # final record was torn (dropped above) or it was complete JSON
+            # that lost only its own trailing newline to the same kind of
+            # crash (the JSON and its newline are two separate writes).
+            # Rewrite the file to exactly the header and sources recovered
+            # above. A bare "append a newline" here would leave the
+            # abandoned bytes in place; once anything is appended after
+            # them they become an unparseable *earlier* line on the next
+            # resume, permanently blocking the capture rather than merely
+            # losing one already-lossless refetch.
+            _rewrite_progress_file(
+                progress_path,
+                need_header=need_header,
+                capture_parameters=capture_parameters,
+                sources=sources,
+            )
 
     raw_root = target / "raw"
     candles: list[PanelCandleRow] = []
@@ -612,6 +646,32 @@ def _bounded_months(
         for month in months
         if (month_from is None or month >= month_from) and (month_to is None or month <= month_to)
     )
+
+
+def _rewrite_progress_file(
+    progress_path: Path,
+    *,
+    need_header: bool,
+    capture_parameters: dict[str, object],
+    sources: list[dict[str, object]],
+) -> None:
+    """Rewrite the progress file to exactly the records recovered from it.
+
+    Called once per resume, and only when the file's tail was not cleanly
+    newline-terminated. This replaces the file outright rather than
+    patching it in place, so any abandoned, unterminated bytes at the old
+    tail are removed from disk -- not merely separated from what comes
+    next by a newline, which would still leave them behind to be read back
+    as an unparseable line once something is appended after them.
+    """
+    lines: list[bytes] = []
+    if not need_header:
+        lines.append(canonical_json({"capture_parameters": capture_parameters}))
+    lines.extend(canonical_json(item) for item in sources)
+    content = b"\n".join(lines)
+    if lines:
+        content += b"\n"
+    progress_path.write_bytes(content)
 
 
 def _validate_panel_url(url: str) -> None:

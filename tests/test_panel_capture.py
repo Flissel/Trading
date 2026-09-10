@@ -268,6 +268,34 @@ def test_panel_zip_client_retries_an_incomplete_read(monkeypatch: pytest.MonkeyP
     assert sleeps == [1]
 
 
+@pytest.mark.parametrize("error_type", [ConnectionAbortedError, BrokenPipeError])
+def test_panel_zip_client_retries_the_rest_of_the_oserror_family(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[OSError]
+) -> None:
+    # ConnectionResetError and IncompleteRead were named explicitly, but the
+    # retry ladder must catch the whole OSError family -- ConnectionAbortedError
+    # (WinError 10053, the common Windows mid-transfer abort) and
+    # BrokenPipeError are exactly as likely over ~46,000 requests.
+    calls = {"count": 0}
+
+    class _FlakyReadResponse(_FakeUrlopenResponse):
+        def read(self, limit: int) -> bytes:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise error_type("connection dropped")
+            return super().read(limit)
+
+    def urlopen_stub(request: urllib.request.Request, timeout: float) -> _FlakyReadResponse:
+        return _FlakyReadResponse(b"payload-bytes", request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen_stub)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    payload = client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert payload.raw_bytes == b"payload-bytes"
+    assert sleeps == [1]
+
+
 def test_panel_zip_client_wraps_an_unexpected_error_without_retrying(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -832,6 +860,91 @@ def test_capture_resume_recovers_from_a_torn_final_progress_line(tmp_path: Path)
     assert control_manifest["capture_root_hash"] == resumed_manifest["capture_root_hash"]
 
 
+def test_capture_survives_a_second_crash_right_after_a_torn_line_repair(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's exact double-crash reproduction: a torn last line is
+    repaired on resume, that resume makes one more successful write, then
+    dies again. Before the fix, the repair never happened -- the next write
+    concatenated onto the torn bytes with no separator, and once a further
+    write followed *that* splice, it became an unparseable earlier line
+    that permanently blocked every future resume."""
+
+    target = tmp_path / "resumable"
+    calls_1 = {"count": 0}
+    base_fetch_1 = _deterministic_fetch()
+
+    def flaky_fetch_1(url: str) -> PanelPayload:
+        calls_1["count"] += 1
+        if calls_1["count"] > 2:
+            raise PanelCaptureError("simulated crash 1")
+        return base_fetch_1(url)
+
+    with pytest.raises(PanelCaptureError, match="simulated crash 1"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01", "2024-02"),
+            fetch=flaky_fetch_1,
+        )
+
+    # Simulate a hard kill mid-write of the next record.
+    progress_path = target / "capture-progress.jsonl"
+    with progress_path.open("a", encoding="utf-8") as handle:
+        handle.write('{"symbol": "BTCUSDT", "month": "2024-02", "kind": "kli')
+
+    # Resume: this repairs the torn line, then makes exactly one more
+    # successful write before dying again.
+    calls_2 = {"count": 0}
+    base_fetch_2 = _deterministic_fetch()
+
+    def flaky_fetch_2(url: str) -> PanelPayload:
+        calls_2["count"] += 1
+        if calls_2["count"] > 1:
+            raise PanelCaptureError("simulated crash 2")
+        return base_fetch_2(url)
+
+    with pytest.raises(PanelCaptureError, match="simulated crash 2"):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01", "2024-02"),
+            fetch=flaky_fetch_2,
+        )
+    assert not (target / "capture-manifest.json").exists()
+
+    # Every line must parse independently -- no splice of the abandoned
+    # torn prefix and the record written right after it.
+    for line in progress_path.read_text(encoding="utf-8").splitlines():
+        json.loads(line)
+
+    control = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "control",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01", "2024-02"),
+        fetch=_deterministic_fetch(),
+    )
+    resumed = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=target,
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01", "2024-02"),
+        fetch=_deterministic_fetch(),
+    )
+    assert verify_panel_capture(resumed.capture_root) == (True, ())
+    control_manifest = json.loads(control.capture_manifest_path.read_text(encoding="utf-8"))
+    resumed_manifest = json.loads(resumed.capture_manifest_path.read_text(encoding="utf-8"))
+    assert control_manifest["sources"] == resumed_manifest["sources"]
+    assert control_manifest["capture_root_hash"] == resumed_manifest["capture_root_hash"]
+
+
 def test_capture_resume_raises_on_a_corrupt_earlier_progress_line(tmp_path: Path) -> None:
     target = tmp_path / "resumable"
     target.mkdir(parents=True)
@@ -853,6 +966,75 @@ def test_capture_resume_raises_on_a_corrupt_earlier_progress_line(tmp_path: Path
         ),
     ]
     progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_resume_raises_on_a_structurally_wrong_progress_line(tmp_path: Path) -> None:
+    # Valid JSON, wrong shape: a list instead of an object. Never reachable
+    # from a torn write (truncated JSON never parses at all), but it must
+    # still fail closed instead of raising a raw TypeError when indexed.
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    lines = [
+        _progress_header(symbols=("BTCUSDT",), months=("2024-01",)),
+        json.dumps(["not", "a", "record"]),
+    ]
+    progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_resume_raises_on_a_progress_line_missing_a_required_field(
+    tmp_path: Path,
+) -> None:
+    # Valid JSON object, missing "symbol". Must fail closed instead of
+    # raising a raw KeyError when indexed.
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    lines = [
+        _progress_header(symbols=("BTCUSDT",), months=("2024-01",)),
+        json.dumps({"month": "2024-01", "kind": "klines", "status": "absent", "url": "u"}),
+    ]
+    progress_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
+        capture_panel(
+            workspace_root=tmp_path,
+            output_directory=target,
+            reserve_bytes=0,
+            symbols=("BTCUSDT",),
+            months=("2024-01",),
+            fetch=_deterministic_fetch(),
+        )
+
+
+def test_capture_resume_raises_on_non_utf8_bytes_in_the_progress_file(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "resumable"
+    target.mkdir(parents=True)
+    progress_path = target / "capture-progress.jsonl"
+    header = _progress_header(symbols=("BTCUSDT",), months=("2024-01",)).encode("utf-8")
+    progress_path.write_bytes(header + b"\n" + b"\xff\xfe not utf-8 \x80\x81\n")
 
     with pytest.raises(PanelCaptureError, match=re.escape(str(progress_path))):
         capture_panel(
