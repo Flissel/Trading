@@ -138,6 +138,7 @@ def publish_panel_walk_forward(
         "folds": [_fold_record(fold) for fold in views.folds],
         "final_holdout_ids": list(views.final_holdout_ids),
         "pooled_test_sample_count": pooled,
+        "capture_quality_max_missing_days_per_instrument": _MAX_MISSING_DAYS_PER_INSTRUMENT,
     }
     manifest_hash = content_sha256(material)
     document = dict(material)

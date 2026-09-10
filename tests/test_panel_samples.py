@@ -12,6 +12,7 @@ from trading_bot.panel_capture import PanelPayload, capture_panel
 from trading_bot.panel_config import PanelFoldGeometry, load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
 from trading_bot.panel_samples import (
+    _MAX_MISSING_DAYS_PER_INSTRUMENT,
     PanelSamplesError,
     build_rebalance_samples,
     derive_panel_config,
@@ -252,3 +253,42 @@ def test_capture_quality_stop_does_not_misfire_at_the_threshold(tmp_path: Path) 
             family_spec_hash="a" * 64,
         )
     assert "CAPTURE_QUALITY_FAILED" not in str(excinfo.value)
+
+
+def test_manifest_records_the_capture_quality_threshold(tmp_path: Path) -> None:
+    # The threshold a capture was accepted under belongs in the artifact itself,
+    # not only in a CAPTURE_QUALITY_FAILED message nobody sees once a manifest
+    # does get built.
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=_FLOOR_TEST_MONTHS,
+        fetch=_floor_test_fetch,
+    )
+    document = json.loads(Path("configs/xs-momentum-panel-v1.json").read_text(encoding="utf-8"))
+    document["folds"] = {
+        "train_duration_ns": 20 * DAY_NS,
+        "validation_duration_ns": 7 * DAY_NS,
+        "test_duration_ns": 14 * DAY_NS,
+        "step_ns": 14 * DAY_NS,
+        "embargo_ns": 7 * DAY_NS,
+        "holdout_duration_ns": 14 * DAY_NS,
+    }
+    document["statistics"]["pooled_episode_floor"] = 1
+    config_path = tmp_path / "tiny-panel.json"
+    config_path.write_text(json.dumps(document), encoding="utf-8")
+    spec, spec_hash = load_panel_family_spec(config_path)
+
+    artifact = publish_panel_walk_forward(
+        tmp_path / "capture",
+        output_path=tmp_path / "manifest.json",
+        spec=spec,
+        family_spec_hash=spec_hash,
+    )
+    manifest = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    assert (
+        manifest["capture_quality_max_missing_days_per_instrument"]
+        == _MAX_MISSING_DAYS_PER_INSTRUMENT
+    )
