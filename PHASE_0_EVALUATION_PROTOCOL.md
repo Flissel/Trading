@@ -258,3 +258,20 @@ on a panel of Binance USD-M USDT perpetuals. It changes no numeric gate.
   perform no validation selection.
 - Non-learned panel rules are direct-policy baselines under section 9.1;
   section 8 does not apply to them.
+
+### 16.1 Clarification (2026-09-10)
+
+Prompted by ICPUSDT: a dead contract, not a live series with a gap (flat
+price and zero `quote_volume` for 104 days, then five days absent from both
+Binance dumps). Clarifies two implementation corrections without changing
+any numeric gate or parameter:
+
+- The dataset-quality stop (panel spec section 12 step 3) discounts, per
+  instrument, days a capture attempted from Binance's daily dump and
+  recorded absent there too, naming the discounted days in the walk-forward
+  manifest; an unattempted or otherwise-unexplained missing day still stops
+  the family at the unchanged threshold of three.
+- "Trailing N-day" windows for realised volatility and for the liquidity
+  median (panel spec sections 8.1 and 7.1) are calendar spans ending at the
+  decision, not counts of available observations; a history-length
+  requirement stated as a bar count remains a bar count.

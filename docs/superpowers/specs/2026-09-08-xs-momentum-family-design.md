@@ -556,6 +556,58 @@ Prohibited: re-running with a different universe threshold, lookback set, or
 cost table after seeing test results; opening the final holdout; reporting
 the best member without the other five.
 
+## 12.1 Addendum (2026-09-10): calendar-aware windows and the capture-quality gate
+
+ICPUSDT prompted this addendum. Its close is exactly 6.44 USDT for 104
+consecutive days, 2022-06-10 through 2022-09-21, with `quote_volume` exactly
+zero throughout — a dead contract, not a live series with a publishing gap —
+followed immediately by five days, 2022-09-22 through 2022-09-26, absent from
+both Binance's monthly and daily dumps. Repairing a production capture from
+the daily dumps surfaced two implementation gaps against this document while
+investigating that instrument; both are fixed for every future capture, not
+only this one. **No pre-registered numeric gate or parameter changes.**
+
+1. **The capture-quality gate (section 12 step 3) now discounts days proven
+   absent at source.** A missing day the capture actually attempted from
+   Binance's daily dump, and which the dump itself answered with a 404, is
+   not a defect the capture could have prevented; it is a hole in Binance's
+   own published data. The capture manifest already records the attempt (a
+   `sources` entry of kind `klines_daily_fill`, `status: "absent"`, naming
+   the symbol and the exact day); the gate now subtracts, per instrument,
+   the count of such proven-absent days before comparing against the
+   pre-registered threshold of three missing days, which is unchanged. A day
+   never attempted this way, or attempted and missing for any other reason,
+   still counts in full, and every subtraction is cross-checked against the
+   instrument's own recomputed missing days so a manifest cannot name a day
+   as absent at source that the dataset does not actually show as missing.
+   The walk-forward manifest records exactly which days were discounted, per
+   instrument, in an `absent_at_source_days` block, so the limitation
+   travels in the immutable artifact rather than living only in a log line.
+2. **`sigma_30d` (section 8.1) is a calendar window, as this document always
+   specified.** "Trailing 30-day standard deviation" means the 30 calendar
+   days ending at the decision, not the last 30 available observations
+   regardless of the span they cover. On a series with an interior hole the
+   two disagree: an observation-count window reaches further back and folds
+   a multi-day price move into what it treats as a single daily return,
+   understating volatility. The implementation is corrected to match the
+   specification text; the specification itself does not change.
+3. **The trailing 30-day liquidity median (section 7.1 item 3) is likewise a
+   calendar window**, corrected the same way for the same reason: an
+   observation-count window can silently reach outside the intended 30-day
+   span when the series inside it has a hole. Section 7.1 item 1's
+   at-least-91-daily-bars history requirement is explicitly a bar count, not
+   a calendar span, and is unaffected.
+
+None of this changed a result. Across the five weekly rebalances whose
+30-day volatility window straddles ICPUSDT's five absent days, the corrected
+and uncorrected weight vectors are identical, because ICPUSDT's zero
+`quote_volume` already excludes it from the eligible universe at every one
+of those decisions under item 3 above, before its volatility is ever
+computed. The pre-registered gate was, in this capture, blocking the entire
+family over a contract the universe filter had already excluded on other
+grounds. The fix is a correctness guard for every future capture, not a
+change to any result reported from this one.
+
 ## 13. Protocol Addendum (prospective, to be appended to `PHASE_0_EVALUATION_PROTOCOL.md`)
 
 ```text
@@ -578,6 +630,23 @@ on a panel of Binance USD-M USDT perpetuals. It changes no numeric gate.
   perform no validation selection.
 - Non-learned panel rules are direct-policy baselines under section 9.1;
   section 8 does not apply to them.
+
+### 16.1 Clarification (2026-09-10)
+
+Prompted by ICPUSDT: a dead contract, not a live series with a gap (flat
+price and zero `quote_volume` for 104 days, then five days absent from both
+Binance dumps). Clarifies two implementation corrections without changing
+any numeric gate or parameter:
+
+- The dataset-quality stop (panel spec section 12 step 3) discounts, per
+  instrument, days a capture attempted from Binance's daily dump and
+  recorded absent there too, naming the discounted days in the walk-forward
+  manifest; an unattempted or otherwise-unexplained missing day still stops
+  the family at the unchanged threshold of three.
+- "Trailing N-day" windows for realised volatility and for the liquidity
+  median (panel spec sections 8.1 and 7.1) are calendar spans ending at the
+  decision, not counts of available observations; a history-length
+  requirement stated as a bar count remains a bar count.
 ```
 
 ## 14. Risks and Honest Priors
