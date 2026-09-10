@@ -594,14 +594,20 @@ def write_fold_with_held_nothing(
     path.write_bytes(canonical_json(document))
 
 
-def test_member_held_nothing_episode_is_excluded_from_pooling(tmp_path: Path) -> None:
-    # Fold 0 marks one of xs_mom_4w's 40 episodes MEMBER_HELD_NOTHING in both
+def test_member_held_nothing_episode_is_excluded_but_its_cost_is_rolled_forward(
+    tmp_path: Path,
+) -> None:
+    # Fold 0 marks xs_mom_4w's episode 5 of 40 (not the first, not the last, so a
+    # retained episode exists both before and after it) MEMBER_HELD_NOTHING in both
     # scenarios; every other fold and every other candidate is a plain uniform
-    # profile. The marked episode must be dropped from xs_mom_4w's own pooled
-    # series and episode count -- not merely zeroed -- while every other
-    # candidate's pooled count is untouched, and the shared-episode-count
-    # invariant (now checked on the *raw*, pre-exclusion count) does not fire even
-    # though the post-exclusion counts now differ across candidates.
+    # profile. Round 1 review: excluding the marked episode by simply dropping it
+    # silently erased its real net_return from the pooled total, an always-
+    # favourable bias, since a real re-entry episode right after it was still kept.
+    # After the fix, the marked episode still stops counting as an observation, but
+    # its net_return and turnover are rolled into the next retained episode in the
+    # same fold, so the pooled total equals the raw total exactly -- no money
+    # disappears -- and the roll-forward is itself visible in the new
+    # held_nothing_episode_count / net_return_rolled_forward fields.
     paths = []
     for fold_index in range(6):
         path = tmp_path / f"fold{fold_index}.json"
@@ -611,6 +617,7 @@ def test_member_held_nothing_episode_is_excluded_from_pooling(tmp_path: Path) ->
                 fold_index,
                 {"xs_mom_4w": ("0.01", "0.001")},
                 held_nothing_candidate="xs_mom_4w",
+                held_nothing_index=5,
             )
         else:
             write_fold(path, fold_index, {"xs_mom_4w": ("0.01", "0.001")})
@@ -625,10 +632,21 @@ def test_member_held_nothing_episode_is_excluded_from_pooling(tmp_path: Path) ->
     momentum = next(
         item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
     )
+    # One fewer counted observation than the raw episode count...
     assert momentum["episode_count"] == 6 * EPISODES_PER_FOLD - 1
-    assert momentum["base_total_net_return"] == str(
-        Decimal("0.01") * (6 * EPISODES_PER_FOLD - 1)
-    )
+    # ...but the marked episode's money is still fully present in both pooled
+    # totals -- equal to the *full* raw total, not short by the excluded episode.
+    assert momentum["base_total_net_return"] == str(Decimal("0.01") * 6 * EPISODES_PER_FOLD)
+    assert momentum["adverse_total_net_return"] == str(Decimal("0.001") * 6 * EPISODES_PER_FOLD)
+    assert momentum["base_held_nothing_episode_count"] == 1
+    assert momentum["adverse_held_nothing_episode_count"] == 1
+    assert momentum["base_held_nothing_net_return_rolled_forward"] == "0.01"
+    assert momentum["adverse_held_nothing_net_return_rolled_forward"] == "0.001"
+    # Turnover is rolled forward the same way: 240 raw episodes each charge "1" of
+    # turnover, so the true total is 240 even though only 239 remain as their own
+    # observation -- the reported mean turnover must reflect that real total, not
+    # merely divide the 239 individually-recorded values.
+    assert Decimal(momentum["base_mean_turnover"]) == Decimal(240) / Decimal(239)
     # The top-level pooled count reports the shared raw decision calendar, not any
     # one member's post-exclusion count.
     assert document["pooled_episode_count"] == 6 * EPISODES_PER_FOLD
@@ -715,8 +733,9 @@ def test_declared_deviations_are_reported(tmp_path: Path) -> None:
     output_path = build(tmp_path, {})
     document = json.loads(output_path.read_text(encoding="utf-8"))
     deviations = document["declared_deviations"]
-    assert len(deviations) >= 1
+    assert len(deviations) >= 2
     ids = {item["id"] for item in deviations}
     assert "RANKABLE_SUBSET_NOT_FULL_UNIVERSE" in ids
+    assert "MEMBER_HELD_NOTHING_EXCLUDED_FROM_POOLED_SERIES" in ids
     for item in deviations:
         assert item["description"]

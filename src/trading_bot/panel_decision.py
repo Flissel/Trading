@@ -41,6 +41,20 @@ _DECLARED_DEVIATIONS: tuple[dict[str, object], ...] = (
             "volatility window."
         ),
     },
+    {
+        "id": "MEMBER_HELD_NOTHING_EXCLUDED_FROM_POOLED_SERIES",
+        "description": (
+            "Spec section 7.1 authorises excluding a week from the pooled series and "
+            "the episode floor only at the universe level (UNIVERSE_TOO_SMALL), where "
+            "no episode and no cost ever exist. A week a single member holds nothing "
+            "is excluded from that member's own pooled series and episode count the "
+            "same way, even though the episode can carry a real unwind cost; that "
+            "cost is never dropped -- it is rolled into the member's next retained "
+            "episode in the same fold, or, if none follows, kept in the pooled total "
+            "directly (reported per member and scenario as the held-nothing episode "
+            "count and the net return rolled forward)."
+        ),
+    },
 )
 
 
@@ -79,6 +93,16 @@ class _Pooled:
     adverse_net_exposures: tuple[Decimal, ...]
     base_forced_close_count: int
     adverse_forced_close_count: int
+    # Visibility into the roll-forward of item 4's exclusion: how many
+    # episodes were marked MEMBER_HELD_NOTHING for this candidate and
+    # scenario, and the total net return those episodes carried -- money
+    # that never left the pooled total (it was rolled into the next retained
+    # episode in the same fold, or, lacking one, kept in the total directly)
+    # even though the episode itself no longer counts as an observation.
+    base_held_nothing_episode_count: int
+    adverse_held_nothing_episode_count: int
+    base_held_nothing_net_return_rolled_forward: Decimal
+    adverse_held_nothing_net_return_rolled_forward: Decimal
 
 
 def build_panel_decision(
@@ -304,6 +328,89 @@ def _held_nothing(episode: object) -> bool:
     return MEMBER_HELD_NOTHING_REASON_CODE in codes
 
 
+@dataclass(frozen=True, slots=True)
+class _ScenarioFoldResult:
+    fold_total: Decimal
+    held_nothing_count: int
+    held_nothing_net_return: Decimal
+    forced_close_count: int
+
+
+def _pool_scenario_fold(
+    episodes: list[object],
+    *,
+    values: list[Decimal],
+    turnovers: list[Decimal],
+    gross_exposures: list[Decimal],
+    net_exposures: list[Decimal],
+    contract_totals: dict[str, Decimal] | None,
+) -> _ScenarioFoldResult:
+    """Pool one fold's one-scenario episode list, appending each retained
+    episode's (possibly cost-adjusted) values to the accumulator lists.
+
+    A MEMBER_HELD_NOTHING episode is real accounting: if a position was
+    carried into it, `evaluate_episode` charges a genuine unwind (turnover,
+    a strictly negative net return). Dropping that episode outright would
+    silently erase that cost while the next retained episode still pays a
+    full re-entry turnover -- one side of a round trip discarded, the other
+    kept, always in the favourable direction. So its net_return and turnover
+    are carried forward and added onto the next retained episode in this
+    same fold instead of being dropped: the week still does not become its
+    own counted observation, but no money disappears. If a held-nothing
+    episode is this fold's last, with no retained episode after it to carry
+    the cost into, its net_return is still folded into `fold_total` (below);
+    it is reported (`held_nothing_net_return`) rather than silently lost, it
+    is just never attributed to any single retained observation.
+
+    `fold_total` is accumulated as a single left-to-right pass over every
+    episode's own net_return, independent of the roll-forward bookkeeping
+    used for `values` -- Decimal addition is not associative at its default
+    28-significant-digit precision, so building the total by summing the
+    (reordered, cost-adjusted) retained values instead can differ from a
+    plain in-order sum by one unit in the last place. Accumulating it
+    directly, in the episodes' own order, is what actually makes the pooled
+    total equal the raw total exactly, to the last digit, rather than
+    merely approximately.
+    """
+    fold_total = Decimal(0)
+    held_nothing_count = 0
+    held_nothing_net_return = Decimal(0)
+    forced_close_count = 0
+    pending_return = Decimal(0)
+    pending_turnover = Decimal(0)
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            raise PanelDecisionError("fold report episode is malformed")
+        net_return = Decimal(str(episode["net_return"]))
+        fold_total += net_return
+        if _held_nothing(episode):
+            held_nothing_count += 1
+            held_nothing_net_return += net_return
+            pending_return += net_return
+            pending_turnover += Decimal(str(episode["turnover"]))
+            continue
+        value = net_return + pending_return
+        turnover_value = Decimal(str(episode["turnover"])) + pending_turnover
+        pending_return = Decimal(0)
+        pending_turnover = Decimal(0)
+        values.append(value)
+        turnovers.append(turnover_value)
+        gross_exposures.append(Decimal(str(episode["gross_exposure"])))
+        net_exposures.append(Decimal(str(episode["net_exposure"])))
+        forced_close_count += int(episode["forced_close_count"])
+        if contract_totals is not None:
+            for contract_id, contribution in episode["contract_net_contributions"]:
+                contract_totals[str(contract_id)] = contract_totals.get(
+                    str(contract_id), Decimal(0)
+                ) + Decimal(str(contribution))
+    return _ScenarioFoldResult(
+        fold_total=fold_total,
+        held_nothing_count=held_nothing_count,
+        held_nothing_net_return=held_nothing_net_return,
+        forced_close_count=forced_close_count,
+    )
+
+
 def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     base: list[Decimal] = []
     adverse: list[Decimal] = []
@@ -317,6 +424,12 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     adverse_net_exposures: list[Decimal] = []
     base_forced_close_count = 0
     adverse_forced_close_count = 0
+    base_held_nothing_count = 0
+    adverse_held_nothing_count = 0
+    base_held_nothing_rolled = Decimal(0)
+    adverse_held_nothing_rolled = Decimal(0)
+    base_total = Decimal(0)
+    adverse_total = Decimal(0)
     raw_episode_count = 0
     for document in documents:
         candidates = document["candidates"]
@@ -328,36 +441,42 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         if record is None:
             raise PanelDecisionError(f"fold report is missing candidate {name}")
         base_episodes = record["base"]["episodes"]
+        adverse_episodes = record["adverse"]["episodes"]
+        if not isinstance(base_episodes, list) or not isinstance(adverse_episodes, list):
+            raise PanelDecisionError("fold report episodes are malformed")
         raw_episode_count += len(base_episodes)
-        fold_total = Decimal(0)
-        for episode in base_episodes:
-            if _held_nothing(episode):
-                continue
-            value = Decimal(str(episode["net_return"]))
-            base.append(value)
-            fold_total += value
-            base_turnovers.append(Decimal(str(episode["turnover"])))
-            base_gross_exposures.append(Decimal(str(episode["gross_exposure"])))
-            base_net_exposures.append(Decimal(str(episode["net_exposure"])))
-            base_forced_close_count += int(episode["forced_close_count"])
-            for contract_id, contribution in episode["contract_net_contributions"]:
-                contracts[str(contract_id)] = contracts.get(
-                    str(contract_id), Decimal(0)
-                ) + Decimal(str(contribution))
-        fold_totals.append(fold_total)
-        for episode in record["adverse"]["episodes"]:
-            if _held_nothing(episode):
-                continue
-            adverse.append(Decimal(str(episode["net_return"])))
-            adverse_turnovers.append(Decimal(str(episode["turnover"])))
-            adverse_gross_exposures.append(Decimal(str(episode["gross_exposure"])))
-            adverse_net_exposures.append(Decimal(str(episode["net_exposure"])))
-            adverse_forced_close_count += int(episode["forced_close_count"])
+
+        base_result = _pool_scenario_fold(
+            base_episodes,
+            values=base,
+            turnovers=base_turnovers,
+            gross_exposures=base_gross_exposures,
+            net_exposures=base_net_exposures,
+            contract_totals=contracts,
+        )
+        fold_totals.append(base_result.fold_total)
+        base_total += base_result.fold_total
+        base_held_nothing_count += base_result.held_nothing_count
+        base_held_nothing_rolled += base_result.held_nothing_net_return
+        base_forced_close_count += base_result.forced_close_count
+
+        adverse_result = _pool_scenario_fold(
+            adverse_episodes,
+            values=adverse,
+            turnovers=adverse_turnovers,
+            gross_exposures=adverse_gross_exposures,
+            net_exposures=adverse_net_exposures,
+            contract_totals=None,
+        )
+        adverse_total += adverse_result.fold_total
+        adverse_held_nothing_count += adverse_result.held_nothing_count
+        adverse_held_nothing_rolled += adverse_result.held_nothing_net_return
+        adverse_forced_close_count += adverse_result.forced_close_count
     return _Pooled(
         base_returns=tuple(base),
         adverse_returns=tuple(adverse),
-        base_total=sum(base, Decimal(0)),
-        adverse_total=sum(adverse, Decimal(0)),
+        base_total=base_total,
+        adverse_total=adverse_total,
         fold_base_totals=tuple(fold_totals),
         contract_totals=contracts,
         episode_count=len(base),
@@ -370,6 +489,10 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         adverse_net_exposures=tuple(adverse_net_exposures),
         base_forced_close_count=base_forced_close_count,
         adverse_forced_close_count=adverse_forced_close_count,
+        base_held_nothing_episode_count=base_held_nothing_count,
+        adverse_held_nothing_episode_count=adverse_held_nothing_count,
+        base_held_nothing_net_return_rolled_forward=base_held_nothing_rolled,
+        adverse_held_nothing_net_return_rolled_forward=adverse_held_nothing_rolled,
     )
 
 
@@ -494,6 +617,10 @@ def _member_record(
         "base_mean_gross_exposure": _mean(pooled.base_gross_exposures),
         "base_mean_net_exposure": _mean(pooled.base_net_exposures),
         "base_forced_close_count": pooled.base_forced_close_count,
+        "base_held_nothing_episode_count": pooled.base_held_nothing_episode_count,
+        "base_held_nothing_net_return_rolled_forward": (
+            pooled.base_held_nothing_net_return_rolled_forward
+        ),
         "adverse_total_net_return": pooled.adverse_total,
         "adverse_mean_net_return": adverse_mean,
         "adverse_median_net_return": _median(pooled.adverse_returns),
@@ -503,6 +630,10 @@ def _member_record(
         "adverse_mean_gross_exposure": _mean(pooled.adverse_gross_exposures),
         "adverse_mean_net_exposure": _mean(pooled.adverse_net_exposures),
         "adverse_forced_close_count": pooled.adverse_forced_close_count,
+        "adverse_held_nothing_episode_count": pooled.adverse_held_nothing_episode_count,
+        "adverse_held_nothing_net_return_rolled_forward": (
+            pooled.adverse_held_nothing_net_return_rolled_forward
+        ),
         "universe_too_small_week_count": universe_too_small_week_count,
         "positive_base_fold_count": positive_folds,
         "required_positive_fold_count": required,
