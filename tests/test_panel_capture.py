@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import urllib.error
@@ -213,6 +214,84 @@ def test_panel_zip_client_does_not_retry_a_403(monkeypatch: pytest.MonkeyPatch) 
         client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
     assert not isinstance(excinfo.value, PanelSourceAbsent)
     assert sleeps == []
+
+
+def test_panel_zip_client_retries_a_connection_reset_during_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"count": 0}
+
+    class _FlakyReadResponse(_FakeUrlopenResponse):
+        def read(self, limit: int) -> bytes:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise ConnectionResetError("reset by peer")
+            return super().read(limit)
+
+    def urlopen_stub(request: urllib.request.Request, timeout: float) -> _FlakyReadResponse:
+        return _FlakyReadResponse(b"payload-bytes", request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen_stub)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    payload = client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert payload.raw_bytes == b"payload-bytes"
+    assert sleeps == [1]
+
+
+def test_panel_zip_client_retries_an_incomplete_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"count": 0}
+
+    class _FlakyReadResponse(_FakeUrlopenResponse):
+        def read(self, limit: int) -> bytes:
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise http.client.IncompleteRead(b"partial")
+            return super().read(limit)
+
+    def urlopen_stub(request: urllib.request.Request, timeout: float) -> _FlakyReadResponse:
+        return _FlakyReadResponse(b"payload-bytes", request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen_stub)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    payload = client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert payload.raw_bytes == b"payload-bytes"
+    assert sleeps == [1]
+
+
+def test_panel_zip_client_wraps_an_unexpected_error_without_retrying(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def urlopen_stub(request: urllib.request.Request, timeout: float) -> None:
+        raise ValueError("totally unexpected")
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen_stub)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    with pytest.raises(PanelCaptureError) as excinfo:
+        client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert not isinstance(excinfo.value, PanelSourceAbsent)
+    assert sleeps == []
+
+
+def test_panel_zip_client_retries_a_429(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = {"count": 0}
+
+    def flaky_urlopen(request: urllib.request.Request, timeout: float) -> _FakeUrlopenResponse:
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise urllib.error.HTTPError(
+                request.full_url, 429, "Too Many Requests", Message(), None
+            )
+        return _FakeUrlopenResponse(b"payload-bytes", request.full_url)
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky_urlopen)
+    sleeps: list[float] = []
+    client = PanelZipClient(sleep=sleeps.append)
+    payload = client.fetch(build_kline_zip_url("BTCUSDT", "2024-01"))
+    assert payload.raw_bytes == b"payload-bytes"
+    assert sleeps == [1]
 
 
 def test_capture_survives_and_records_a_delisted_symbols_absent_month(

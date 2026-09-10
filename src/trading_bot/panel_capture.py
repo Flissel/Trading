@@ -2,6 +2,7 @@
 
 import csv
 import hashlib
+import http.client
 import io
 import json
 import re
@@ -90,13 +91,31 @@ class PanelZipClient:
             except urllib.error.HTTPError as error:
                 if error.code == 404:
                     raise PanelSourceAbsent(f"panel dump is absent: {error}") from error
-                if error.code < 500:
-                    # Any other 4xx (403, 400, ...) is a real problem, not a
-                    # transient one -- surface it immediately, unretried.
+                if error.code == 429 or error.code >= 500:
+                    # A throttle (429) or a server-side failure (5xx) is
+                    # transient -- back off and retry. Any other 4xx (403,
+                    # 400, ...) is a real problem, not a transient one --
+                    # surface it immediately, unretried.
+                    last_error = error
+                else:
                     raise PanelCaptureError(f"panel dump request failed: {error}") from error
+            except (
+                urllib.error.URLError,
+                TimeoutError,
+                ConnectionResetError,
+                http.client.IncompleteRead,
+            ) as error:
+                # Covers both the request itself and draining the response
+                # body -- a reset or a short read mid-transfer is exactly as
+                # transient as a failure to connect in the first place.
                 last_error = error
-            except (urllib.error.URLError, TimeoutError) as error:
-                last_error = error
+            except PanelCaptureError:
+                raise
+            except Exception as error:
+                # Anything else unexpected must not escape raw and unwrapped;
+                # it is not a failure mode this client recognizes as
+                # transient, so it is not retried.
+                raise PanelCaptureError(f"panel dump request failed: {error}") from error
             else:
                 if len(raw) > _MAX_ZIP_BYTES:
                     raise PanelCaptureError("panel dump exceeds the byte limit")
