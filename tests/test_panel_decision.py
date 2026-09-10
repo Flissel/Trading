@@ -6,10 +6,11 @@ from pathlib import Path
 import pytest
 
 from trading_bot.canonical import canonical_json, content_sha256
-from trading_bot.evaluation import _maximum_drawdown
+from trading_bot.evaluation import _maximum_drawdown, evaluate_signals
 from trading_bot.panel_config import load_panel_family_spec
-from trading_bot.panel_decision import PanelDecisionError, build_panel_decision
+from trading_bot.panel_decision import PanelDecisionError, _win_rate, build_panel_decision
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
+from trading_bot.strategy import CostScenario
 
 SPEC_PATH = Path("configs/xs-momentum-panel-v1.json")
 SPEC, SPEC_HASH = load_panel_family_spec(SPEC_PATH)
@@ -764,3 +765,35 @@ def test_code_hash_mismatch_across_fold_reports_is_rejected(tmp_path: Path) -> N
             output_path=tmp_path / "decision.json",
             registry_path=tmp_path / "registry.sqlite3",
         )
+
+
+def test_win_rate_matches_evaluate_signals_across_series() -> None:
+    """Pins agreement between panel_decision._win_rate and evaluation.py's own
+    inline win-rate computation inside evaluate_signals (there was nothing
+    importable, since evaluate_signals computes it inline), including the tie
+    convention -- a value of exactly zero is never a win in either -- so the
+    bar-cadence and panel research lines cannot silently drift apart on what
+    "win rate" means. A zero-cost, always-active scenario makes
+    evaluate_signals's net_returns equal the input series exactly."""
+    scenario = CostScenario(
+        name="zero_cost",
+        fee_bps_per_side=Decimal(0),
+        spread_multiplier=Decimal(0),
+        slippage_bps_per_side=Decimal(0),
+        funding_bps=Decimal(0),
+    )
+    series_cases: list[tuple[Decimal, ...]] = [
+        (),
+        (Decimal("0.01"),),
+        (Decimal("-0.01"), Decimal("0.02"), Decimal("0.03")),
+        (Decimal("0"), Decimal("0"), Decimal("0.01")),
+        (Decimal("-1"), Decimal("-2"), Decimal("3"), Decimal("4"), Decimal("-5")),
+    ]
+    for series in series_cases:
+        evaluation = evaluate_signals(
+            tuple(1 for _ in series),
+            series,
+            tuple(Decimal(0) for _ in series),
+            scenario,
+        )
+        assert _win_rate(series) == evaluation.win_rate
