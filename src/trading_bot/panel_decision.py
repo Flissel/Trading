@@ -83,7 +83,11 @@ class _Pooled:
     # the same for every candidate in one decision (it reflects how many
     # decisions were not skipped for UNIVERSE_TOO_SMALL, independent of any
     # one member's own holding pattern) and used only for the cross-candidate
-    # linkage check and the top-level `pooled_episode_count` report field.
+    # linkage check and the top-level `pooled_raw_episode_count` report field.
+    # A member's own post-exclusion count is `episode_count` above; the two
+    # are named apart deliberately so a reader cannot confuse the shared
+    # decision calendar with the (per-member, generally smaller) count the
+    # episode floor is actually checked against.
     raw_episode_count: int
     base_turnovers: tuple[Decimal, ...]
     adverse_turnovers: tuple[Decimal, ...]
@@ -161,6 +165,15 @@ def build_panel_decision(
         raise PanelDecisionError("fold reports do not share one family and manifest")
     if next(iter(linkage))[0] != family_spec_hash:
         raise PanelDecisionError("fold reports were produced under a different declaration")
+    # A family half-run under an older panel_fold_run.py (before MEMBER_HELD_NOTHING
+    # marking existed, say) and half under a newer one would apply the pooled
+    # exclusion to some folds only, silently, with none of the checks above ever
+    # firing -- code_hash covers exactly that class of drift.
+    code_hashes = {str(document["code_hash"]) for document in documents}
+    if len(code_hashes) != 1:
+        raise PanelDecisionError(
+            "fold reports were built by different code versions (code_hash mismatch)"
+        )
     documents.sort(key=lambda item: _int_field(item, "fold_index"))
 
     member_names = tuple(item.name for item in spec.members)
@@ -265,7 +278,7 @@ def build_panel_decision(
         "dataset_root_hash": str(documents[0]["dataset_root_hash"]),
         "split_manifest_hash": str(documents[0]["split_manifest_hash"]),
         "fold_count": fold_count,
-        "pooled_episode_count": pooled_raw_episode_count,
+        "pooled_raw_episode_count": pooled_raw_episode_count,
         "source_report_hashes": [str(document["report_hash"]) for document in documents],
         "skipped_sample_ids": skipped_sample_ids,
         "block_length": spec.statistics.block_length,

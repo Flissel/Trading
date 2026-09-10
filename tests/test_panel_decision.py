@@ -462,7 +462,7 @@ def test_member_clearing_every_gate_is_eligible(tmp_path: Path) -> None:
 def test_pooled_counts_and_hashes_are_recorded(tmp_path: Path) -> None:
     output_path = build(tmp_path, {})
     document = json.loads(output_path.read_text(encoding="utf-8"))
-    assert document["pooled_episode_count"] == 6 * EPISODES_PER_FOLD
+    assert document["pooled_raw_episode_count"] == 6 * EPISODES_PER_FOLD
     assert document["fold_count"] == 6
     assert len(document["source_report_hashes"]) == 6
     assert document["family_spec_hash"] == SPEC_HASH
@@ -649,7 +649,7 @@ def test_member_held_nothing_episode_is_excluded_but_its_cost_is_rolled_forward(
     assert Decimal(momentum["base_mean_turnover"]) == Decimal(240) / Decimal(239)
     # The top-level pooled count reports the shared raw decision calendar, not any
     # one member's post-exclusion count.
-    assert document["pooled_episode_count"] == 6 * EPISODES_PER_FOLD
+    assert document["pooled_raw_episode_count"] == 6 * EPISODES_PER_FOLD
     # An untouched candidate's own pooled count is unaffected.
     control = next(item for item in document["controls"] if item["candidate_name"] == "no_trade")
     assert control["episode_count"] == 6 * EPISODES_PER_FOLD
@@ -739,3 +739,28 @@ def test_declared_deviations_are_reported(tmp_path: Path) -> None:
     assert "MEMBER_HELD_NOTHING_EXCLUDED_FROM_POOLED_SERIES" in ids
     for item in deviations:
         assert item["description"]
+
+
+def test_code_hash_mismatch_across_fold_reports_is_rejected(tmp_path: Path) -> None:
+    # A family half-run under one version of panel_fold_run.py and half under
+    # another (e.g. before vs. after MEMBER_HELD_NOTHING marking existed) would
+    # apply the pooled exclusion to some folds only, silently, with no other
+    # check catching it -- the code_hash linkage check must refuse it outright.
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        write_fold(path, fold_index, {})
+        paths.append(path)
+    document = json.loads(paths[3].read_text(encoding="utf-8"))
+    document["code_hash"] = "9" * 64
+    material = {key: value for key, value in document.items() if key != "report_hash"}
+    document["report_hash"] = content_sha256(material)
+    paths[3].write_bytes(canonical_json(document))
+
+    with pytest.raises(PanelDecisionError, match="code_hash mismatch"):
+        build_panel_decision(
+            tuple(paths),
+            family_spec_path=SPEC_PATH,
+            output_path=tmp_path / "decision.json",
+            registry_path=tmp_path / "registry.sqlite3",
+        )
