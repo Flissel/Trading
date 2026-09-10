@@ -36,6 +36,19 @@ class PanelFoldError(RuntimeError):
     """Raised when a panel fold cannot be evaluated or published."""
 
 
+# Marks an episode where a member's own weight construction returned no
+# weights (e.g. a cross-sectional member cannot form both quintiles, or a
+# time-series member has no contract with both a trailing return and a full
+# volatility window) even though the week's universe was not too small.
+# Spec section 7.1 already excludes UNIVERSE_TOO_SMALL weeks from the pooled
+# series and the episode floor because they hold no position; this is the
+# same situation one level down, at a single member rather than the whole
+# universe, and `panel_decision.py` excludes episodes carrying this code the
+# same way. Controls are never marked: `no_trade`'s permanent empty weights
+# are a deliberate baseline, not a data-insufficiency artifact.
+MEMBER_HELD_NOTHING_REASON_CODE = "MEMBER_HELD_NOTHING"
+
+
 @dataclass(frozen=True, slots=True)
 class PanelFoldArtifact:
     output_path: Path
@@ -90,11 +103,13 @@ def run_panel_fold(
 
     test_ids = [str(value) for value in fold["test_ids"]]
     decisions = sorted(int(value.split(":")[1]) for value in test_ids)
+    member_names = {member.name for member in spec.members}
     names = [member.name for member in spec.members] + [item.name for item in spec.controls]
     scenarios: tuple[PanelCostTable, ...] = (spec.costs.base, spec.costs.adverse)
     episodes: dict[tuple[str, str], list[EpisodeResult]] = {
         (name, scenario.name): [] for name in names for scenario in scenarios
     }
+    held_nothing: dict[str, list[bool]] = {name: [] for name in names}
     carried: dict[tuple[str, str], tuple[tuple[str, Decimal], ...]] = {
         key: () for key in episodes
     }
@@ -113,6 +128,13 @@ def run_panel_fold(
         tiers = {item.contract_id: item.tier for item in snapshot.contracts}
         vectors = build_weight_vectors(histories, snapshot, spec=spec)
         for name in names:
+            # Only a member's own construction can legitimately produce no
+            # weights while the universe itself was not too small (too few
+            # rankable contracts to form both quintiles, or none with a full
+            # volatility window); the controls always have well-defined
+            # weights here (no_trade is always empty by design and is never
+            # marked).
+            held_nothing[name].append(name in member_names and not vectors[name].weights)
             for scenario in scenarios:
                 key = (name, scenario.name)
                 result = evaluate_episode(
@@ -146,14 +168,13 @@ def run_panel_fold(
         # omission visible.
         reason_codes.append("FOLD_FINAL_EXIT_COST_UNCHARGED")
 
-    member_names = {member.name for member in spec.members}
     candidates = [
         {
             "candidate_name": name,
             "role": "member" if name in member_names else "control",
             "episode_count": len(episodes[(name, "base")]),
-            "base": _scenario_record(episodes[(name, "base")]),
-            "adverse": _scenario_record(episodes[(name, "adverse")]),
+            "base": _scenario_record(episodes[(name, "base")], held_nothing[name]),
+            "adverse": _scenario_record(episodes[(name, "adverse")], held_nothing[name]),
         }
         for name in names
     ]
@@ -211,7 +232,7 @@ def verify_panel_fold_report(path: Path) -> bool:
         return False
 
 
-def _scenario_record(results: list[EpisodeResult]) -> dict[str, object]:
+def _scenario_record(results: list[EpisodeResult], held_nothing: list[bool]) -> dict[str, object]:
     return {
         "total_net_return": sum((item.net_return for item in results), Decimal(0)),
         "episodes": [
@@ -226,11 +247,12 @@ def _scenario_record(results: list[EpisodeResult]) -> dict[str, object]:
                 "gross_exposure": item.gross_exposure,
                 "net_exposure": item.net_exposure,
                 "forced_close_count": item.forced_close_count,
+                "reason_codes": [MEMBER_HELD_NOTHING_REASON_CODE] if flag else [],
                 "contract_net_contributions": [
                     [contract_id, value] for contract_id, value in item.contract_net_contributions
                 ],
             }
-            for item in results
+            for item, flag in zip(results, held_nothing, strict=True)
         ],
     }
 

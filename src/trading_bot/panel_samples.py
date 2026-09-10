@@ -18,6 +18,15 @@ from trading_bot.splits import (
 DAY_NS = 86_400_000_000_000
 _SUNDAY_REMAINDER = 3  # the Unix epoch began on a Thursday
 
+# Operational data-quality threshold, not part of the frozen family
+# declaration (`configs/xs-momentum-panel-v1.json`): that file is a
+# pre-registration whose hash travels in every report, and a capture-quality
+# gate is not a statement about the experiment family. Spec section 12 step 3.
+_MAX_MISSING_DAYS_PER_INSTRUMENT = 3
+# Cap on how many offending instruments are named in the failure message --
+# enough to be actionable, not so many the message becomes unreadable.
+_MAX_QUALITY_FAILURE_NAMES = 20
+
 
 class PanelSamplesError(RuntimeError):
     """Raised when the panel rebalance calendar cannot be published."""
@@ -95,6 +104,7 @@ def publish_panel_walk_forward(
     dataset_manifest = _load_object(capture_root / "dataset" / "dataset-manifest.json")
     capture_hash = str(capture_manifest["capture_root_hash"])
     dataset_hash = str(dataset_manifest["root_hash"])
+    _enforce_capture_quality(capture_root / "dataset" / "quality-report.json")
 
     bars = load_panel_bars(capture_root / "dataset")
     samples = build_rebalance_samples(bars, holding_days=spec.holding_days)
@@ -128,6 +138,7 @@ def publish_panel_walk_forward(
         "folds": [_fold_record(fold) for fold in views.folds],
         "final_holdout_ids": list(views.final_holdout_ids),
         "pooled_test_sample_count": pooled,
+        "capture_quality_max_missing_days_per_instrument": _MAX_MISSING_DAYS_PER_INSTRUMENT,
     }
     manifest_hash = content_sha256(material)
     document = dict(material)
@@ -154,6 +165,44 @@ def verify_panel_manifest(path: Path) -> bool:
         return content_sha256(material) == recorded
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return False
+
+
+def _enforce_capture_quality(quality_report_path: Path) -> None:
+    """Stop the family before a manifest is built on a defective capture.
+
+    Spec section 12 step 3: the family stops if any contract's daily series
+    has more than `_MAX_MISSING_DAYS_PER_INSTRUMENT` missing days inside its
+    listed span. `panel_dataset.py` already computes `missing_days` per
+    instrument span-relative (a delisting does not count, only an interior
+    gap does); this is the first and only reader of that field.
+    """
+    quality = _load_object(quality_report_path)
+    instruments = quality.get("instruments")
+    if not isinstance(instruments, list):
+        raise PanelSamplesError("quality-report.json is malformed")
+    offenders: list[tuple[str, int]] = []
+    for item in instruments:
+        if not isinstance(item, dict):
+            raise PanelSamplesError("quality-report.json is malformed")
+        missing_days = item.get("missing_days")
+        instrument_id = item.get("instrument_id")
+        if not isinstance(missing_days, int) or not isinstance(instrument_id, str):
+            raise PanelSamplesError("quality-report.json is malformed")
+        if missing_days > _MAX_MISSING_DAYS_PER_INSTRUMENT:
+            offenders.append((instrument_id, missing_days))
+    if not offenders:
+        return
+    offenders.sort(key=lambda pair: (-pair[1], pair[0]))
+    shown = offenders[:_MAX_QUALITY_FAILURE_NAMES]
+    detail = ", ".join(f"{name} ({count} missing days)" for name, count in shown)
+    omitted = len(offenders) - len(shown)
+    if omitted:
+        detail += f", and {omitted} more"
+    raise PanelSamplesError(
+        "CAPTURE_QUALITY_FAILED: "
+        f"{len(offenders)} instrument(s) exceed {_MAX_MISSING_DAYS_PER_INSTRUMENT} missing "
+        f"days inside their listed span: {detail}"
+    )
 
 
 def _fold_record(fold: WalkForwardFold) -> dict[str, object]:

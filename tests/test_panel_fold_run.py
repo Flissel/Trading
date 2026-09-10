@@ -1,7 +1,7 @@
 import io
 import json
 import zipfile
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
@@ -10,12 +10,23 @@ import pytest
 from trading_bot import panel_fold_run as panel_fold_run_module
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_capture import PanelPayload, capture_panel
-from trading_bot.panel_config import load_panel_family_spec
-from trading_bot.panel_fold_run import PanelFoldError, run_panel_fold, verify_panel_fold_report
+from trading_bot.panel_config import PanelFamilySpec, load_panel_family_spec
+from trading_bot.panel_decision import _POOLING_CONTEXT, _pool
+from trading_bot.panel_fold_run import (
+    MEMBER_HELD_NOTHING_REASON_CODE,
+    PanelFoldError,
+    run_panel_fold,
+    verify_panel_fold_report,
+)
 from trading_bot.panel_reader import load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
-from trading_bot.panel_signals import build_weight_vectors
-from trading_bot.panel_universe import build_contract_histories, select_universe
+from trading_bot.panel_signals import WeightVector, build_weight_vectors
+from trading_bot.panel_universe import (
+    ContractHistory,
+    UniverseSnapshot,
+    build_contract_histories,
+    select_universe,
+)
 from trading_bot.registry import MetadataRegistry
 
 DAY_MS = 86_400_000
@@ -151,6 +162,39 @@ def small_config(tmp_path: Path) -> Path:
     }
     document["statistics"].update({"block_length": 2, "pooled_episode_floor": 4})
     path = tmp_path / "small-panel.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def small_config_with_seven_decisions(tmp_path: Path) -> Path:
+    """Like `small_config`, but with a wider test window (53 days, empirically
+    confirmed against this fixture) that holds exactly 7 weekly Sundays in one
+    fold, instead of 3 -- long enough to force MEMBER_HELD_NOTHING at a fold's
+    genuinely *last* decision while still carrying several real decisions
+    before it."""
+    document = json.loads(Path("configs/xs-momentum-panel-v1.json").read_text(encoding="utf-8"))
+    document["universe"].update(
+        {
+            "minimum_history_days": 20,
+            "liquidity_window_days": 5,
+            "maximum_contracts": 10,
+            "minimum_contracts": 10,
+            "tier_one_rank_limit": 4,
+        }
+    )
+    document["weights"]["minimum_quintile_size"] = 2
+    document["weights"]["volatility_window_days"] = 10
+    day_ns = 86_400_000_000_000
+    document["folds"] = {
+        "train_duration_ns": 60 * day_ns,
+        "validation_duration_ns": 14 * day_ns,
+        "test_duration_ns": 53 * day_ns,
+        "step_ns": 53 * day_ns,
+        "embargo_ns": 14 * day_ns,
+        "holdout_duration_ns": 53 * day_ns,
+    }
+    document["statistics"].update({"block_length": 2, "pooled_episode_floor": 4})
+    path = tmp_path / "small-panel-seven.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 
@@ -514,3 +558,235 @@ def test_fold_wide_bars_are_bounded_exactly_at_the_test_end_boundary(
         fold_index=0,
     )
     assert captured_boundaries == [test_end_ns + 1]
+
+
+def test_member_held_nothing_is_marked_and_controls_are_never_marked(
+    workspace: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A member's own construction can legitimately return no weights (too few
+    rankable contracts to form both cross-sectional quintiles, or none with a full
+    volatility window) even though the week's universe was not too small. Such an
+    episode must be visibly marked MEMBER_HELD_NOTHING, not recorded as an ordinary,
+    unremarkable zero-return episode -- and a control whose weights are also empty
+    by design (`no_trade`, always) must never be marked, since its emptiness is a
+    deliberate baseline, not a data-insufficiency artifact.
+
+    Round 1 review: forcing the emptiness at the fold's *first* decision (as this
+    test originally did) is the one index where the bug this guards against is
+    invisible -- the carried position is empty there regardless, so the forced
+    episode's net_return and turnover are exactly zero and dropping it loses
+    nothing. Decision 2 of this fold's 3 carries a real position in from decision
+    1, so forcing it there charges a genuine unwind: a strictly negative net
+    return and non-zero turnover. That is the case that actually exercises
+    `panel_decision.py`'s cost-conservation fix (see
+    test_panel_decision.test_member_held_nothing_episode_is_excluded_but_its_cost_is_rolled_forward
+    for the pooling side); this test pins that no money vanishes from the pooled
+    total the real fold runner produces."""
+    root, capture_root, config_path = workspace
+    original_build_weight_vectors = build_weight_vectors
+    calls = {"count": 0}
+
+    def flaky_vectors(
+        histories: dict[str, ContractHistory],
+        snapshot: UniverseSnapshot,
+        *,
+        spec: PanelFamilySpec,
+    ) -> dict[str, WeightVector]:
+        vectors = original_build_weight_vectors(histories, snapshot, spec=spec)
+        calls["count"] += 1
+        if calls["count"] == 2:
+            # Force xs_mom_1w to have produced no weights on the fold's *second*
+            # decision -- a position is already carried into it from the first,
+            # so the enforced emptiness charges a real unwind, not a free zero --
+            # without touching the universe snapshot itself, which stays
+            # non-empty.
+            existing = vectors["xs_mom_1w"]
+            forced = dict(vectors)
+            forced["xs_mom_1w"] = WeightVector(
+                existing.decision_close_ns, existing.member, (), existing.reason_codes
+            )
+            return forced
+        return vectors
+
+    monkeypatch.setattr(panel_fold_run_module, "build_weight_vectors", flaky_vectors)
+
+    artifact = run_panel_fold(
+        capture_root,
+        manifest_path=root / "manifest.json",
+        family_spec_path=config_path,
+        output_path=root / "fold0.json",
+        registry_path=root / "registry.sqlite3",
+        fold_index=0,
+    )
+    document: dict[str, object] = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    candidates = document["candidates"]
+    assert isinstance(candidates, list)
+    momentum = next(
+        item for item in candidates if item["candidate_name"] == "xs_mom_1w"
+    )
+    # Sanity on the fixture: exactly 3 decisions in this fold, so index 1 (the
+    # second) is the one forced above, and it is neither the first nor the last.
+    assert calls["count"] == 3
+    assert len(momentum["base"]["episodes"]) == 3
+
+    for scenario in ("base", "adverse"):
+        episodes = momentum[scenario]["episodes"]
+        reason_codes = [episode["reason_codes"] for episode in episodes]
+        assert reason_codes == [[], [MEMBER_HELD_NOTHING_REASON_CODE], []]
+        # The forced episode carries a real position into an empty target: a
+        # genuine unwind, not the free zero a first-decision force would produce.
+        assert Decimal(episodes[1]["net_return"]) < 0
+        assert Decimal(episodes[1]["turnover"]) > 0
+
+    no_trade = next(item for item in candidates if item["candidate_name"] == "no_trade")
+    assert all(episode["reason_codes"] == [] for episode in no_trade["base"]["episodes"])
+    assert all(episode["reason_codes"] == [] for episode in no_trade["adverse"]["episodes"])
+
+    # The reviewer's exact reproduction: reproduce the raw (ground-truth) pooled
+    # total by summing every episode including the held-nothing one, and confirm
+    # panel_decision's pooling -- which now excludes that episode from the
+    # observation series but rolls its net_return into the next retained episode
+    # -- lands on that same raw total, to the last digit, in both scenarios.
+    # `_pool` sums under elevated precision (`_POOLING_CONTEXT`) so its own
+    # accumulation never needs to round; the reference sum below uses that same
+    # precision so both sides are the true mathematical total, not one exact and
+    # one arbitrarily rounded at the ambient 28 digits.
+    pooled = _pool([document], "xs_mom_1w")
+    with localcontext(_POOLING_CONTEXT):
+        raw_base_total = sum(
+            (Decimal(episode["net_return"]) for episode in momentum["base"]["episodes"]),
+            Decimal(0),
+        )
+        raw_adverse_total = sum(
+            (Decimal(episode["net_return"]) for episode in momentum["adverse"]["episodes"]),
+            Decimal(0),
+        )
+    assert pooled.base_total == raw_base_total
+    assert pooled.adverse_total == raw_adverse_total
+    assert pooled.episode_count == len(momentum["base"]["episodes"]) - 1
+
+
+def test_member_held_nothing_last_in_fold_is_rolled_backward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 2 review: a held-nothing episode that is a fold's *last* kept its
+    cost in `fold_total` (so the pooled total still conserved) but never
+    entered `base_returns`/`turnovers` -- the exact series the bootstrap, both
+    Sharpes, the drawdown, the median, the win rate, the mean turnover and the
+    largest-episode share all read, reproducing the same favourable bias one
+    level down, and leaving the reported mean and the bootstrap's own mean
+    computed off two different numbers. It must now roll *backward* onto the
+    fold's own last retained episode instead, on a 7-decision fold (small_
+    config's usual 3 decisions never let a held-nothing week be genuinely
+    "last" with several real decisions still behind it)."""
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=SYMBOLS,
+        months=MONTHS,
+        fetch=fetch,
+    )
+    config_path = small_config_with_seven_decisions(tmp_path)
+    spec, spec_hash = load_panel_family_spec(config_path)
+    publish_panel_walk_forward(
+        tmp_path / "capture",
+        output_path=tmp_path / "manifest.json",
+        spec=spec,
+        family_spec_hash=spec_hash,
+    )
+
+    original_build_weight_vectors = build_weight_vectors
+    calls = {"count": 0}
+
+    def flaky_vectors(
+        histories: dict[str, ContractHistory],
+        snapshot: UniverseSnapshot,
+        *,
+        spec: PanelFamilySpec,
+    ) -> dict[str, WeightVector]:
+        vectors = original_build_weight_vectors(histories, snapshot, spec=spec)
+        calls["count"] += 1
+        if calls["count"] == 7:
+            # Force the fold's *seventh and last* decision -- a position is
+            # carried into it from the sixth, so this is a genuine unwind, and
+            # there is no decision after it within the fold to roll forward
+            # into.
+            existing = vectors["xs_mom_1w"]
+            forced = dict(vectors)
+            forced["xs_mom_1w"] = WeightVector(
+                existing.decision_close_ns, existing.member, (), existing.reason_codes
+            )
+            return forced
+        return vectors
+
+    monkeypatch.setattr(panel_fold_run_module, "build_weight_vectors", flaky_vectors)
+
+    artifact = run_panel_fold(
+        tmp_path / "capture",
+        manifest_path=tmp_path / "manifest.json",
+        family_spec_path=config_path,
+        output_path=tmp_path / "fold0.json",
+        registry_path=tmp_path / "registry.sqlite3",
+        fold_index=0,
+    )
+    document: dict[str, object] = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    candidates = document["candidates"]
+    assert isinstance(candidates, list)
+    momentum = next(item for item in candidates if item["candidate_name"] == "xs_mom_1w")
+    assert calls["count"] == 7
+    assert len(momentum["base"]["episodes"]) == 7
+
+    for scenario in ("base", "adverse"):
+        episodes = momentum[scenario]["episodes"]
+        reason_codes = [episode["reason_codes"] for episode in episodes]
+        assert reason_codes == [[], [], [], [], [], [], [MEMBER_HELD_NOTHING_REASON_CODE]]
+        assert Decimal(episodes[6]["net_return"]) < 0
+        assert Decimal(episodes[6]["turnover"]) > 0
+
+    # As above: `_pool` sums under elevated precision so its own accumulation
+    # never needs to round; every reference sum below (including the test's own
+    # re-summation of the already-pooled series) uses that same precision, so
+    # every side of every comparison is the true mathematical total.
+    pooled = _pool([document], "xs_mom_1w")
+    with localcontext(_POOLING_CONTEXT):
+        raw_base_total = sum(
+            (Decimal(episode["net_return"]) for episode in momentum["base"]["episodes"]),
+            Decimal(0),
+        )
+        raw_adverse_total = sum(
+            (Decimal(episode["net_return"]) for episode in momentum["adverse"]["episodes"]),
+            Decimal(0),
+        )
+        raw_base_turnover_total = sum(
+            (Decimal(episode["turnover"]) for episode in momentum["base"]["episodes"]),
+            Decimal(0),
+        )
+        base_returns_sum = sum(pooled.base_returns, Decimal(0))
+        adverse_returns_sum = sum(pooled.adverse_returns, Decimal(0))
+        base_turnovers_sum = sum(pooled.base_turnovers, Decimal(0))
+        contract_totals_sum = sum(pooled.contract_totals.values(), Decimal(0))
+    # Division is expected to round (most quotients are not exact in Decimal),
+    # so -- like `_member_record` itself -- these means are computed outside
+    # the Inexact-trapped pooling context; only the summations above are
+    # expected to be exact.
+    base_mean_from_total = pooled.base_total / Decimal(pooled.episode_count)
+    base_mean_from_series = base_returns_sum / Decimal(len(pooled.base_returns))
+
+    # R1: the fold's last episode (held-nothing, a genuine unwind) is no longer
+    # missing from the per-episode series -- it was rolled backward onto the
+    # fold's own last retained episode, so the series sums to the raw total
+    # exactly, not just the fold total.
+    assert base_returns_sum == raw_base_total
+    assert pooled.base_total == raw_base_total
+    assert adverse_returns_sum == raw_adverse_total
+    assert pooled.adverse_total == raw_adverse_total
+    assert pooled.episode_count == 6
+    assert base_turnovers_sum == raw_base_turnover_total
+    # The reported mean and the mean of the series the bootstrap actually runs
+    # on must now be the same number, not two that merely used to look similar.
+    assert base_mean_from_total == base_mean_from_series
+    # R2: contract_net_contributions are no longer skipped for the held-nothing
+    # episode, so the per-contract breakdown sums to the same pooled total.
+    assert contract_totals_sum == pooled.base_total
+

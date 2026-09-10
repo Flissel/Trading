@@ -1,7 +1,10 @@
 # tests/test_panel_accounting.py
-from decimal import Decimal
+from decimal import Context, Decimal, Inexact
 
-from trading_bot.panel_accounting import evaluate_episode
+import pytest
+
+import trading_bot.panel_accounting as panel_accounting_module
+from trading_bot.panel_accounting import PanelAccountingError, evaluate_episode
 from trading_bot.panel_config import PanelCostTable
 from trading_bot.panel_reader import FundingEvent
 from trading_bot.panel_universe import ContractHistory
@@ -87,6 +90,33 @@ def test_base_episode_arithmetic() -> None:
     assert net_attribution["A:0"] == Decimal("0.049")
     assert net_attribution["B:0"] == Decimal("0.0245")
     assert sum(net_attribution.values(), Decimal(0)) == result.net_return
+
+
+def test_net_return_precision_headroom_is_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "never itself needs to round" guarantee behind net_return matching
+    its own contract breakdown is only real if exceeding it is loud.
+    Shrinking _NET_RETURN_CONTEXT to one significant digit of precision
+    (Inexact still trapped) turns this ordinary two-contract episode's own
+    summation into a real rounding event, and that must now raise
+    PanelAccountingError instead of silently returning a net_return that no
+    longer matches its own contract_net_contributions."""
+    insufficient = Context(prec=1)
+    insufficient.traps[Inexact] = True
+    monkeypatch.setattr(panel_accounting_module, "_NET_RETURN_CONTEXT", insufficient)
+
+    with pytest.raises(PanelAccountingError, match="precision headroom"):
+        evaluate_episode(
+            sample_id="BINANCE_UM:1:w1",
+            member="xs_mom_1w",
+            decision_close_ns=DECISION,
+            holding_days=7,
+            weights=WEIGHTS,
+            previous_weights=(),
+            histories=histories(),
+            tiers=TIERS,
+            funding_by_contract={},
+            cost_table=BASE,
+        )
 
 
 def test_adverse_doubles_slippage_and_funding_payments() -> None:

@@ -1,13 +1,17 @@
 import json
 import random
-from decimal import Decimal
+from decimal import Context, Decimal, Inexact
 from pathlib import Path
 
 import pytest
 
+import trading_bot.panel_decision as panel_decision_module
 from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.evaluation import _maximum_drawdown, evaluate_signals
 from trading_bot.panel_config import load_panel_family_spec
-from trading_bot.panel_decision import PanelDecisionError, build_panel_decision
+from trading_bot.panel_decision import PanelDecisionError, _pool, _win_rate, build_panel_decision
+from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
+from trading_bot.strategy import CostScenario
 
 SPEC_PATH = Path("configs/xs-momentum-panel-v1.json")
 SPEC, SPEC_HASH = load_panel_family_spec(SPEC_PATH)
@@ -460,7 +464,7 @@ def test_member_clearing_every_gate_is_eligible(tmp_path: Path) -> None:
 def test_pooled_counts_and_hashes_are_recorded(tmp_path: Path) -> None:
     output_path = build(tmp_path, {})
     document = json.loads(output_path.read_text(encoding="utf-8"))
-    assert document["pooled_episode_count"] == 6 * EPISODES_PER_FOLD
+    assert document["pooled_raw_episode_count"] == 6 * EPISODES_PER_FOLD
     assert document["fold_count"] == 6
     assert len(document["source_report_hashes"]) == 6
     assert document["family_spec_hash"] == SPEC_HASH
@@ -520,3 +524,359 @@ def test_tampered_report_is_rejected(tmp_path: Path) -> None:
             output_path=tmp_path / "decision.json",
             registry_path=tmp_path / "registry.sqlite3",
         )
+
+
+def write_fold_with_held_nothing(
+    path: Path,
+    fold_index: int,
+    returns: dict[str, tuple[str, str]],
+    *,
+    held_nothing_candidate: str,
+    held_nothing_index: int = 0,
+) -> None:
+    """Like `write_fold`, but one episode of `held_nothing_candidate`, in both
+    scenarios, is marked the way `panel_fold_run.py` marks a week where a member's
+    own construction produced no weights while the universe was not too small."""
+    candidates = []
+    for name in MEMBERS + CONTROLS:
+        base_value, adverse_value = returns.get(name, ("0", "0"))
+        base_episodes = episodes(f"f{fold_index}", base_value, EPISODES_PER_FOLD)
+        adverse_episodes = episodes(f"f{fold_index}", adverse_value, EPISODES_PER_FOLD)
+        if name == held_nothing_candidate:
+            base_episodes[held_nothing_index]["reason_codes"] = [MEMBER_HELD_NOTHING_REASON_CODE]
+            adverse_episodes[held_nothing_index]["reason_codes"] = [
+                MEMBER_HELD_NOTHING_REASON_CODE
+            ]
+        candidates.append(
+            {
+                "candidate_name": name,
+                "role": "member" if name in MEMBERS else "control",
+                "episode_count": EPISODES_PER_FOLD,
+                "base": {
+                    "total_net_return": str(
+                        Decimal(base_value) * Decimal(EPISODES_PER_FOLD)
+                    ),
+                    "episodes": base_episodes,
+                },
+                "adverse": {
+                    "total_net_return": str(
+                        Decimal(adverse_value) * Decimal(EPISODES_PER_FOLD)
+                    ),
+                    "episodes": adverse_episodes,
+                },
+            }
+        )
+    material = {
+        "report_version": "1.0.0",
+        "status": "development_only",
+        "reason_codes": [],
+        "family_name": SPEC.family_name,
+        "family_spec_hash": SPEC_HASH,
+        "capture_root_hash": "c" * 64,
+        "dataset_root_hash": "d" * 64,
+        "split_manifest_hash": "e" * 64,
+        "manifest_hash": "f" * 64,
+        "fold_index": fold_index,
+        "fold_count": 6,
+        "train_sample_count": 10,
+        "validation_sample_count": 10,
+        "test_sample_count": EPISODES_PER_FOLD,
+        "train_membership_hash": "0" * 64,
+        "validation_membership_hash": "1" * 64,
+        "test_membership_hash": "2" * 64,
+        "random_seed": 17,
+        "block_length": 4,
+        "bootstrap_repetitions": 2000,
+        "skipped_sample_ids": [],
+        "code_hash": "3" * 64,
+        "candidates": candidates,
+    }
+    document = dict(material)
+    document["report_hash"] = content_sha256(material)
+    path.write_bytes(canonical_json(document))
+
+
+def test_member_held_nothing_episode_is_excluded_but_its_cost_is_rolled_forward(
+    tmp_path: Path,
+) -> None:
+    # Fold 0 marks xs_mom_4w's episode 5 of 40 (not the first, not the last, so a
+    # retained episode exists both before and after it) MEMBER_HELD_NOTHING in both
+    # scenarios; every other fold and every other candidate is a plain uniform
+    # profile. Round 1 review: excluding the marked episode by simply dropping it
+    # silently erased its real net_return from the pooled total, an always-
+    # favourable bias, since a real re-entry episode right after it was still kept.
+    # After the fix, the marked episode still stops counting as an observation, but
+    # its net_return and turnover are rolled into the next retained episode in the
+    # same fold, so the pooled total equals the raw total exactly -- no money
+    # disappears -- and the roll-forward is itself visible in the new
+    # held_nothing_episode_count / net_return_rolled_forward fields.
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        if fold_index == 0:
+            write_fold_with_held_nothing(
+                path,
+                fold_index,
+                {"xs_mom_4w": ("0.01", "0.001")},
+                held_nothing_candidate="xs_mom_4w",
+                held_nothing_index=5,
+            )
+        else:
+            write_fold(path, fold_index, {"xs_mom_4w": ("0.01", "0.001")})
+        paths.append(path)
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=SPEC_PATH,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    # One fewer counted observation than the raw episode count...
+    assert momentum["pooled_retained_episode_count"] == 6 * EPISODES_PER_FOLD - 1
+    # ...but the marked episode's money is still fully present in both pooled
+    # totals -- equal to the *full* raw total, not short by the excluded episode.
+    assert momentum["base_total_net_return"] == str(Decimal("0.01") * 6 * EPISODES_PER_FOLD)
+    assert momentum["adverse_total_net_return"] == str(Decimal("0.001") * 6 * EPISODES_PER_FOLD)
+    assert momentum["base_held_nothing_episode_count"] == 1
+    assert momentum["adverse_held_nothing_episode_count"] == 1
+    assert momentum["base_held_nothing_net_return_rolled_forward"] == "0.01"
+    assert momentum["adverse_held_nothing_net_return_rolled_forward"] == "0.001"
+    # Turnover is rolled forward the same way: 240 raw episodes each charge "1" of
+    # turnover, so the true total is 240 even though only 239 remain as their own
+    # observation -- the reported mean turnover must reflect that real total, not
+    # merely divide the 239 individually-recorded values.
+    assert Decimal(momentum["base_mean_turnover"]) == Decimal(240) / Decimal(239)
+    # The top-level pooled count reports the shared raw decision calendar, not any
+    # one member's post-exclusion count.
+    assert document["pooled_raw_episode_count"] == 6 * EPISODES_PER_FOLD
+    # An untouched candidate's own pooled count is unaffected.
+    control = next(item for item in document["controls"] if item["candidate_name"] == "no_trade")
+    assert control["pooled_retained_episode_count"] == 6 * EPISODES_PER_FOLD
+
+
+def _alternating(count: int, *, low: str, high: str) -> list[str]:
+    half = count // 2
+    return [low] * half + [high] * (count - half)
+
+
+def test_member_record_reports_the_spec_8_4_fields(tmp_path: Path) -> None:
+    # xs_mom_4w gets the same 40-value alternating base pattern in every one of the
+    # six folds (20 episodes at "-0.01", 20 at "0.02") and a uniformly positive
+    # adverse return; every other candidate stays at the default all-zero profile.
+    # Every quantity asserted below is independently hand-derived (or, for maximum
+    # drawdown, cross-checked against the exact function `evaluation.py` uses) from
+    # that same fixture, so this pins the wiring of every section 8.4 field this
+    # item adds, not just their presence.
+    base_pattern = _alternating(EPISODES_PER_FOLD, low="-0.01", high="0.02")
+    adverse_pattern = ["0.001"] * EPISODES_PER_FOLD
+    per_fold_base = {index: {"xs_mom_4w": base_pattern} for index in range(6)}
+    per_fold_adverse = {index: {"xs_mom_4w": adverse_pattern} for index in range(6)}
+    output_path = build_with_fold_episodes(tmp_path, per_fold_base, per_fold_adverse)
+    document = json.loads(output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+
+    assert momentum["pooled_retained_episode_count"] == 6 * EPISODES_PER_FOLD
+    # 120 episodes at -0.01 and 120 at 0.02: the two middle (sorted) values straddle
+    # the boundary between the two groups, so the median is their average.
+    assert Decimal(momentum["base_median_net_return"]) == (Decimal("-0.01") + Decimal("0.02")) / 2
+    assert Decimal(momentum["base_win_rate"]) == Decimal("120") / Decimal("240")
+    assert momentum["base_mean_turnover"] == "1"
+    assert momentum["base_mean_gross_exposure"] == "1"
+    assert momentum["base_mean_net_exposure"] == "0"
+    assert momentum["base_forced_close_count"] == 0
+    pooled_base_series = [Decimal(value) for value in base_pattern] * 6
+    assert Decimal(momentum["base_maximum_drawdown"]) == _maximum_drawdown(pooled_base_series)
+
+    # The adverse series is uniformly positive: every episode is a "win", the
+    # median equals the constant, and there is never a drawdown.
+    assert momentum["adverse_median_net_return"] == "0.001"
+    assert momentum["adverse_win_rate"] == "1"
+    assert momentum["adverse_maximum_drawdown"] == "0"
+    assert momentum["adverse_mean_turnover"] == "1"
+    assert momentum["adverse_forced_close_count"] == 0
+
+    # No week in this fixture is UNIVERSE_TOO_SMALL.
+    assert momentum["universe_too_small_week_count"] == 0
+
+
+def test_universe_too_small_week_count_reflects_skipped_samples(tmp_path: Path) -> None:
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        write_fold(path, fold_index, {})
+        if fold_index == 0:
+            document = json.loads(path.read_text(encoding="utf-8"))
+            document["skipped_sample_ids"] = ["BINANCE_UM:1:w1", "BINANCE_UM:2:w1"]
+            document["reason_codes"] = ["SKIPPED_WEEK_EXIT_COST_UNCHARGED"]
+            material = {k: v for k, v in document.items() if k != "report_hash"}
+            document["report_hash"] = content_sha256(material)
+            path.write_bytes(canonical_json(document))
+        paths.append(path)
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=SPEC_PATH,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    assert document["skipped_sample_ids"] == ["BINANCE_UM:1:w1", "BINANCE_UM:2:w1"]
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    assert momentum["universe_too_small_week_count"] == 2
+
+
+def test_declared_deviations_are_reported(tmp_path: Path) -> None:
+    output_path = build(tmp_path, {})
+    document = json.loads(output_path.read_text(encoding="utf-8"))
+    deviations = document["declared_deviations"]
+    assert len(deviations) >= 2
+    ids = {item["id"] for item in deviations}
+    assert "RANKABLE_SUBSET_NOT_FULL_UNIVERSE" in ids
+    assert "MEMBER_HELD_NOTHING_EXCLUDED_FROM_POOLED_SERIES" in ids
+    for item in deviations:
+        assert item["description"]
+
+
+def test_code_hash_mismatch_across_fold_reports_is_rejected(tmp_path: Path) -> None:
+    # A family half-run under one version of panel_fold_run.py and half under
+    # another (e.g. before vs. after MEMBER_HELD_NOTHING marking existed) would
+    # apply the pooled exclusion to some folds only, silently, with no other
+    # check catching it -- the code_hash linkage check must refuse it outright.
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        write_fold(path, fold_index, {})
+        paths.append(path)
+    document = json.loads(paths[3].read_text(encoding="utf-8"))
+    document["code_hash"] = "9" * 64
+    material = {key: value for key, value in document.items() if key != "report_hash"}
+    document["report_hash"] = content_sha256(material)
+    paths[3].write_bytes(canonical_json(document))
+
+    with pytest.raises(PanelDecisionError, match="code_hash mismatch"):
+        build_panel_decision(
+            tuple(paths),
+            family_spec_path=SPEC_PATH,
+            output_path=tmp_path / "decision.json",
+            registry_path=tmp_path / "registry.sqlite3",
+        )
+
+
+def test_win_rate_matches_evaluate_signals_across_series() -> None:
+    """Pins agreement between panel_decision._win_rate and evaluation.py's own
+    inline win-rate computation inside evaluate_signals (there was nothing
+    importable, since evaluate_signals computes it inline), including the tie
+    convention -- a value of exactly zero is never a win in either -- so the
+    bar-cadence and panel research lines cannot silently drift apart on what
+    "win rate" means. A zero-cost, always-active scenario makes
+    evaluate_signals's net_returns equal the input series exactly."""
+    scenario = CostScenario(
+        name="zero_cost",
+        fee_bps_per_side=Decimal(0),
+        spread_multiplier=Decimal(0),
+        slippage_bps_per_side=Decimal(0),
+        funding_bps=Decimal(0),
+    )
+    series_cases: list[tuple[Decimal, ...]] = [
+        (),
+        (Decimal("0.01"),),
+        (Decimal("-0.01"), Decimal("0.02"), Decimal("0.03")),
+        (Decimal("0"), Decimal("0"), Decimal("0.01")),
+        (Decimal("-1"), Decimal("-2"), Decimal("3"), Decimal("4"), Decimal("-5")),
+    ]
+    for series in series_cases:
+        evaluation = evaluate_signals(
+            tuple(1 for _ in series),
+            series,
+            tuple(Decimal(0) for _ in series),
+            scenario,
+        )
+        assert _win_rate(series) == evaluation.win_rate
+
+
+def test_pooling_precision_headroom_is_enforced(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The "never itself needs to round" guarantee behind exact pooled totals
+    is only real if exceeding it is loud. Shrinking _POOLING_CONTEXT to one
+    significant digit of precision (Inexact still trapped) turns the very
+    first addition of two two-digit values into a real rounding event, and
+    that must now raise PanelDecisionError instead of silently returning a
+    wrong total."""
+    insufficient = Context(prec=1)
+    insufficient.traps[Inexact] = True
+    monkeypatch.setattr(panel_decision_module, "_POOLING_CONTEXT", insufficient)
+
+    document: dict[str, object] = {
+        "candidates": [
+            {
+                "candidate_name": "xs_mom_4w",
+                "base": {"episodes": episodes_with_values("f0", ["0.12", "0.34"])},
+                "adverse": {"episodes": episodes_with_values("f0", ["0", "0"])},
+            }
+        ]
+    }
+    with pytest.raises(PanelDecisionError, match="precision headroom"):
+        _pool([document], "xs_mom_4w")
+
+
+def test_folds_where_a_member_retained_nothing_are_reported(tmp_path: Path) -> None:
+    # Fold 2 marks every one of xs_mom_4w's 40 episodes MEMBER_HELD_NOTHING in
+    # both scenarios -- the fold-retains-nothing fallback R1's backward roll
+    # cannot fix, since there is no retained episode in that fold to roll onto.
+    # That fold must still be visible: a per-fold retained-episode-count list
+    # and a distinct list naming which fold(s) retained zero.
+    all_held_nothing = episodes_with_values("f2", ["0.01"] * EPISODES_PER_FOLD)
+    for episode in all_held_nothing:
+        episode["reason_codes"] = [MEMBER_HELD_NOTHING_REASON_CODE]
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        if fold_index == 2:
+            write_fold_with_episodes(
+                path,
+                fold_index,
+                {},
+                {},
+            )
+            document = json.loads(path.read_text(encoding="utf-8"))
+            for candidate in document["candidates"]:
+                if candidate["candidate_name"] == "xs_mom_4w":
+                    candidate["base"]["episodes"] = all_held_nothing
+                    candidate["adverse"]["episodes"] = all_held_nothing
+            material = {key: value for key, value in document.items() if key != "report_hash"}
+            document["report_hash"] = content_sha256(material)
+            path.write_bytes(canonical_json(document))
+        else:
+            write_fold(path, fold_index, {"xs_mom_4w": ("0.01", "0.001")})
+        paths.append(path)
+
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=SPEC_PATH,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    assert momentum["base_fold_retained_episode_counts"] == [
+        EPISODES_PER_FOLD,
+        EPISODES_PER_FOLD,
+        0,
+        EPISODES_PER_FOLD,
+        EPISODES_PER_FOLD,
+        EPISODES_PER_FOLD,
+    ]
+    assert momentum["base_folds_with_no_retained_episodes"] == [2]
+    assert momentum["adverse_folds_with_no_retained_episodes"] == [2]
+    # An untouched candidate never retains nothing anywhere.
+    other = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_1w"
+    )
+    assert other["base_folds_with_no_retained_episodes"] == []

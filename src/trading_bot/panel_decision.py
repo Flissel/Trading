@@ -3,14 +3,19 @@
 import json
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Context, Decimal, Inexact, localcontext
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from trading_bot.canonical import canonical_json, content_sha256
-from trading_bot.evaluation import BootstrapMeanTest, benjamini_hochberg, block_bootstrap_mean_test
+from trading_bot.evaluation import (
+    BootstrapMeanTest,
+    benjamini_hochberg,
+    block_bootstrap_mean_test,
+)
+from trading_bot.evaluation import _maximum_drawdown as _shared_maximum_drawdown
 from trading_bot.panel_config import PanelFamilySpec, load_panel_family_spec
-from trading_bot.panel_fold_run import verify_panel_fold_report
+from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE, verify_panel_fold_report
 from trading_bot.panel_statistics import (
     PanelStatisticsError,
     annualised_sharpe,
@@ -18,6 +23,60 @@ from trading_bot.panel_statistics import (
     sharpe_ratio,
 )
 from trading_bot.registry import ArtifactRecord, MetadataRegistry
+
+# Section 8.1's declared weight construction reads from the *full eligible*
+# universe; the implementation reads from the subset of it that is actually
+# rankable at that decision (has the exact lagged close for the member's
+# lookback, or a full volatility window). This is a known, deliberate
+# reporting departure from the spec text -- not a change to how weights are
+# built -- surfaced in every decision report via `declared_deviations`.
+_DECLARED_DEVIATIONS: tuple[dict[str, object], ...] = (
+    {
+        "id": "RANKABLE_SUBSET_NOT_FULL_UNIVERSE",
+        "description": (
+            "The cross-sectional quintile size and the time-series weight cap are "
+            "computed from the contracts that are actually rankable at a decision, not "
+            "from the full eligible universe as spec section 8.1 states, because a "
+            "contract can be eligible yet lack the exact lagged close or a full "
+            "volatility window."
+        ),
+    },
+    {
+        "id": "MEMBER_HELD_NOTHING_EXCLUDED_FROM_POOLED_SERIES",
+        "description": (
+            "Spec section 7.1 authorises excluding a week from the pooled series and "
+            "the episode floor only at the universe level (UNIVERSE_TOO_SMALL), where "
+            "no episode and no cost ever exist. A week a single member holds nothing "
+            "is excluded from that member's own pooled series and episode count the "
+            "same way, even though the episode can carry a real unwind cost (net "
+            "return and turnover); that cost is never dropped -- it is rolled into "
+            "the member's next retained episode in the same fold, or, if none "
+            "follows, rolled backward onto that fold's last retained episode so it "
+            "still enters the pooled series and not merely the total. Only a fold "
+            "that retains nothing at all falls back to keeping the cost in the total "
+            "alone, since there is then no episode to roll onto. Reported per member "
+            "and scenario as the held-nothing episode count and the net return and "
+            "turnover rolled forward."
+        ),
+    },
+)
+
+
+# Precision for the pooling summations in `_pool`/`_pool_scenario_fold` only
+# (never the ambient default context): generous headroom above the default
+# 28 significant digits so that summing the bounded number of already-28-29-
+# digit episode and contract values pooled here never itself needs to round.
+# See the comment at its point of use for why that is what actually makes
+# `sum(contract_totals)` and `base_total` -- two different groupings of the
+# same underlying money -- agree exactly rather than approximately.
+#
+# Real inputs need roughly 32 digits of headroom (measured); prec=50 leaves
+# ample margin. Inexact is trapped so that margin is an enforced guarantee,
+# not an assumption: if it is ever exceeded, this raises immediately rather
+# than silently rounding to a wrong total that nothing downstream would
+# notice -- the exact failure mode this precision work exists to remove.
+_POOLING_CONTEXT = Context(prec=50)
+_POOLING_CONTEXT.traps[Inexact] = True
 
 
 class PanelDecisionError(RuntimeError):
@@ -39,8 +98,51 @@ class _Pooled:
     base_total: Decimal
     adverse_total: Decimal
     fold_base_totals: tuple[Decimal, ...]
+    # How many episodes this member actually retained from each fold, in
+    # fold-index order -- surfaces the case the R1 backward-roll fallback
+    # cannot fix on its own: a fold where the member retained zero episodes
+    # (every one of that fold's decisions was MEMBER_HELD_NOTHING). That fold
+    # then contributes only to `fold_base_totals`/`base_total`, never to
+    # `base_returns`, `base_turnovers` or the bootstrap series they feed --
+    # authorised (there is no episode within that fold to roll the cost onto)
+    # but otherwise invisible, since a fold like that looks identical to a
+    # healthy one everywhere else in the report.
+    base_fold_retained_episode_counts: tuple[int, ...]
+    adverse_fold_retained_episode_counts: tuple[int, ...]
     contract_totals: dict[str, Decimal]
     episode_count: int
+    # Episode count before excluding MEMBER_HELD_NOTHING-marked episodes --
+    # the same for every candidate in one decision (it reflects how many
+    # decisions were not skipped for UNIVERSE_TOO_SMALL, independent of any
+    # one member's own holding pattern) and used only for the cross-candidate
+    # linkage check and the top-level `pooled_raw_episode_count` report field.
+    # A member's own post-exclusion count is `episode_count` above; the two
+    # are named apart deliberately so a reader cannot confuse the shared
+    # decision calendar with the (per-member, generally smaller) count the
+    # episode floor is actually checked against.
+    raw_episode_count: int
+    base_turnovers: tuple[Decimal, ...]
+    adverse_turnovers: tuple[Decimal, ...]
+    base_gross_exposures: tuple[Decimal, ...]
+    adverse_gross_exposures: tuple[Decimal, ...]
+    base_net_exposures: tuple[Decimal, ...]
+    adverse_net_exposures: tuple[Decimal, ...]
+    base_forced_close_count: int
+    adverse_forced_close_count: int
+    # Visibility into the roll-forward/-backward of the MEMBER_HELD_NOTHING
+    # exclusion: how many episodes were marked for this candidate and
+    # scenario, and the total net return and turnover those episodes
+    # carried -- money and activity that never left the pooled series (each
+    # was rolled into an adjacent retained episode in the same fold, forward
+    # if one follows, backward onto the fold's last retained episode
+    # otherwise) even though the episode itself no longer counts as its own
+    # observation.
+    base_held_nothing_episode_count: int
+    adverse_held_nothing_episode_count: int
+    base_held_nothing_net_return_rolled_forward: Decimal
+    adverse_held_nothing_net_return_rolled_forward: Decimal
+    base_held_nothing_turnover_rolled_forward: Decimal
+    adverse_held_nothing_turnover_rolled_forward: Decimal
 
 
 def build_panel_decision(
@@ -99,6 +201,15 @@ def build_panel_decision(
         raise PanelDecisionError("fold reports do not share one family and manifest")
     if next(iter(linkage))[0] != family_spec_hash:
         raise PanelDecisionError("fold reports were produced under a different declaration")
+    # A family half-run under an older panel_fold_run.py (before MEMBER_HELD_NOTHING
+    # marking existed, say) and half under a newer one would apply the pooled
+    # exclusion to some folds only, silently, with none of the checks above ever
+    # firing -- code_hash covers exactly that class of drift.
+    code_hashes = {str(document["code_hash"]) for document in documents}
+    if len(code_hashes) != 1:
+        raise PanelDecisionError(
+            "fold reports were built by different code versions (code_hash mismatch)"
+        )
     documents.sort(key=lambda item: _int_field(item, "fold_index"))
 
     member_names = tuple(item.name for item in spec.members)
@@ -106,9 +217,17 @@ def build_panel_decision(
     pooled: dict[str, _Pooled] = {
         name: _pool(documents, name) for name in member_names + control_names
     }
-    episode_counts = {pooled[name].episode_count for name in member_names + control_names}
-    if len(episode_counts) != 1:
-        raise PanelDecisionError("candidates do not share one pooled episode count")
+    # This checks the *raw* per-candidate episode count, from before any
+    # MEMBER_HELD_NOTHING episode is excluded below -- that raw count is what
+    # every candidate must share (it reflects the fold-report family's own
+    # decision calendar), whereas the post-exclusion `episode_count` now
+    # legitimately differs member by member.
+    raw_episode_counts = {
+        pooled[name].raw_episode_count for name in member_names + control_names
+    }
+    if len(raw_episode_counts) != 1:
+        raise PanelDecisionError("candidates do not share one raw pooled episode count")
+    pooled_raw_episode_count = next(iter(raw_episode_counts))
     fold_count = len(documents)
 
     tests: dict[str, BootstrapMeanTest] = {}
@@ -147,6 +266,15 @@ def build_panel_decision(
         default=Decimal(0),
     )
 
+    skipped_sample_ids = sorted(
+        {
+            value
+            for document in documents
+            for value in _string_list_field(document, "skipped_sample_ids")
+        }
+    )
+    universe_too_small_week_count = len(skipped_sample_ids)
+
     members: list[dict[str, object]] = []
     eligible: list[str] = []
     for name in member_names:
@@ -160,6 +288,7 @@ def build_panel_decision(
             trial_sharpes=tuple(trial_sharpes),
             strongest_base=strongest_base,
             strongest_adverse=strongest_adverse,
+            universe_too_small_week_count=universe_too_small_week_count,
         )
         members.append(record)
         if status == "eligible_for_further_review":
@@ -168,7 +297,7 @@ def build_panel_decision(
     controls = [
         {
             "candidate_name": name,
-            "episode_count": pooled[name].episode_count,
+            "pooled_retained_episode_count": pooled[name].episode_count,
             "base_total_net_return": pooled[name].base_total,
             "adverse_total_net_return": pooled[name].adverse_total,
         }
@@ -185,18 +314,13 @@ def build_panel_decision(
         "dataset_root_hash": str(documents[0]["dataset_root_hash"]),
         "split_manifest_hash": str(documents[0]["split_manifest_hash"]),
         "fold_count": fold_count,
-        "pooled_episode_count": pooled[member_names[0]].episode_count,
+        "pooled_raw_episode_count": pooled_raw_episode_count,
         "source_report_hashes": [str(document["report_hash"]) for document in documents],
-        "skipped_sample_ids": sorted(
-            {
-                value
-                for document in documents
-                for value in _string_list_field(document, "skipped_sample_ids")
-            }
-        ),
+        "skipped_sample_ids": skipped_sample_ids,
         "block_length": spec.statistics.block_length,
         "bootstrap_repetitions": spec.statistics.bootstrap_repetitions,
         "random_seed": spec.statistics.random_seed,
+        "declared_deviations": list(_DECLARED_DEVIATIONS),
         "members": members,
         "controls": controls,
         "eligible_member_names": eligible,
@@ -234,41 +358,291 @@ def _register_artifact(registry_path: Path, *, output_path: Path, report_hash: s
         )
 
 
+def _held_nothing(episode: object) -> bool:
+    """True if the fold report marked this episode MEMBER_HELD_NOTHING.
+
+    A member's own weight construction can return no weights (too few
+    rankable contracts to form both cross-sectional quintiles, or none with a
+    full volatility window) even though the week's universe was not too
+    small. Such an episode holds no position and must be excluded from the
+    pooled series and the episode floor the same way a UNIVERSE_TOO_SMALL
+    week already is (spec section 7.1), one level down. Older-shaped episode
+    dicts with no `reason_codes` key at all are simply never held-nothing.
+    """
+    if not isinstance(episode, dict):
+        return False
+    codes = episode.get("reason_codes", ())
+    if not isinstance(codes, list | tuple):
+        return False
+    return MEMBER_HELD_NOTHING_REASON_CODE in codes
+
+
+@dataclass(frozen=True, slots=True)
+class _ScenarioFoldResult:
+    fold_total: Decimal
+    held_nothing_count: int
+    held_nothing_net_return: Decimal
+    held_nothing_turnover: Decimal
+    forced_close_count: int
+
+
+def _pool_scenario_fold(
+    episodes: list[object],
+    *,
+    values: list[Decimal],
+    turnovers: list[Decimal],
+    gross_exposures: list[Decimal],
+    net_exposures: list[Decimal],
+    contract_totals: dict[str, Decimal] | None,
+) -> _ScenarioFoldResult:
+    """Pool one fold's one-scenario episode list, appending each retained
+    episode's (possibly cost-adjusted) values to the accumulator lists.
+
+    A MEMBER_HELD_NOTHING episode is real accounting: if a position was
+    carried into it, `evaluate_episode` charges a genuine unwind (turnover,
+    a strictly negative net return). Dropping that episode outright would
+    silently erase that cost while the next retained episode still pays a
+    full re-entry turnover -- one side of a round trip discarded, the other
+    kept, always in the favourable direction. So its net_return and turnover
+    are carried forward and added onto the next retained episode in this
+    same fold instead of being dropped. If a held-nothing episode is this
+    fold's *last*, with no retained episode after it to roll into, it is
+    instead rolled *backward* onto this fold's own last retained episode --
+    round 2 review: rolling only into `fold_total` for that case left the
+    cost out of `values`/`turnovers`, the exact series the bootstrap, both
+    Sharpes, the drawdown, the median, the win rate, the mean turnover and
+    the largest-episode share all read, reproducing the same favourable
+    bias one level down. Only when the fold retains nothing at all is
+    there truly no episode to roll onto; the cost then lives only in
+    `fold_total` (and the `held_nothing_*` totals below), which is the one
+    case today's total-only behaviour is still correct for.
+
+    `contract_net_contributions` and `forced_close_count` are accumulated
+    for *every* episode, held-nothing or not, unconditionally, before the
+    held-nothing branch even runs: unlike `values`/`turnovers` they are
+    plain aggregates with no per-episode attribution to preserve, so there
+    is nothing to roll forward or backward -- only something that must not
+    be skipped. Skipping a held-nothing episode's contract_net_contributions
+    (as an earlier version did, via a `continue` that fired before this
+    loop) made `sum(contract_totals)` differ from the pooled total by
+    exactly the skipped amount, corrupting `largest_contract_share`.
+
+    `fold_total` is accumulated as a single left-to-right pass over every
+    episode's own net_return, independent of the roll-forward/-backward
+    bookkeeping used for `values` -- Decimal addition is not associative
+    at its default 28-significant-digit precision, so building the total
+    by summing the (reordered, cost-adjusted) retained values instead can
+    differ from a plain in-order sum by one unit in the last place.
+    Accumulating it directly, in the episodes' own order, is what actually
+    makes the pooled total equal the raw total exactly, to the last digit,
+    rather than merely approximately.
+    """
+    fold_total = Decimal(0)
+    held_nothing_count = 0
+    held_nothing_net_return = Decimal(0)
+    held_nothing_turnover = Decimal(0)
+    forced_close_count = 0
+    pending_return = Decimal(0)
+    pending_turnover = Decimal(0)
+    retained_before = len(values)
+    for episode in episodes:
+        if not isinstance(episode, dict):
+            raise PanelDecisionError("fold report episode is malformed")
+        net_return = Decimal(str(episode["net_return"]))
+        turnover = Decimal(str(episode["turnover"]))
+        fold_total += net_return
+        forced_close_count += int(episode["forced_close_count"])
+        if contract_totals is not None:
+            for contract_id, contribution in episode["contract_net_contributions"]:
+                contract_totals[str(contract_id)] = contract_totals.get(
+                    str(contract_id), Decimal(0)
+                ) + Decimal(str(contribution))
+        if _held_nothing(episode):
+            held_nothing_count += 1
+            held_nothing_net_return += net_return
+            held_nothing_turnover += turnover
+            pending_return += net_return
+            pending_turnover += turnover
+            continue
+        values.append(net_return + pending_return)
+        turnovers.append(turnover + pending_turnover)
+        gross_exposures.append(Decimal(str(episode["gross_exposure"])))
+        net_exposures.append(Decimal(str(episode["net_exposure"])))
+        pending_return = Decimal(0)
+        pending_turnover = Decimal(0)
+    if (pending_return != 0 or pending_turnover != 0) and len(values) > retained_before:
+        # A held-nothing run at the tail of this fold, with nothing after it to
+        # roll forward into: roll it backward onto this fold's own last
+        # retained episode instead. If the fold retained nothing at all
+        # (`len(values) == retained_before`), there is no episode to roll onto
+        # either way -- the cost stays visible only via `fold_total` and the
+        # held_nothing_* totals, exactly as before.
+        values[-1] += pending_return
+        turnovers[-1] += pending_turnover
+    return _ScenarioFoldResult(
+        fold_total=fold_total,
+        held_nothing_count=held_nothing_count,
+        held_nothing_net_return=held_nothing_net_return,
+        held_nothing_turnover=held_nothing_turnover,
+        forced_close_count=forced_close_count,
+    )
+
+
 def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     base: list[Decimal] = []
     adverse: list[Decimal] = []
     fold_totals: list[Decimal] = []
+    base_fold_retained_counts: list[int] = []
+    adverse_fold_retained_counts: list[int] = []
     contracts: dict[str, Decimal] = {}
-    for document in documents:
-        candidates = document["candidates"]
-        if not isinstance(candidates, list):
-            raise PanelDecisionError("fold report candidates are malformed")
-        record = next(
-            (item for item in candidates if item.get("candidate_name") == name), None
-        )
-        if record is None:
-            raise PanelDecisionError(f"fold report is missing candidate {name}")
-        fold_total = Decimal(0)
-        for episode in record["base"]["episodes"]:
-            value = Decimal(str(episode["net_return"]))
-            base.append(value)
-            fold_total += value
-            for contract_id, contribution in episode["contract_net_contributions"]:
-                contracts[str(contract_id)] = contracts.get(
-                    str(contract_id), Decimal(0)
-                ) + Decimal(str(contribution))
-        fold_totals.append(fold_total)
-        for episode in record["adverse"]["episodes"]:
-            adverse.append(Decimal(str(episode["net_return"])))
+    base_turnovers: list[Decimal] = []
+    adverse_turnovers: list[Decimal] = []
+    base_gross_exposures: list[Decimal] = []
+    adverse_gross_exposures: list[Decimal] = []
+    base_net_exposures: list[Decimal] = []
+    adverse_net_exposures: list[Decimal] = []
+    base_forced_close_count = 0
+    adverse_forced_close_count = 0
+    base_held_nothing_count = 0
+    adverse_held_nothing_count = 0
+    base_held_nothing_rolled = Decimal(0)
+    adverse_held_nothing_rolled = Decimal(0)
+    base_held_nothing_turnover_rolled = Decimal(0)
+    adverse_held_nothing_turnover_rolled = Decimal(0)
+    base_total = Decimal(0)
+    adverse_total = Decimal(0)
+    raw_episode_count = 0
+    # Elevated precision, scoped to this pooling pass only: `base_total` is
+    # accumulated episode-by-episode (in `_pool_scenario_fold`) while
+    # `contract_totals` accumulates the very same underlying money grouped by
+    # contract instead. Those are two different additions of the same
+    # multiset of numbers, and Decimal addition is not associative at the
+    # default 28-significant-digit precision -- summing the identical values
+    # in a different order can round differently, so `sum(contract_totals)`
+    # drifted from `base_total` by one part in roughly 1e30. Every episode
+    # and contract value here already has at most ~28-29 significant digits;
+    # summing at most a few hundred of them never needs more than a handful
+    # of extra digits to represent the exact mathematical result, so this
+    # margin makes every summation in this pass exact (no rounding at all),
+    # and mathematically exact sums are associative -- any two correct
+    # regroupings of the same numbers then agree to the last digit, not by
+    # coincidence of accumulation order.
+    try:
+        with localcontext(_POOLING_CONTEXT):
+            for document in documents:
+                candidates = document["candidates"]
+                if not isinstance(candidates, list):
+                    raise PanelDecisionError("fold report candidates are malformed")
+                record = next(
+                    (item for item in candidates if item.get("candidate_name") == name), None
+                )
+                if record is None:
+                    raise PanelDecisionError(f"fold report is missing candidate {name}")
+                base_episodes = record["base"]["episodes"]
+                adverse_episodes = record["adverse"]["episodes"]
+                if not isinstance(base_episodes, list) or not isinstance(adverse_episodes, list):
+                    raise PanelDecisionError("fold report episodes are malformed")
+                raw_episode_count += len(base_episodes)
+
+                base_retained_before = len(base)
+                base_result = _pool_scenario_fold(
+                    base_episodes,
+                    values=base,
+                    turnovers=base_turnovers,
+                    gross_exposures=base_gross_exposures,
+                    net_exposures=base_net_exposures,
+                    contract_totals=contracts,
+                )
+                fold_totals.append(base_result.fold_total)
+                base_fold_retained_counts.append(len(base) - base_retained_before)
+                base_total += base_result.fold_total
+                base_held_nothing_count += base_result.held_nothing_count
+                base_held_nothing_rolled += base_result.held_nothing_net_return
+                base_held_nothing_turnover_rolled += base_result.held_nothing_turnover
+                base_forced_close_count += base_result.forced_close_count
+
+                adverse_retained_before = len(adverse)
+                adverse_result = _pool_scenario_fold(
+                    adverse_episodes,
+                    values=adverse,
+                    turnovers=adverse_turnovers,
+                    gross_exposures=adverse_gross_exposures,
+                    net_exposures=adverse_net_exposures,
+                    contract_totals=None,
+                )
+                adverse_fold_retained_counts.append(len(adverse) - adverse_retained_before)
+                adverse_total += adverse_result.fold_total
+                adverse_held_nothing_count += adverse_result.held_nothing_count
+                adverse_held_nothing_rolled += adverse_result.held_nothing_net_return
+                adverse_held_nothing_turnover_rolled += adverse_result.held_nothing_turnover
+                adverse_forced_close_count += adverse_result.forced_close_count
+    except Inexact as error:
+        raise PanelDecisionError(
+            "pooling summation exceeded its precision headroom (_POOLING_CONTEXT) -- "
+            "the pooled total can no longer be guaranteed exact"
+        ) from error
     return _Pooled(
         base_returns=tuple(base),
         adverse_returns=tuple(adverse),
-        base_total=sum(base, Decimal(0)),
-        adverse_total=sum(adverse, Decimal(0)),
+        base_total=base_total,
+        adverse_total=adverse_total,
         fold_base_totals=tuple(fold_totals),
+        base_fold_retained_episode_counts=tuple(base_fold_retained_counts),
+        adverse_fold_retained_episode_counts=tuple(adverse_fold_retained_counts),
         contract_totals=contracts,
         episode_count=len(base),
+        raw_episode_count=raw_episode_count,
+        base_turnovers=tuple(base_turnovers),
+        adverse_turnovers=tuple(adverse_turnovers),
+        base_gross_exposures=tuple(base_gross_exposures),
+        adverse_gross_exposures=tuple(adverse_gross_exposures),
+        base_net_exposures=tuple(base_net_exposures),
+        adverse_net_exposures=tuple(adverse_net_exposures),
+        base_forced_close_count=base_forced_close_count,
+        adverse_forced_close_count=adverse_forced_close_count,
+        base_held_nothing_episode_count=base_held_nothing_count,
+        adverse_held_nothing_episode_count=adverse_held_nothing_count,
+        base_held_nothing_net_return_rolled_forward=base_held_nothing_rolled,
+        adverse_held_nothing_net_return_rolled_forward=adverse_held_nothing_rolled,
+        base_held_nothing_turnover_rolled_forward=base_held_nothing_turnover_rolled,
+        adverse_held_nothing_turnover_rolled_forward=adverse_held_nothing_turnover_rolled,
     )
+
+
+def _folds_with_no_retained_episodes(counts: tuple[int, ...]) -> list[int]:
+    """Fold indices (positional, which is also fold_index -- documents are
+    sorted by fold_index before pooling) where a member retained zero
+    episodes: the R1 backward-roll fallback for a fold that retains nothing
+    at all, made visible rather than indistinguishable from a healthy fold.
+    """
+    return [index for index, count in enumerate(counts) if count == 0]
+
+
+def _mean(values: tuple[Decimal, ...]) -> Decimal:
+    return sum(values, Decimal(0)) / Decimal(len(values)) if values else Decimal(0)
+
+
+def _median(values: tuple[Decimal, ...]) -> Decimal:
+    if not values:
+        return Decimal(0)
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / Decimal(2)
+
+
+def _win_rate(values: tuple[Decimal, ...]) -> Decimal:
+    """Wins over count, zero when there is nothing to divide by.
+
+    Mirrors `evaluate_signals`'s win-rate definition in `evaluation.py`
+    (wins among the active trades, divided by the active trade count) so the
+    bar-cadence and panel research lines agree on what "win rate" means.
+    """
+    if not values:
+        return Decimal(0)
+    wins = sum(1 for value in values if value > 0)
+    return Decimal(wins) / Decimal(len(values))
 
 
 def _member_record(
@@ -282,6 +656,7 @@ def _member_record(
     trial_sharpes: tuple[Decimal, ...],
     strongest_base: Decimal,
     strongest_adverse: Decimal,
+    universe_too_small_week_count: int,
 ) -> tuple[dict[str, object], str]:
     evidence: list[str] = []
     economic: list[str] = []
@@ -354,11 +729,50 @@ def _member_record(
 
     record: dict[str, object] = {
         "candidate_name": name,
-        "episode_count": pooled.episode_count,
+        "pooled_retained_episode_count": pooled.episode_count,
         "base_total_net_return": pooled.base_total,
         "base_mean_net_return": base_mean,
+        "base_median_net_return": _median(pooled.base_returns),
+        "base_win_rate": _win_rate(pooled.base_returns),
+        "base_maximum_drawdown": _shared_maximum_drawdown(list(pooled.base_returns)),
+        "base_mean_turnover": _mean(pooled.base_turnovers),
+        "base_mean_gross_exposure": _mean(pooled.base_gross_exposures),
+        "base_mean_net_exposure": _mean(pooled.base_net_exposures),
+        "base_forced_close_count": pooled.base_forced_close_count,
+        "base_held_nothing_episode_count": pooled.base_held_nothing_episode_count,
+        "base_held_nothing_net_return_rolled_forward": (
+            pooled.base_held_nothing_net_return_rolled_forward
+        ),
+        "base_held_nothing_turnover_rolled_forward": (
+            pooled.base_held_nothing_turnover_rolled_forward
+        ),
+        "base_fold_retained_episode_counts": list(pooled.base_fold_retained_episode_counts),
+        "base_folds_with_no_retained_episodes": _folds_with_no_retained_episodes(
+            pooled.base_fold_retained_episode_counts
+        ),
         "adverse_total_net_return": pooled.adverse_total,
         "adverse_mean_net_return": adverse_mean,
+        "adverse_median_net_return": _median(pooled.adverse_returns),
+        "adverse_win_rate": _win_rate(pooled.adverse_returns),
+        "adverse_maximum_drawdown": _shared_maximum_drawdown(list(pooled.adverse_returns)),
+        "adverse_mean_turnover": _mean(pooled.adverse_turnovers),
+        "adverse_mean_gross_exposure": _mean(pooled.adverse_gross_exposures),
+        "adverse_mean_net_exposure": _mean(pooled.adverse_net_exposures),
+        "adverse_forced_close_count": pooled.adverse_forced_close_count,
+        "adverse_held_nothing_episode_count": pooled.adverse_held_nothing_episode_count,
+        "adverse_held_nothing_net_return_rolled_forward": (
+            pooled.adverse_held_nothing_net_return_rolled_forward
+        ),
+        "adverse_held_nothing_turnover_rolled_forward": (
+            pooled.adverse_held_nothing_turnover_rolled_forward
+        ),
+        "adverse_fold_retained_episode_counts": list(
+            pooled.adverse_fold_retained_episode_counts
+        ),
+        "adverse_folds_with_no_retained_episodes": _folds_with_no_retained_episodes(
+            pooled.adverse_fold_retained_episode_counts
+        ),
+        "universe_too_small_week_count": universe_too_small_week_count,
         "positive_base_fold_count": positive_folds,
         "required_positive_fold_count": required,
         "base_bootstrap_lower": lower,
