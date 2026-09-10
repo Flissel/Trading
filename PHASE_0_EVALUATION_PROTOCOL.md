@@ -261,10 +261,14 @@ on a panel of Binance USD-M USDT perpetuals. It changes no numeric gate.
 
 ### 16.1 Clarification (2026-09-10)
 
-Prompted by ICPUSDT: a dead contract, not a live series with a gap (flat
-price and zero `quote_volume` for 104 days, then five days absent from both
-Binance dumps). Clarifies two implementation corrections without changing
-any numeric gate or parameter:
+Prompted by ICPUSDT: a dormant contract, not a live series with an ordinary
+publishing gap. Its close is flat at 6.44 USDT for 104 days, 2022-06-10
+through 2022-09-21; `quote_volume` is exactly zero for 103 of those days
+(2022-06-11 onward, after trading 14,142,060 on the first day). Five days
+then follow, 2022-09-22 through 2022-09-26, absent from both Binance dumps.
+It is not delisted: it resumes trading on 2022-09-27 and continues through
+2026-08-31. Clarifies three implementation corrections without changing any
+numeric gate or parameter:
 
 - The dataset-quality stop (panel spec section 12 step 3) discounts, per
   instrument, days a capture attempted from Binance's daily dump and
@@ -275,3 +279,9 @@ any numeric gate or parameter:
   median (panel spec sections 8.1 and 7.1) are calendar spans ending at the
   decision, not counts of available observations; a history-length
   requirement stated as a bar count remains a bar count.
+- Both of those windows must be complete -- every day present, no hole --
+  not merely calendar-bounded: a partial statistic over an incomplete
+  window is not a safe substitute, and for the liquidity median in
+  particular it is biased toward admitting contracts a complete window
+  would correctly exclude, since missing days concentrate on halted,
+  dormant, and delisting-adjacent contracts.

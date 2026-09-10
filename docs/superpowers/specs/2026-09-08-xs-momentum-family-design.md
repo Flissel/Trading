@@ -559,12 +559,17 @@ the best member without the other five.
 ## 12.1 Addendum (2026-09-10): calendar-aware windows and the capture-quality gate
 
 ICPUSDT prompted this addendum. Its close is exactly 6.44 USDT for 104
-consecutive days, 2022-06-10 through 2022-09-21, with `quote_volume` exactly
-zero throughout — a dead contract, not a live series with a publishing gap —
-followed immediately by five days, 2022-09-22 through 2022-09-26, absent from
-both Binance's monthly and daily dumps. Repairing a production capture from
-the daily dumps surfaced two implementation gaps against this document while
-investigating that instrument; both are fixed for every future capture, not
+consecutive days, 2022-06-10 through 2022-09-21: it trades 14,142,060 in
+`quote_volume` on the first of those days, then `quote_volume` is exactly
+zero for the following 103 days, 2022-06-11 through 2022-09-21 — a dormant
+contract, not a live series with an ordinary publishing gap. Five days
+immediately follow, 2022-09-22 through 2022-09-26, absent from both
+Binance's monthly and daily dumps. ICPUSDT is not delisted: it resumes
+trading on 2022-09-27 at `quote_volume` 31,000,000 and continues through
+2026-08-31 (1,934 rows), eligible in the panel's universe at 236 of the 348
+decisions in this capture. Repairing a production capture from the daily
+dumps surfaced implementation gaps against this document while
+investigating that instrument; all are fixed for every future capture, not
 only this one. **No pre-registered numeric gate or parameter changes.**
 
 1. **The capture-quality gate (section 12 step 3) now discounts days proven
@@ -589,24 +594,40 @@ only this one. **No pre-registered numeric gate or parameter changes.**
    regardless of the span they cover. On a series with an interior hole the
    two disagree: an observation-count window reaches further back and folds
    a multi-day price move into what it treats as a single daily return,
-   understating volatility. The implementation is corrected to match the
+   understating volatility. The window must be complete — every day
+   present, no hole — or the contract simply drops out of the time-series
+   members at that decision. The implementation is corrected to match the
    specification text; the specification itself does not change.
-3. **The trailing 30-day liquidity median (section 7.1 item 3) is likewise a
-   calendar window**, corrected the same way for the same reason: an
-   observation-count window can silently reach outside the intended 30-day
-   span when the series inside it has a hole. Section 7.1 item 1's
-   at-least-91-daily-bars history requirement is explicitly a bar count, not
-   a calendar span, and is unaffected.
+3. **The trailing 30-day liquidity median (section 7.1 item 3) is a calendar
+   window and must likewise be complete.** A median computed over whichever
+   days happen to survive a hole is not a safe substitute for the days that
+   are missing: missing days are not missing at random, they concentrate on
+   halted, dormant, and delisting-adjacent contracts, which is exactly where
+   the removed days are the low-volume ones — and the liquidity floor is a
+   one-sided gate, so a partial median is biased toward *admitting*
+   contracts a complete window would correctly exclude. On this capture, of
+   27,940 contract-decision pairs that fail the floor with a complete
+   window, removing the three lowest in-window days flips 4.1% of them to
+   passing; five days, 6.8%; ten days, 14.3%. Requiring completeness is free
+   here: it changes zero of the 348 decisions in this capture, and no
+   admitted contract-decision pair anywhere in it has an incomplete window.
+   Section 7.1 item 1's at-least-91-daily-bars history requirement is
+   explicitly a bar count, not a calendar span, and is unaffected.
 
-None of this changed a result. Across the five weekly rebalances whose
-30-day volatility window straddles ICPUSDT's five absent days, the corrected
-and uncorrected weight vectors are identical, because ICPUSDT's zero
-`quote_volume` already excludes it from the eligible universe at every one
-of those decisions under item 3 above, before its volatility is ever
-computed. The pre-registered gate was, in this capture, blocking the entire
-family over a contract the universe filter had already excluded on other
-grounds. The fix is a correctness guard for every future capture, not a
-change to any result reported from this one.
+None of this changed a result. The corrected and uncorrected weight vectors
+are identical at every one of the 348 decisions in this capture, verified
+directly rather than only argued: neither the calendar-aware volatility
+window nor the completeness requirement on the liquidity median changes a
+single universe snapshot or weight vector anywhere in it. At the five
+weekly rebalances whose 30-day volatility window straddles ICPUSDT's absent
+days, ICPUSDT is outside the eligible universe at all five — excluded by
+the liquidity floor at three of them, and by the top-100 rank cutoff at the
+other two (2022-10-16 and 2022-10-23, where its median `quote_volume`,
+6,963,751 and 9,853,035, clears the five-million floor but not the rank
+cutoff). The pre-registered gate was, in this capture, blocking the entire
+family over a contract already outside the eligible universe at every
+decision where the fix could matter. The fix is a correctness guard for
+every future capture, not a change to any result reported from this one.
 
 ## 13. Protocol Addendum (prospective, to be appended to `PHASE_0_EVALUATION_PROTOCOL.md`)
 
@@ -633,10 +654,14 @@ on a panel of Binance USD-M USDT perpetuals. It changes no numeric gate.
 
 ### 16.1 Clarification (2026-09-10)
 
-Prompted by ICPUSDT: a dead contract, not a live series with a gap (flat
-price and zero `quote_volume` for 104 days, then five days absent from both
-Binance dumps). Clarifies two implementation corrections without changing
-any numeric gate or parameter:
+Prompted by ICPUSDT: a dormant contract, not a live series with an ordinary
+publishing gap. Its close is flat at 6.44 USDT for 104 days, 2022-06-10
+through 2022-09-21; `quote_volume` is exactly zero for 103 of those days
+(2022-06-11 onward, after trading 14,142,060 on the first day). Five days
+then follow, 2022-09-22 through 2022-09-26, absent from both Binance dumps.
+It is not delisted: it resumes trading on 2022-09-27 and continues through
+2026-08-31. Clarifies three implementation corrections without changing any
+numeric gate or parameter:
 
 - The dataset-quality stop (panel spec section 12 step 3) discounts, per
   instrument, days a capture attempted from Binance's daily dump and
@@ -647,6 +672,12 @@ any numeric gate or parameter:
   median (panel spec sections 8.1 and 7.1) are calendar spans ending at the
   decision, not counts of available observations; a history-length
   requirement stated as a bar count remains a bar count.
+- Both of those windows must be complete -- every day present, no hole --
+  not merely calendar-bounded: a partial statistic over an incomplete
+  window is not a safe substitute, and for the liquidity median in
+  particular it is biased toward admitting contracts a complete window
+  would correctly exclude, since missing days concentrate on halted,
+  dormant, and delisting-adjacent contracts.
 ```
 
 ## 14. Risks and Honest Priors
