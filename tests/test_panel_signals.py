@@ -379,13 +379,27 @@ def test_time_series_weights_exclude_a_contract_with_a_hole_in_its_volatility_wi
     real-world instance that motivated the fix -- a calendar hole the daily
     dumps never fill either -- reproduced from first principles rather than
     from a fixture file. It does not reproduce that instance's own price
-    action: ICPUSDT was a dead contract by the time of its hole (flat price,
-    zero `quote_volume` for the preceding 104 days), which is a separate,
-    additional reason it never reaches this code path at all -- see
-    `panel_universe.py`'s liquidity filter."""
+    action: ICPUSDT was dormant by the time of its hole (flat price,
+    `quote_volume` exactly zero for 103 of the preceding 104 days, not
+    delisted -- it resumes trading days after the hole), which is a
+    separate, additional reason it is outside the eligible universe at the
+    decisions this hole affects -- see `panel_universe.py`'s liquidity and
+    rank filters.
+
+    Production's own config sets `liquidity_window_days` equal to
+    `volatility_window_days` (30 each), and the liquidity window must now
+    also be complete (this branch's other fix), so a hole inside the shared
+    span would drop the contract from the eligible universe entirely before
+    its volatility is ever computed -- unable to isolate what this test is
+    actually about. The liquidity window is narrowed to 5 days here (a
+    `model_copy`, not a change to the frozen config file) so the hole, at
+    day 90, sits inside the 30-day volatility window but outside the
+    5-day liquidity window ending at day 98 (days 94-98): the contract stays
+    eligible, and only its time-series membership is at stake."""
     decision = 99 * DAY_NS - 1_000_000
     bars = volatility_window_sensitive_panel()
-    gap_index = 90  # well inside the 30-day window ending at day 98 (indices 68..98)
+    gap_index = 90  # inside the 30-day volatility window (68..98), outside the 5-day
+    # liquidity window (94..98) narrowed for this test below.
     gap_close_time_ns = (gap_index + 1) * DAY_NS - 1_000_000
     bars_with_gap = tuple(
         item
@@ -394,10 +408,21 @@ def test_time_series_weights_exclude_a_contract_with_a_hole_in_its_volatility_wi
     )
     assert len(bars_with_gap) == len(bars) - 1
 
+    narrow_liquidity_universe = SPEC.universe.model_copy(update={"liquidity_window_days": 5})
+    narrow_liquidity_spec = SPEC.model_copy(update={"universe": narrow_liquidity_universe})
+
     histories = build_contract_histories(bars_with_gap)
-    snapshot = select_universe(histories, decision_close_ns=decision, rules=SPEC.universe)
+    snapshot = select_universe(
+        histories, decision_close_ns=decision, rules=narrow_liquidity_spec.universe
+    )
     assert len(snapshot.contracts) == 40
     assert "V000USDT:0" in {item.contract_id for item in snapshot.contracts}
+
+    vectors = build_weight_vectors(histories, snapshot, spec=narrow_liquidity_spec)
+    for member_name in ("ts_mom_4w", "ts_mom_12w"):
+        weight_ids = {contract_id for contract_id, _ in vectors[member_name].weights}
+        assert "V000USDT:0" not in weight_ids
+        assert any(f"V{index:03d}USDT:0" in weight_ids for index in range(1, 5))
 
     vectors = build_weight_vectors(histories, snapshot, spec=SPEC)
     for member_name in ("ts_mom_4w", "ts_mom_12w"):

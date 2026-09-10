@@ -73,17 +73,27 @@ def select_universe(
             continue
         # Spec 7.1 item 3's "trailing 30-day median" is a calendar span ending
         # at the decision, not the last `liquidity_window_days` *observations*
-        # regardless of span. Bounding by calendar day (rather than slicing
-        # the last N observed values) means a hole inside the window simply
-        # yields fewer values for the median -- it never reaches outside the
-        # window to replace them, the way an observation-count slice would on
-        # a series with a gap. That reach-outside behaviour, not the median
-        # having fewer points, was the bug: a five-day hole let this window
-        # span 35 calendar days instead of 30 and pull in volume the window
-        # was never meant to see.
-        window_start_ns = decision_close_ns - (rules.liquidity_window_days - 1) * DAY_NS
-        window = [value for value in observed if value >= window_start_ns]
-        median = _median(tuple(history.quote_volumes[value] for value in window))
+        # regardless of span, and the window must be complete -- every day
+        # present, no hole -- mirroring `_annualised_volatility`
+        # (panel_signals.py). A median computed over whichever days survive a
+        # hole is not a safe substitute for the missing ones: days go missing
+        # non-randomly, concentrated on halted, dormant, and
+        # delisting-adjacent contracts, which is exactly where the removed
+        # days are the low-volume ones -- so a partial median is biased
+        # upward on precisely the contracts a one-sided liquidity floor
+        # exists to exclude. A five-day hole could once let this window reach
+        # back to span 35 calendar days for a full count of observations;
+        # requiring completeness instead means the contract simply drops out
+        # of the eligible universe at this decision, the same way an
+        # incomplete volatility window drops a contract from the time-series
+        # members.
+        expected_close_times = tuple(
+            decision_close_ns - day_offset * DAY_NS
+            for day_offset in range(rules.liquidity_window_days - 1, -1, -1)
+        )
+        if any(value not in history.quote_volumes for value in expected_close_times):
+            continue
+        median = _median(tuple(history.quote_volumes[value] for value in expected_close_times))
         if median < rules.minimum_median_quote_volume:
             continue
         scored.append((median, contract_id))
