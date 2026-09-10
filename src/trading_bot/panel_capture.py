@@ -273,6 +273,7 @@ def capture_panel(
         shutil.rmtree(dataset_directory)
 
     download = fetch if fetch is not None else PanelZipClient().fetch
+    discovery_mode = months is None
 
     progress_path = target / "capture-progress.jsonl"
     sources: list[dict[str, object]] = []
@@ -288,6 +289,7 @@ def capture_panel(
     raw_root = target / "raw"
     candles: list[PanelCandleRow] = []
     funding: list[PanelFundingRow] = []
+    discovered_months: dict[str, dict[str, list[str]]] = {}
     with progress_path.open("a", encoding="utf-8") as progress_handle:
         for symbol in symbols:
             symbol_candle_row_count = 0
@@ -306,6 +308,10 @@ def capture_panel(
                     month_from,
                     month_to,
                 )
+                discovered_months[symbol] = {
+                    "klines": list(kline_months),
+                    "fundingRate": list(funding_months),
+                }
                 ordered_months = tuple(sorted(set(kline_months) | set(funding_months)))
             for month in ordered_months:
                 for kind, url_builder, kind_months in (
@@ -345,12 +351,17 @@ def capture_panel(
                     try:
                         payload = download(url)
                     except PanelSourceAbsent:
+                        # In discovery mode this month came from the bucket's
+                        # own listing, so a 404 on fetch means the bucket
+                        # contradicted itself inside one run -- record that
+                        # distinctly rather than as an ordinary absence.
+                        status = "absent_after_discovery" if discovery_mode else "absent"
                         absent_record: dict[str, object] = {
                             "symbol": symbol,
                             "month": month,
                             "kind": kind,
                             "url": url,
-                            "status": "absent",
+                            "status": status,
                         }
                         sources.append(absent_record)
                         progress_handle.write(canonical_json(absent_record).decode("utf-8"))
@@ -410,6 +421,8 @@ def capture_panel(
         material["month_from"] = month_from
     if month_to is not None:
         material["month_to"] = month_to
+    if discovered_months:
+        material["discovered_months"] = discovered_months
     capture_root_hash = content_sha256(material)
     document = dict(material)
     document["capture_root_hash"] = capture_root_hash
@@ -445,7 +458,9 @@ def verify_panel_capture(capture_root: Path) -> tuple[bool, tuple[str, ...]]:
         if not isinstance(entry, dict):
             errors.append("MANIFEST_STRUCTURE_INVALID")
             continue
-        if entry.get("status") == "absent":
+        if entry.get("status") != "present":
+            # Any non-present status (absent, or a discovery-then-404
+            # absent_after_discovery) has no raw payload to check.
             continue
         relative = str(entry.get("raw_relative_path"))
         try:

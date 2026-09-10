@@ -558,6 +558,55 @@ def test_capture_bounds_filter_the_discovered_months(tmp_path: Path) -> None:
     }
 
 
+def test_capture_records_discovered_months_including_a_symbol_with_zero_funding_months(
+    tmp_path: Path,
+) -> None:
+    fetch = _discovery_and_zip_fetch(kline_months=("2024-01", "2024-02"), funding_months=())
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        fetch=fetch,
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["discovered_months"]["BTCUSDT"]["klines"] == ["2024-01", "2024-02"]
+    # A symbol that discovered zero funding months is now visible as such,
+    # distinct from a symbol that was never asked about funding at all.
+    assert manifest["discovered_months"]["BTCUSDT"]["fundingRate"] == []
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+
+def test_capture_records_a_discovery_then_404_distinctly(tmp_path: Path) -> None:
+    def fetch(url: str) -> PanelPayload:
+        if "list-type=2" in url:
+            if "fundingRate" in url:
+                keys = (
+                    "data/futures/um/monthly/fundingRate/BTCUSDT/BTCUSDT-fundingRate-2024-01.zip",
+                )
+            else:
+                keys = ("data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip",)
+            return PanelPayload(url=url, raw_bytes=_listing_xml(keys=keys), received_time_ns=1)
+        if "fundingRate" in url:
+            # The bucket contradicts its own listing: this discovered month
+            # 404s when actually fetched.
+            raise PanelSourceAbsent("404: contradicts discovery")
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        fetch=fetch,
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    funding_entry = next(e for e in manifest["sources"] if e["kind"] == "fundingRate")
+    assert funding_entry["status"] == "absent_after_discovery"
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+
+
 def _deterministic_fetch() -> Callable[[str], PanelPayload]:
     def fetch(url: str) -> PanelPayload:
         if "fundingRate" in url:
