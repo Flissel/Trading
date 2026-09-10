@@ -71,7 +71,17 @@ def main(arguments: list[str] | None = None) -> int:
     panel_capture.add_argument("--output", type=Path, required=True)
     panel_capture.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
     panel_capture.add_argument("--symbols", required=True, help="comma-separated symbol list")
-    panel_capture.add_argument("--months", required=True, help="comma-separated YYYY-MM list")
+    panel_capture.add_argument(
+        "--months",
+        default=None,
+        help="comma-separated YYYY-MM list; omit to discover available months per symbol",
+    )
+    panel_capture.add_argument(
+        "--month-from", default=None, help="earliest YYYY-MM to keep when discovering months"
+    )
+    panel_capture.add_argument(
+        "--month-to", default=None, help="latest YYYY-MM to keep when discovering months"
+    )
     panel_manifest = commands.add_parser("panel-manifest")
     panel_manifest.add_argument("--workspace-root", type=Path, default=Path.cwd())
     panel_manifest.add_argument("--capture", type=Path, required=True)
@@ -197,12 +207,19 @@ def main(arguments: list[str] | None = None) -> int:
         output = parsed.output.resolve()
         if not output.is_relative_to(workspace):
             raise ValueError("panel capture paths must stay inside workspace")
+        months = (
+            tuple(item for item in parsed.months.split(",") if item)
+            if parsed.months is not None
+            else None
+        )
         capture_panel(
             workspace_root=workspace,
             output_directory=output,
             reserve_bytes=parsed.reserve_bytes,
             symbols=tuple(item for item in parsed.symbols.split(",") if item),
-            months=tuple(item for item in parsed.months.split(",") if item),
+            months=months,
+            month_from=parsed.month_from,
+            month_to=parsed.month_to,
         )
         return 0
     if parsed.command == "panel-manifest":
