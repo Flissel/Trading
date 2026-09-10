@@ -124,6 +124,85 @@ def test_even_liquidity_window_averages_the_two_middle_volumes() -> None:
     assert snapshot.reason_codes == ("UNIVERSE_TOO_SMALL",)
 
 
+def _close_time_ns(day_index: int) -> int:
+    return (day_index + 1) * DAY_NS - 1_000_000
+
+
+def bars_on_days(symbol: str, day_volumes: dict[int, str]) -> list[PanelBar]:
+    """One bar per (day index, volume) pair, at whatever days are given -- unlike
+    `bars`/`daily_volume_bars`, the day indices need not be consecutive, so
+    callers can construct a series with an interior hole."""
+    output: list[PanelBar] = []
+    for index, volume in sorted(day_volumes.items()):
+        open_time_ns = index * DAY_NS
+        close_time_ns = _close_time_ns(index)
+        output.append(
+            PanelBar(
+                contract_id=f"{symbol}:0",
+                instrument_id=symbol,
+                open_time_ns=open_time_ns,
+                close_time_ns=close_time_ns,
+                available_time_ns=close_time_ns + 1,
+                close=Decimal(100 + index),
+                quote_volume=Decimal(volume),
+            )
+        )
+    return output
+
+
+def test_liquidity_median_requires_a_complete_calendar_window() -> None:
+    """Spec 7.1 item 3's "trailing 30-day median quote_volume" is a calendar
+    span ending at the decision, and that window must be complete -- the same
+    requirement as `_annualised_volatility`'s (panel_signals.py), and for a
+    sharper reason here: a subset median is not merely a smaller sample, it
+    is a biased one, because days go missing non-randomly -- concentrated on
+    halted, dormant, and delisting-adjacent contracts, exactly where the
+    missing days are the low-volume ones -- and the liquidity floor is a
+    one-sided gate. Only two of a ten-calendar-day window's days have any
+    bar at all, both carrying an enormous volume (50,000,000); the other
+    eight are an interior hole. A pre-fix, merely calendar-bounded window
+    would compute a median from only those two present values and admit the
+    contract at 50,000,000 -- the reviewer's own measured failure mode on
+    the real capture, reproduced here from first principles. Requiring
+    completeness excludes the contract instead, regardless of how high the
+    partial median would be."""
+    day_volumes = {16: "50000000", 17: "50000000"}
+    rules = PanelUniverseRules(
+        minimum_history_days=2,
+        liquidity_window_days=10,
+        minimum_median_quote_volume=Decimal("5000000"),
+        maximum_contracts=1,
+        minimum_contracts=1,
+        tier_one_rank_limit=1,
+    )
+    histories = build_contract_histories(tuple(bars_on_days("AAAUSDT", day_volumes)))
+    decision = _close_time_ns(17)
+    snapshot = select_universe(histories, decision_close_ns=decision, rules=rules)
+    assert snapshot.contracts == ()
+    assert snapshot.reason_codes == ("UNIVERSE_TOO_SMALL",)
+
+
+def test_liquidity_median_admits_a_genuinely_complete_calendar_window() -> None:
+    """Sanity counterpart to the completeness test above: with every day of a
+    ten-calendar-day window present and above the floor, the contract must
+    still be admitted -- the fix requires completeness, it does not turn the
+    liquidity filter into an unconditional exclusion."""
+    day_volumes = {day: "10000000" for day in range(8, 18)}
+    rules = PanelUniverseRules(
+        minimum_history_days=10,
+        liquidity_window_days=10,
+        minimum_median_quote_volume=Decimal("5000000"),
+        maximum_contracts=1,
+        minimum_contracts=1,
+        tier_one_rank_limit=1,
+    )
+    histories = build_contract_histories(tuple(bars_on_days("AAAUSDT", day_volumes)))
+    decision = _close_time_ns(17)
+    snapshot = select_universe(histories, decision_close_ns=decision, rules=rules)
+    assert [item.contract_id for item in snapshot.contracts] == ["AAAUSDT:0"]
+    assert snapshot.contracts[0].median_quote_volume == Decimal("10000000")
+
+
 def test_equal_medians_break_ties_by_contract_id() -> None:
     # All three contracts carry the same volume, so their medians tie exactly; the
     # rows are added out of alphabetical order so the assertion cannot pass merely

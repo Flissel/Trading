@@ -4,8 +4,13 @@ from pathlib import Path
 
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
-from trading_bot.panel_signals import _normalise, _water_fill, build_weight_vectors
-from trading_bot.panel_universe import build_contract_histories, select_universe
+from trading_bot.panel_signals import (
+    _annualised_volatility,
+    _normalise,
+    _water_fill,
+    build_weight_vectors,
+)
+from trading_bot.panel_universe import ContractHistory, build_contract_histories, select_universe
 
 DAY_NS = 86_400_000_000_000
 SPEC, _ = load_panel_family_spec(Path("configs/xs-momentum-panel-v1.json"))
@@ -327,3 +332,100 @@ def test_weight_vectors_are_unaffected_by_a_bar_one_day_after_the_decision() -> 
     vectors_with = build_weight_vectors(histories_with, snapshot_with, spec=SPEC)
     vectors_without = build_weight_vectors(histories_without, snapshot_without, spec=SPEC)
     assert vectors_with == vectors_without
+
+
+def test_annualised_volatility_requires_a_complete_calendar_window() -> None:
+    """Spec 8.1's `sigma_30d` is "the trailing 30-day standard deviation of daily
+    log returns" -- a calendar span, not a count of whatever bars happen to be on
+    hand. Before this fix, `_annualised_volatility` took the last `window_days + 1`
+    *observations* regardless of the calendar span they covered: with day 3 of
+    0..6 missing, six observations (0, 1, 2, 4, 5, 6) still satisfy a `window_days
+    = 5` count, so the old code would reach back to day 0 and treat the two-day
+    log return spanning the hole as an ordinary one-day move -- computing a number
+    instead of recognising the window is incomplete. The fix must return `None`."""
+    decision = 6 * DAY_NS
+    closes = {day * DAY_NS: Decimal(100) + Decimal(day) for day in (0, 1, 2, 4, 5, 6)}
+    history = ContractHistory(
+        contract_id="GAPUSDT:0",
+        instrument_id="GAPUSDT",
+        closes=closes,
+        quote_volumes={},
+        close_times=tuple(sorted(closes)),
+    )
+    assert _annualised_volatility(history, decision, window_days=5) is None
+
+
+def test_annualised_volatility_accepts_a_genuinely_complete_calendar_window() -> None:
+    """Sanity counterpart to the hole test above: with every day of the same span
+    present, the calendar-aware check must still produce a value rather than
+    turning into an unconditional `None`."""
+    decision = 6 * DAY_NS
+    closes = {day * DAY_NS: Decimal(100) + Decimal(day) for day in range(7)}
+    history = ContractHistory(
+        contract_id="FULLUSDT:0",
+        instrument_id="FULLUSDT",
+        closes=closes,
+        quote_volumes={},
+        close_times=tuple(sorted(closes)),
+    )
+    assert _annualised_volatility(history, decision, window_days=5) is not None
+
+
+def test_time_series_weights_exclude_a_contract_with_a_hole_in_its_volatility_window() -> None:
+    """End-to-end regression through `build_weight_vectors`, not just the helper in
+    isolation: a contract that is otherwise eligible and trending, but is missing
+    one bar inside the 30-day span ending at the decision, must drop out of every
+    time-series member at that decision. This exercises the mechanics of the
+    real-world instance that motivated the fix -- a calendar hole the daily
+    dumps never fill either -- reproduced from first principles rather than
+    from a fixture file. It does not reproduce that instance's own price
+    action: ICPUSDT was dormant by the time of its hole (flat price,
+    `quote_volume` exactly zero for 103 of the preceding 104 days, not
+    delisted -- it resumes trading days after the hole), which is a
+    separate, additional reason it is outside the eligible universe at the
+    decisions this hole affects -- see `panel_universe.py`'s liquidity and
+    rank filters.
+
+    Production's own config sets `liquidity_window_days` equal to
+    `volatility_window_days` (30 each), and the liquidity window must now
+    also be complete (this branch's other fix), so a hole inside the shared
+    span would drop the contract from the eligible universe entirely before
+    its volatility is ever computed -- unable to isolate what this test is
+    actually about. The liquidity window is narrowed to 5 days here (a
+    `model_copy`, not a change to the frozen config file) so the hole, at
+    day 90, sits inside the 30-day volatility window but outside the
+    5-day liquidity window ending at day 98 (days 94-98): the contract stays
+    eligible, and only its time-series membership is at stake."""
+    decision = 99 * DAY_NS - 1_000_000
+    bars = volatility_window_sensitive_panel()
+    gap_index = 90  # inside the 30-day volatility window (68..98), outside the 5-day
+    # liquidity window (94..98) narrowed for this test below.
+    gap_close_time_ns = (gap_index + 1) * DAY_NS - 1_000_000
+    bars_with_gap = tuple(
+        item
+        for item in bars
+        if not (item.instrument_id == "V000USDT" and item.close_time_ns == gap_close_time_ns)
+    )
+    assert len(bars_with_gap) == len(bars) - 1
+
+    narrow_liquidity_universe = SPEC.universe.model_copy(update={"liquidity_window_days": 5})
+    narrow_liquidity_spec = SPEC.model_copy(update={"universe": narrow_liquidity_universe})
+
+    histories = build_contract_histories(bars_with_gap)
+    snapshot = select_universe(
+        histories, decision_close_ns=decision, rules=narrow_liquidity_spec.universe
+    )
+    assert len(snapshot.contracts) == 40
+    assert "V000USDT:0" in {item.contract_id for item in snapshot.contracts}
+
+    vectors = build_weight_vectors(histories, snapshot, spec=narrow_liquidity_spec)
+    for member_name in ("ts_mom_4w", "ts_mom_12w"):
+        weight_ids = {contract_id for contract_id, _ in vectors[member_name].weights}
+        assert "V000USDT:0" not in weight_ids
+        assert any(f"V{index:03d}USDT:0" in weight_ids for index in range(1, 5))
+
+    vectors = build_weight_vectors(histories, snapshot, spec=SPEC)
+    for member_name in ("ts_mom_4w", "ts_mom_12w"):
+        weight_ids = {contract_id for contract_id, _ in vectors[member_name].weights}
+        assert "V000USDT:0" not in weight_ids
+        assert any(f"V{index:03d}USDT:0" in weight_ids for index in range(1, 5))

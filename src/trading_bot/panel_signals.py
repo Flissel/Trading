@@ -178,12 +178,25 @@ def _normalise(weights: dict[str, Decimal]) -> dict[str, Decimal]:
 def _annualised_volatility(
     history: ContractHistory, decision_close_ns: int, window_days: int
 ) -> Decimal | None:
-    observed = [value for value in history.close_times if value <= decision_close_ns]
-    window = observed[-(window_days + 1) :]
-    if len(window) < window_days + 1:
+    """Trailing `window_days`-day standard deviation of daily log returns (spec 8.1).
+
+    "30-day" means a calendar span, not a count of whatever bars happen to be on
+    hand: the window is the `window_days + 1` consecutive daily closes ending at
+    `decision_close_ns`, spaced exactly one day apart, with no hole. A series
+    with a gap inside that span does not silently reach further back to find
+    enough observations -- reaching further back would let one log return
+    computed across the hole (a multi-day move) stand in for an ordinary
+    one-day move, understating volatility. It returns `None` instead, the same
+    signal already used for an insufficient history, so the contract simply
+    drops out of the time-series members at this decision.
+    """
+    expected_close_times = tuple(
+        decision_close_ns - day_offset * DAY_NS for day_offset in range(window_days, -1, -1)
+    )
+    if any(close_time not in history.closes for close_time in expected_close_times):
         return None
     log_returns: list[Decimal] = []
-    for previous, current in pairwise(window):
+    for previous, current in pairwise(expected_close_times):
         earlier = history.closes[previous]
         later = history.closes[current]
         if earlier <= 0 or later <= 0:
