@@ -1,7 +1,7 @@
 """Weekly portfolio accounting for the perpetual panel."""
 
 from dataclasses import dataclass
-from decimal import Context, Decimal, localcontext
+from decimal import Context, Decimal, Inexact, localcontext
 
 from trading_bot.panel_config import PanelCostTable
 from trading_bot.panel_reader import FundingEvent
@@ -17,7 +17,14 @@ _BPS = Decimal(10_000)
 # under the default context can round, silently breaking the invariant (relied
 # on by callers pooling per-contract totals across many episodes) that an
 # episode's own net_contributions sum to its own net_return exactly.
+#
+# Real inputs need roughly 32 digits of headroom (measured); prec=50 leaves
+# ample margin. Inexact is trapped so that margin is an enforced guarantee,
+# not an assumption: if it is ever exceeded, this raises immediately rather
+# than silently rounding to a net_return that no longer matches its own
+# contract breakdown.
 _NET_RETURN_CONTEXT = Context(prec=50)
+_NET_RETURN_CONTEXT.traps[Inexact] = True
 
 
 class PanelAccountingError(RuntimeError):
@@ -148,8 +155,14 @@ def evaluate_episode(
     # to round (see its definition) -- an exact sum is associative, so any
     # caller regrouping this same per-contract money (by episode or by
     # contract) later necessarily agrees with it to the last digit too.
-    with localcontext(_NET_RETURN_CONTEXT):
-        net_return = sum(net_contributions.values(), Decimal(0))
+    try:
+        with localcontext(_NET_RETURN_CONTEXT):
+            net_return = sum(net_contributions.values(), Decimal(0))
+    except Inexact as error:
+        raise PanelAccountingError(
+            "net_return summation exceeded its precision headroom (_NET_RETURN_CONTEXT) -- "
+            "net_return can no longer be guaranteed to match its own contract breakdown"
+        ) from error
     denominator = Decimal(1) + gross_return
     drifted: dict[str, Decimal] = {}
     for contract_id, weight in weight_map.items():
