@@ -407,3 +407,22 @@ def test_total_loss_on_a_fully_invested_vector_zeroes_every_drifted_weight() -> 
     drifted = dict(result.drifted_weights)
     assert drifted["A:0"] == Decimal("0")
     assert drifted["B:0"] == Decimal("0")
+
+
+def test_fee_overrides_apply_per_contract() -> None:
+    plain = evaluate_episode(
+        sample_id="s", member="m", decision_close_ns=DECISION, holding_days=7,
+        weights=WEIGHTS, previous_weights=(), histories=histories(), tiers=TIERS,
+        funding_by_contract={}, cost_table=BASE,
+    )
+    overridden = evaluate_episode(
+        sample_id="s", member="m", decision_close_ns=DECISION, holding_days=7,
+        weights=WEIGHTS, previous_weights=(), histories=histories(), tiers=TIERS,
+        funding_by_contract={}, cost_table=BASE,
+        fee_overrides={"A:0": Decimal("10")},
+    )
+    # A:0 turnover 0.5 at (10 + 5) bps instead of (5 + 5): +0.5 * 5 / 10000
+    assert overridden.trading_cost - plain.trading_cost == Decimal("0.00025")
+    plain_net = dict(plain.contract_net_contributions)
+    overridden_net = dict(overridden.contract_net_contributions)
+    assert overridden_net["B:0"] == plain_net["B:0"]

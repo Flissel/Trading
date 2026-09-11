@@ -62,6 +62,7 @@ def evaluate_episode(
     tiers: dict[str, int],
     funding_by_contract: dict[str, tuple[FundingEvent, ...]],
     cost_table: PanelCostTable,
+    fee_overrides: dict[str, Decimal] | None = None,
 ) -> EpisodeResult:
     """Evaluate one weekly rebalance under a single cost table."""
     if holding_days < 1:
@@ -69,6 +70,7 @@ def evaluate_episode(
     exit_close_ns = decision_close_ns + holding_days * DAY_NS
     weight_map = dict(weights)
     previous_map = dict(previous_weights)
+    overrides = fee_overrides or {}
 
     returns: dict[str, Decimal] = {}
     forced: set[str] = set()
@@ -106,7 +108,9 @@ def evaluate_episode(
             continue
         turnover += change
         trading_by_contract[contract_id] = (
-            change * _per_side_bps(cost_table, tiers.get(contract_id, 2)) / _BPS
+            change
+            * _per_side_bps(cost_table, tiers.get(contract_id, 2), overrides.get(contract_id))
+            / _BPS
         )
     trading_cost = sum(trading_by_contract.values(), Decimal(0))
 
@@ -129,7 +133,7 @@ def evaluate_episode(
     for contract_id in sorted(forced):
         forced_by_id[contract_id] = (
             abs(weight_map[contract_id])
-            * _per_side_bps(cost_table, tiers.get(contract_id, 2))
+            * _per_side_bps(cost_table, tiers.get(contract_id, 2), overrides.get(contract_id))
             / _BPS
             * cost_table.forced_close_multiplier
         )
@@ -192,10 +196,10 @@ def evaluate_episode(
     )
 
 
-def _per_side_bps(cost_table: PanelCostTable, tier: int) -> Decimal:
+def _per_side_bps(cost_table: PanelCostTable, tier: int, fee: Decimal | None = None) -> Decimal:
     slippage = (
         cost_table.slippage_bps_per_side_tier_one
         if tier == 1
         else cost_table.slippage_bps_per_side_tier_two
     )
-    return cost_table.fee_bps_per_side + slippage
+    return (cost_table.fee_bps_per_side if fee is None else fee) + slippage
