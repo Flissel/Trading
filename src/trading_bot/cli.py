@@ -10,7 +10,7 @@ from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
 from trading_bot.panel_capture import capture_panel, repair_panel_capture
-from trading_bot.panel_config import load_panel_family_spec
+from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_decision import build_panel_decision
 from trading_bot.panel_fold_run import run_panel_fold
 from trading_bot.panel_samples import publish_panel_walk_forward
@@ -93,6 +93,7 @@ def main(arguments: list[str] | None = None) -> int:
     panel_manifest.add_argument("--capture", type=Path, required=True)
     panel_manifest.add_argument("--output", type=Path, required=True)
     panel_manifest.add_argument("--family-spec", type=Path, required=True)
+    panel_manifest.add_argument("--hedge-capture", type=Path, default=None)
     panel_fold = commands.add_parser("panel-fold")
     panel_fold.add_argument("--workspace-root", type=Path, default=Path.cwd())
     panel_fold.add_argument("--capture", type=Path, required=True)
@@ -251,12 +252,18 @@ def main(arguments: list[str] | None = None) -> int:
         )
         if any(not path.is_relative_to(workspace) for path in manifest_paths):
             raise ValueError("panel manifest paths must stay inside workspace")
-        spec, spec_hash = load_panel_family_spec(manifest_paths[2])
+        hedge_capture_root = (
+            parsed.hedge_capture.resolve() if parsed.hedge_capture is not None else None
+        )
+        if hedge_capture_root is not None and not hedge_capture_root.is_relative_to(workspace):
+            raise ValueError("panel manifest paths must stay inside workspace")
+        spec, spec_hash = load_family_spec(manifest_paths[2])
         publish_panel_walk_forward(
             manifest_paths[0],
             output_path=manifest_paths[1],
             spec=spec,
             family_spec_hash=spec_hash,
+            hedge_capture_root=hedge_capture_root,
         )
         return 0
     if parsed.command == "panel-fold":

@@ -9,9 +9,11 @@ from pathlib import Path
 
 import pytest
 
+import trading_bot.panel_samples as panel_samples_module
+from tests.carry_fixtures import build_captures, small_carry_config, spot_fetch_with_a_hole
 from trading_bot.canonical import content_sha256
 from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_panel
-from trading_bot.panel_config import PanelFoldGeometry, load_panel_family_spec
+from trading_bot.panel_config import PanelFoldGeometry, load_family_spec, load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
 from trading_bot.panel_samples import (
     _MAX_MISSING_DAYS_PER_INSTRUMENT,
@@ -21,6 +23,7 @@ from trading_bot.panel_samples import (
     derive_panel_config,
     publish_panel_walk_forward,
     rebalance_close_times,
+    verify_panel_manifest,
 )
 from trading_bot.splits import build_walk_forward_views
 
@@ -649,3 +652,73 @@ def test_enforce_capture_quality_rejects_a_day_that_was_never_actually_missing(
     )
     with pytest.raises(PanelSamplesError, match="inconsistent with the published dataset"):
         _enforce_capture_quality(quality_report, capture_manifest, gapless_bars)
+
+
+def test_manifest_binds_a_hedge_capture(tmp_path: Path) -> None:
+    perp, spot = build_captures(tmp_path)
+    spec, spec_hash = load_family_spec(small_carry_config(tmp_path))
+    artifact = publish_panel_walk_forward(
+        perp, output_path=tmp_path / "m.json", spec=spec,
+        family_spec_hash=spec_hash, hedge_capture_root=spot,
+    )
+    manifest = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    spot_manifest = json.loads((spot / "capture-manifest.json").read_text(encoding="utf-8"))
+    spot_dataset = json.loads(
+        (spot / "dataset" / "dataset-manifest.json").read_text(encoding="utf-8")
+    )
+    assert manifest["hedge_capture_root_hash"] == spot_manifest["capture_root_hash"]
+    assert manifest["hedge_dataset_root_hash"] == spot_dataset["root_hash"]
+    assert manifest["hedge_absent_at_source_days"] == {}
+    assert manifest["family_name"] == "funding_carry_panel_v1"
+    assert manifest["hedge_capture_root_hash"] != manifest["capture_root_hash"]
+    assert verify_panel_manifest(artifact.output_path)
+
+
+def test_manifest_without_a_hedge_has_no_hedge_keys(tmp_path: Path) -> None:
+    perp, _ = build_captures(tmp_path)
+    spec, spec_hash = load_family_spec(small_carry_config(tmp_path))
+    artifact = publish_panel_walk_forward(
+        perp, output_path=tmp_path / "m.json", spec=spec, family_spec_hash=spec_hash,
+    )
+    manifest = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    assert not any(key.startswith("hedge_") for key in manifest)
+
+
+def test_hedge_capture_names_its_absent_at_source_days(tmp_path: Path) -> None:
+    perp, spot = build_captures(tmp_path, spot_fetch_function=spot_fetch_with_a_hole)
+    spec, spec_hash = load_family_spec(small_carry_config(tmp_path))
+    artifact = publish_panel_walk_forward(
+        perp, output_path=tmp_path / "m.json", spec=spec,
+        family_spec_hash=spec_hash, hedge_capture_root=spot,
+    )
+    manifest = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    assert set(manifest["hedge_absent_at_source_days"]) == {"C00USDT"}
+    assert len(manifest["hedge_absent_at_source_days"]["C00USDT"]) == 3
+    assert manifest["absent_at_source_days"] == {}
+
+
+def test_hedge_capture_goes_through_the_same_quality_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    perp, spot = build_captures(tmp_path)
+    spec, spec_hash = load_family_spec(small_carry_config(tmp_path))
+    real_gate = panel_samples_module._enforce_capture_quality
+    seen: list[Path] = []
+
+    def gate(path: Path, manifest: dict[str, object], bars: object) -> dict[str, tuple[str, ...]]:
+        seen.append(path)
+        if path.is_relative_to(spot):
+            raise PanelSamplesError("CAPTURE_QUALITY_FAILED: hedge capture")
+        return real_gate(path, manifest, bars)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(panel_samples_module, "_enforce_capture_quality", gate)
+    with pytest.raises(PanelSamplesError, match="CAPTURE_QUALITY_FAILED"):
+        publish_panel_walk_forward(
+            perp, output_path=tmp_path / "m.json", spec=spec,
+            family_spec_hash=spec_hash, hedge_capture_root=spot,
+        )
+    assert seen == [
+        perp / "dataset" / "quality-report.json",
+        spot / "dataset" / "quality-report.json",
+    ]
+    assert not (tmp_path / "m.json").exists()

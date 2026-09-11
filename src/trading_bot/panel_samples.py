@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.carry_config import CarryFamilySpec
 from trading_bot.panel_capture import verify_panel_capture
 from trading_bot.panel_config import PanelFamilySpec, PanelFoldGeometry
 from trading_bot.panel_reader import PanelBar, load_panel_bars
@@ -93,8 +94,9 @@ def publish_panel_walk_forward(
     capture_root: Path,
     *,
     output_path: Path,
-    spec: PanelFamilySpec,
+    spec: PanelFamilySpec | CarryFamilySpec,
     family_spec_hash: str,
+    hedge_capture_root: Path | None = None,
 ) -> PanelManifestArtifact:
     valid, errors = verify_panel_capture(capture_root)
     if not valid:
@@ -126,6 +128,27 @@ def publish_panel_walk_forward(
             f"{spec.statistics.pooled_episode_floor}"
         )
 
+    hedge: dict[str, object] = {}
+    if hedge_capture_root is not None:
+        hedge_valid, hedge_errors = verify_panel_capture(hedge_capture_root)
+        if not hedge_valid:
+            raise PanelSamplesError(
+                "hedge capture verification failed: " + ",".join(hedge_errors)
+            )
+        hedge_manifest = _load_object(hedge_capture_root / "capture-manifest.json")
+        hedge_dataset = _load_object(hedge_capture_root / "dataset" / "dataset-manifest.json")
+        hedge_bars = load_panel_bars(hedge_capture_root / "dataset")
+        hedge_absent = _enforce_capture_quality(
+            hedge_capture_root / "dataset" / "quality-report.json", hedge_manifest, hedge_bars
+        )
+        hedge = {
+            "hedge_capture_root_hash": str(hedge_manifest["capture_root_hash"]),
+            "hedge_dataset_root_hash": str(hedge_dataset["root_hash"]),
+            "hedge_absent_at_source_days": {
+                instrument_id: list(days) for instrument_id, days in sorted(hedge_absent.items())
+            },
+        }
+
     material: dict[str, object] = {
         "manifest_version": "1.0.0",
         "family_name": spec.family_name,
@@ -150,6 +173,7 @@ def publish_panel_walk_forward(
             instrument_id: list(days)
             for instrument_id, days in sorted(absent_at_source_days.items())
         },
+        **hedge,
     }
     manifest_hash = content_sha256(material)
     document = dict(material)
