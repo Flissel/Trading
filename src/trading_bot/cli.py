@@ -82,6 +82,7 @@ def main(arguments: list[str] | None = None) -> int:
     panel_capture.add_argument(
         "--month-to", default=None, help="latest YYYY-MM to keep when discovering months"
     )
+    panel_capture.add_argument("--market", choices=("um", "spot"), default="um")
     panel_capture_repair = commands.add_parser("panel-capture-repair")
     panel_capture_repair.add_argument("--workspace-root", type=Path, default=Path.cwd())
     panel_capture_repair.add_argument("--source-capture", type=Path, required=True)
@@ -225,6 +226,7 @@ def main(arguments: list[str] | None = None) -> int:
             months=months,
             month_from=parsed.month_from,
             month_to=parsed.month_to,
+            market=parsed.market,
         )
         return 0
     if parsed.command == "panel-capture-repair":

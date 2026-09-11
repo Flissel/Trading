@@ -663,11 +663,13 @@ def _progress_header(
     months: tuple[str, ...] | None,
     month_from: str | None = None,
     month_to: str | None = None,
+    market: str = "um",
 ) -> str:
     return json.dumps(
         {
             "capture_parameters": {
                 "capture_version": "1.0.0",
+                "market": market,
                 "symbols": list(symbols),
                 "months": list(months) if months is not None else None,
                 "month_from": month_from,
@@ -1851,3 +1853,82 @@ def test_repair_refuses_when_the_source_is_nested_inside_the_output(tmp_path: Pa
         )
     assert not (outer / "capture-manifest.json").exists()
     assert verify_panel_capture(source.capture_root) == (True, ())
+
+
+def test_spot_urls_use_the_spot_prefix() -> None:
+    from trading_bot.panel_capture import build_daily_kline_zip_url, build_kline_zip_url
+
+    assert build_kline_zip_url("BTCUSDT", "2024-01", market="spot") == (
+        "https://data.binance.vision/data/spot/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip"
+    )
+    assert build_daily_kline_zip_url("BTCUSDT", "2024-01-15", market="spot") == (
+        "https://data.binance.vision/data/spot/daily/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01-15.zip"
+    )
+    assert build_kline_zip_url("BTCUSDT", "2024-01") == (
+        "https://data.binance.vision/data/futures/um/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2024-01.zip"
+    )
+
+
+def test_spot_capture_fetches_no_funding_and_records_its_market(tmp_path: Path) -> None:
+    urls: list[str] = []
+
+    def fetch(url: str) -> PanelPayload:
+        urls.append(url)
+        assert "fundingRate" not in url
+        assert "/data/spot/" in url
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    artifact = capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "spot",
+        reserve_bytes=0,
+        symbols=("BTCUSDT",),
+        months=("2024-01",),
+        fetch=fetch,
+        market="spot",
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["market"] == "spot"
+    assert manifest["venue"] == "BINANCE_SPOT"
+    assert {s["kind"] for s in manifest["sources"]} == {"klines"}
+    dataset_manifest = json.loads(
+        (artifact.dataset_root / "dataset-manifest.json").read_text(encoding="utf-8")
+    )
+    assert dataset_manifest["funding_row_count"] == 0
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+    assert len(urls) == 1
+
+
+def test_default_market_manifest_names_um(tmp_path: Path) -> None:
+    def fetch(url: str) -> PanelPayload:
+        if "fundingRate" in url:
+            text = "calc_time,funding_interval_hours,last_funding_rate\n0,8,0.0001\n"
+            return PanelPayload(url=url, raw_bytes=zip_bytes("f.csv", text), received_time_ns=1)
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    artifact = capture_panel(
+        workspace_root=tmp_path, output_directory=tmp_path / "um", reserve_bytes=0,
+        symbols=("BTCUSDT",), months=("2024-01",), fetch=fetch,
+    )
+    manifest = json.loads(artifact.capture_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["market"] == "um"
+    assert manifest["venue"] == "BINANCE_UM"
+
+
+def test_repair_of_a_spot_capture_stays_on_the_spot_market(tmp_path: Path) -> None:
+    def fetch(url: str) -> PanelPayload:
+        assert "/data/spot/" in url
+        return PanelPayload(url=url, raw_bytes=zip_bytes("k.csv", kline_csv(3)), received_time_ns=1)
+
+    source = capture_panel(
+        workspace_root=tmp_path, output_directory=tmp_path / "spot", reserve_bytes=0,
+        symbols=("BTCUSDT",), months=("2024-01",), fetch=fetch, market="spot",
+    )
+    repaired = repair_panel_capture(
+        workspace_root=tmp_path, source_capture_root=source.capture_root,
+        output_directory=tmp_path / "spot-repaired", reserve_bytes=0, fetch=fetch,
+    )
+    manifest = json.loads(repaired.capture_manifest_path.read_text(encoding="utf-8"))
+    assert manifest["market"] == "spot"
+    assert manifest["venue"] == "BINANCE_SPOT"
+    assert verify_panel_capture(repaired.capture_root) == (True, ())

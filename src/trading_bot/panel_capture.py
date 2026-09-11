@@ -1,4 +1,8 @@
-"""Bounded capture of Binance USD-M daily klines and funding from public dumps."""
+"""Bounded capture of Binance daily klines and funding from public dumps.
+
+Covers both the USD-M perpetuals market ("um") and the spot market
+("spot"); funding exists only on "um" -- the spot market has none.
+"""
 
 import csv
 import hashlib
@@ -18,7 +22,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any, Literal, TextIO
 
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_dataset import (
@@ -35,7 +39,10 @@ from trading_bot.storage import StoragePolicy
 _ALLOWED_PANEL_HOSTS = frozenset(
     {"data.binance.vision", "s3-ap-northeast-1.amazonaws.com", "fapi.binance.com"}
 )
-_VENUE = "BINANCE_UM"
+Market = Literal["um", "spot"]
+_MARKET_PATH: dict[str, str] = {"um": "data/futures/um", "spot": "data/spot"}
+_MARKET_VENUE: dict[str, str] = {"um": "BINANCE_UM", "spot": "BINANCE_SPOT"}
+_VENUE = _MARKET_VENUE["um"]
 _MAX_ZIP_BYTES = 32_000_000
 _MONTH_PATTERN = re.compile(r"^\d{4}-\d{2}$")
 _DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -47,6 +54,18 @@ _CAPTURE_VERSION = "1.0.0"
 # itself) so the manifest keeps provenance explicit: a reader can always tell
 # a monthly row from a gap-filled one.
 _DAILY_FILL_KIND = "klines_daily_fill"
+
+
+def venue_for_market(market: str) -> str:
+    if market not in _MARKET_VENUE:
+        raise PanelCaptureError(f"invalid panel market: {market}")
+    return _MARKET_VENUE[market]
+
+
+def _market_path(market: str) -> str:
+    if market not in _MARKET_PATH:
+        raise PanelCaptureError(f"invalid panel market: {market}")
+    return _MARKET_PATH[market]
 
 
 class PanelCaptureError(RuntimeError):
@@ -136,22 +155,22 @@ class PanelZipClient:
         ) from last_error
 
 
-def build_kline_zip_url(symbol: str, month: str) -> str:
+def build_kline_zip_url(symbol: str, month: str, *, market: str = "um") -> str:
     _validate_symbol(symbol)
     _validate_month(month)
     return (
-        "https://data.binance.vision/data/futures/um/monthly/klines/"
+        f"https://data.binance.vision/{_market_path(market)}/monthly/klines/"
         f"{symbol}/1d/{symbol}-1d-{month}.zip"
     )
 
 
-def build_daily_kline_zip_url(symbol: str, date: str) -> str:
+def build_daily_kline_zip_url(symbol: str, date: str, *, market: str = "um") -> str:
     """URL of one day's kline dump -- used only to patch a gap in the monthly
     aggregate, never as the primary source for a month already covered."""
     _validate_symbol(symbol)
     _validate_date(date)
     return (
-        "https://data.binance.vision/data/futures/um/daily/klines/"
+        f"https://data.binance.vision/{_market_path(market)}/daily/klines/"
         f"{symbol}/1d/{symbol}-1d-{date}.zip"
     )
 
@@ -165,8 +184,8 @@ def build_funding_zip_url(symbol: str, month: str) -> str:
     )
 
 
-def build_month_listing_url(symbol: str, kind: str) -> str:
-    prefix = _listing_prefix(symbol, kind)
+def build_month_listing_url(symbol: str, kind: str, *, market: str = "um") -> str:
+    prefix = _listing_prefix(symbol, kind, market)
     encoded_prefix = urllib.parse.quote(prefix, safe="")
     url = (
         "https://s3-ap-northeast-1.amazonaws.com/data.binance.vision"
@@ -176,7 +195,9 @@ def build_month_listing_url(symbol: str, kind: str) -> str:
     return url
 
 
-def discover_panel_months(fetch: PanelFetch, *, symbol: str, kind: str) -> tuple[str, ...]:
+def discover_panel_months(
+    fetch: PanelFetch, *, symbol: str, kind: str, market: str = "um"
+) -> tuple[str, ...]:
     """Ask the bucket which months a symbol actually has for one source kind.
 
     A symbol has at most about eighty months of history, so a single page of
@@ -186,12 +207,14 @@ def discover_panel_months(fetch: PanelFetch, *, symbol: str, kind: str) -> tuple
     or a key count at the page limit) is a hard failure rather than a silent
     partial list.
     """
-    url = build_month_listing_url(symbol, kind)
+    url = build_month_listing_url(symbol, kind, market=market)
     payload = fetch(url)
-    return _parse_listing_months(payload.raw_bytes, symbol=symbol, kind=kind)
+    return _parse_listing_months(payload.raw_bytes, symbol=symbol, kind=kind, market=market)
 
 
-def parse_kline_zip(payload: PanelPayload, *, symbol: str) -> tuple[PanelCandleRow, ...]:
+def parse_kline_zip(
+    payload: PanelPayload, *, symbol: str, venue: str = _VENUE
+) -> tuple[PanelCandleRow, ...]:
     digest = hashlib.sha256(payload.raw_bytes).hexdigest()
     rows: list[PanelCandleRow] = []
     for record in _zip_rows(payload.raw_bytes):
@@ -203,7 +226,7 @@ def parse_kline_zip(payload: PanelPayload, *, symbol: str) -> tuple[PanelCandleR
         close_time_ns = int(record[6]) * 1_000_000
         rows.append(
             PanelCandleRow(
-                venue=_VENUE,
+                venue=venue,
                 instrument_id=symbol,
                 open_time_ns=open_time_ns,
                 close_time_ns=close_time_ns,
@@ -222,7 +245,9 @@ def parse_kline_zip(payload: PanelPayload, *, symbol: str) -> tuple[PanelCandleR
     return tuple(rows)
 
 
-def parse_funding_zip(payload: PanelPayload, *, symbol: str) -> tuple[PanelFundingRow, ...]:
+def parse_funding_zip(
+    payload: PanelPayload, *, symbol: str, venue: str = _VENUE
+) -> tuple[PanelFundingRow, ...]:
     rows: list[PanelFundingRow] = []
     for record in _zip_rows(payload.raw_bytes):
         if record[0].startswith("calc_time"):
@@ -231,7 +256,7 @@ def parse_funding_zip(payload: PanelPayload, *, symbol: str) -> tuple[PanelFundi
             raise PanelCaptureError("funding row has too few columns")
         rows.append(
             PanelFundingRow(
-                venue=_VENUE,
+                venue=venue,
                 instrument_id=symbol,
                 calc_time_ns=int(record[0]) * 1_000_000,
                 funding_interval_hours=int(record[1]),
@@ -251,6 +276,7 @@ def capture_panel(
     month_from: str | None = None,
     month_to: str | None = None,
     fetch: PanelFetch | None = None,
+    market: str = "um",
 ) -> PanelCaptureArtifact:
     if not symbols:
         raise PanelCaptureError("panel capture needs at least one symbol and one month")
@@ -265,6 +291,7 @@ def capture_panel(
         _validate_month(month_to)
     if month_from is not None and month_to is not None and month_from > month_to:
         raise PanelCaptureError("month_from must not be after month_to")
+    venue = venue_for_market(market)
     workspace = workspace_root.resolve()
     target = output_directory.resolve()
     StoragePolicy(workspace, reserve_bytes).authorize(
@@ -302,6 +329,7 @@ def capture_panel(
     # being parsed into the dataset.
     capture_parameters: dict[str, object] = {
         "capture_version": _CAPTURE_VERSION,
+        "market": market,
         "symbols": list(symbols),
         "months": list(months) if months is not None else None,
         "month_from": month_from,
@@ -333,14 +361,16 @@ def capture_panel(
             symbol_has_no_months_inside_bounds = False
             if months is not None:
                 kline_months: tuple[str, ...] = months
-                funding_months: tuple[str, ...] = months
+                funding_months: tuple[str, ...] = months if market == "um" else ()
                 ordered_months: tuple[str, ...] = months
             else:
                 discovered_kline_months = discover_panel_months(
-                    download, symbol=symbol, kind="klines"
+                    download, symbol=symbol, kind="klines", market=market
                 )
-                discovered_funding_months = discover_panel_months(
-                    download, symbol=symbol, kind="fundingRate"
+                discovered_funding_months = (
+                    discover_panel_months(download, symbol=symbol, kind="fundingRate")
+                    if market == "um"
+                    else ()
                 )
                 kline_months = _bounded_months(discovered_kline_months, month_from, month_to)
                 funding_months = _bounded_months(discovered_funding_months, month_from, month_to)
@@ -354,7 +384,7 @@ def capture_panel(
                 )
             for month in ordered_months:
                 for kind, url_builder, kind_months in (
-                    ("klines", build_kline_zip_url, kline_months),
+                    ("klines", lambda s, m: build_kline_zip_url(s, m, market=market), kline_months),
                     ("fundingRate", build_funding_zip_url, funding_months),
                 ):
                     if month not in kind_months:
@@ -380,11 +410,13 @@ def capture_panel(
                                 received_time_ns=int(done["received_time_ns"]),
                             )
                             if kind == "klines":
-                                rows = parse_kline_zip(payload, symbol=symbol)
+                                rows = parse_kline_zip(payload, symbol=symbol, venue=venue)
                                 candles.extend(rows)
                                 symbol_candle_row_count += len(rows)
                             else:
-                                funding.extend(parse_funding_zip(payload, symbol=symbol))
+                                funding.extend(
+                                    parse_funding_zip(payload, symbol=symbol, venue=venue)
+                                )
                         continue
                     url = url_builder(symbol, month)
                     try:
@@ -427,11 +459,11 @@ def capture_panel(
                     progress_handle.write("\n")
                     progress_handle.flush()
                     if kind == "klines":
-                        rows = parse_kline_zip(payload, symbol=symbol)
+                        rows = parse_kline_zip(payload, symbol=symbol, venue=venue)
                         candles.extend(rows)
                         symbol_candle_row_count += len(rows)
                     else:
-                        funding.extend(parse_funding_zip(payload, symbol=symbol))
+                        funding.extend(parse_funding_zip(payload, symbol=symbol, venue=venue))
             if symbol_candle_row_count == 0 and not symbol_has_no_months_inside_bounds:
                 raise PanelCaptureError(
                     f"symbol {symbol} produced no candle rows across every requested month"
@@ -450,6 +482,8 @@ def capture_panel(
                 sources=sources,
                 already_done=already_done,
                 progress_handle=progress_handle,
+                market=market,
+                venue=venue,
             )
         )
     if not raw_root.is_dir():
@@ -465,7 +499,8 @@ def capture_panel(
     )
     material: dict[str, object] = {
         "capture_version": _CAPTURE_VERSION,
-        "venue": _VENUE,
+        "market": market,
+        "venue": venue,
         "interval": "1d",
         "symbols": list(symbols),
         "months": list(months) if months is not None else None,
@@ -537,6 +572,8 @@ def repair_panel_capture(
         )
     source_manifest = _load_capture_manifest(source_root)
     source_capture_root_hash = str(source_manifest["capture_root_hash"])
+    market = str(source_manifest.get("market", "um"))
+    venue = venue_for_market(market)
     source_sources = source_manifest.get("sources")
     if not isinstance(source_sources, list):
         raise PanelCaptureError("source panel capture manifest is malformed")
@@ -645,9 +682,9 @@ def repair_panel_capture(
                 # a later repair, so a klines-shaped row can arrive under
                 # either kind.
                 if kind in ("klines", _DAILY_FILL_KIND):
-                    candles.extend(parse_kline_zip(payload, symbol=symbol))
+                    candles.extend(parse_kline_zip(payload, symbol=symbol, venue=venue))
                 elif kind == "fundingRate":
-                    funding.extend(parse_funding_zip(payload, symbol=symbol))
+                    funding.extend(parse_funding_zip(payload, symbol=symbol, venue=venue))
         admitted_candles, _ = admit_candles(tuple(candles))
         missing_days = find_missing_days(admitted_candles)
         candles.extend(
@@ -658,6 +695,8 @@ def repair_panel_capture(
                 sources=sources,
                 already_done=already_done,
                 progress_handle=progress_handle,
+                market=market,
+                venue=venue,
             )
         )
     if not raw_root.is_dir():
@@ -673,7 +712,8 @@ def repair_panel_capture(
     )
     material: dict[str, object] = {
         "capture_version": _CAPTURE_VERSION,
-        "venue": _VENUE,
+        "market": market,
+        "venue": venue,
         "interval": "1d",
         "symbols": source_manifest.get("symbols"),
         "months": source_manifest.get("months"),
@@ -777,20 +817,23 @@ def _load_capture_manifest(capture_root: Path) -> dict[str, object]:
     return manifest
 
 
-def _listing_prefix(symbol: str, kind: str) -> str:
+def _listing_prefix(symbol: str, kind: str, market: str = "um") -> str:
     _validate_symbol(symbol)
     if kind == "klines":
-        return f"data/futures/um/monthly/klines/{symbol}/1d/"
+        return f"{_market_path(market)}/monthly/klines/{symbol}/1d/"
     if kind == "fundingRate":
-        return f"data/futures/um/monthly/fundingRate/{symbol}/"
+        if market != "um":
+            raise PanelCaptureError("funding exists only on the um market")
+        return "data/futures/um/monthly/fundingRate/" + f"{symbol}/"
     raise PanelCaptureError(f"invalid panel source kind: {kind}")
 
 
-def _listing_key_pattern(symbol: str, kind: str) -> re.Pattern[str]:
+def _listing_key_pattern(symbol: str, kind: str, market: str = "um") -> re.Pattern[str]:
     escaped = re.escape(symbol)
+    base = re.escape(_market_path(market))
     if kind == "klines":
         return re.compile(
-            rf"^data/futures/um/monthly/klines/{escaped}/1d/{escaped}-1d-(\d{{4}}-\d{{2}})\.zip$"
+            rf"^{base}/monthly/klines/{escaped}/1d/{escaped}-1d-(\d{{4}}-\d{{2}})\.zip$"
         )
     return re.compile(
         rf"^data/futures/um/monthly/fundingRate/{escaped}/"
@@ -798,7 +841,9 @@ def _listing_key_pattern(symbol: str, kind: str) -> re.Pattern[str]:
     )
 
 
-def _parse_listing_months(raw: bytes, *, symbol: str, kind: str) -> tuple[str, ...]:
+def _parse_listing_months(
+    raw: bytes, *, symbol: str, kind: str, market: str = "um"
+) -> tuple[str, ...]:
     try:
         root = ET.fromstring(raw)
     except ET.ParseError as error:
@@ -834,7 +879,7 @@ def _parse_listing_months(raw: bytes, *, symbol: str, kind: str) -> tuple[str, .
         )
     # The strict pattern re-confirms the exact symbol on every key, so a
     # prefix collision (BTCUSDT vs. BTCUSDTX) can never leak a foreign month.
-    pattern = _listing_key_pattern(symbol, kind)
+    pattern = _listing_key_pattern(symbol, kind, market)
     months = {match.group(1) for key in keys if (match := pattern.match(key)) is not None}
     return tuple(sorted(months))
 
@@ -994,6 +1039,8 @@ def _fill_gap_days(
     sources: list[dict[str, object]],
     already_done: dict[tuple[str, str, str], dict[str, Any]],
     progress_handle: TextIO,
+    market: str = "um",
+    venue: str = _VENUE,
 ) -> list[PanelCandleRow]:
     """Fetch every missing interior day from the daily kline dumps and
     return the resulting candle rows.
@@ -1029,11 +1076,14 @@ def _fill_gap_days(
                     )
                     filled.append(
                         _parse_single_daily_fill_row(
-                            payload, symbol=symbol, expected_open_time_ns=day_open_time_ns
+                            payload,
+                            symbol=symbol,
+                            expected_open_time_ns=day_open_time_ns,
+                            venue=venue,
                         )
                     )
                 continue
-            url = build_daily_kline_zip_url(symbol, date)
+            url = build_daily_kline_zip_url(symbol, date, market=market)
             try:
                 payload = download(url)
             except PanelSourceAbsent:
@@ -1058,7 +1108,7 @@ def _fill_gap_days(
             # for this URL again, so it would keep re-reading and
             # re-rejecting the same bad payload forever.
             row = _parse_single_daily_fill_row(
-                payload, symbol=symbol, expected_open_time_ns=day_open_time_ns
+                payload, symbol=symbol, expected_open_time_ns=day_open_time_ns, venue=venue
             )
             relative = f"raw/{symbol}/{_DAILY_FILL_KIND}-{date}.zip"
             path = target / relative
@@ -1083,9 +1133,9 @@ def _fill_gap_days(
 
 
 def _parse_single_daily_fill_row(
-    payload: PanelPayload, *, symbol: str, expected_open_time_ns: int
+    payload: PanelPayload, *, symbol: str, expected_open_time_ns: int, venue: str = _VENUE
 ) -> PanelCandleRow:
-    rows = parse_kline_zip(payload, symbol=symbol)
+    rows = parse_kline_zip(payload, symbol=symbol, venue=venue)
     if len(rows) != 1 or rows[0].open_time_ns != expected_open_time_ns:
         raise PanelCaptureError(
             f"daily kline dump for {symbol} did not contain exactly the requested day "
