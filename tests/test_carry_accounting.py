@@ -1,7 +1,7 @@
 # tests/test_carry_accounting.py
 from decimal import Decimal
 
-from trading_bot.carry_accounting import CarryEpisode, evaluate_carry_episode
+from trading_bot.carry_accounting import CarryEpisode, _aggregate_to_pairs, evaluate_carry_episode
 from trading_bot.carry_config import CarryCostTable
 from trading_bot.panel_reader import FundingEvent
 from trading_bot.panel_universe import ContractHistory
@@ -115,3 +115,15 @@ def test_previous_spot_leg_exit_is_charged_the_spot_fee() -> None:
     assert episode.spot_trading_cost == Decimal("0.00075")
     assert episode.perpetual_trading_cost == Decimal("0.0005")
     assert episode.result.trading_cost == Decimal("0.00125")
+
+
+def test_pair_aggregation_is_exact_beyond_default_decimal_precision() -> None:
+    """Pair-level regrouping must reconstitute an exact sum, not the default
+    28-significant-digit rounding: two per-leg contributions whose exact sum
+    needs 29 digits must not silently round down to 28 in the pair total."""
+    contributions = (
+        ("perp:A:0", Decimal("9.999999999999999999999999999")),
+        ("spot:A:7", Decimal("5E-27")),
+    )
+    aggregated = _aggregate_to_pairs(contributions, PAIR_OF)
+    assert dict(aggregated)["A:0"] == Decimal("10.000000000000000000000000004")

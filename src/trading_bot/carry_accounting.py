@@ -1,10 +1,15 @@
 """Two-leg carry episodes on top of the panel accounting."""
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, Inexact, localcontext
 
 from trading_bot.carry_config import CarryCostTable
-from trading_bot.panel_accounting import EpisodeResult, evaluate_episode
+from trading_bot.panel_accounting import (
+    _NET_RETURN_CONTEXT,
+    EpisodeResult,
+    PanelAccountingError,
+    evaluate_episode,
+)
 from trading_bot.panel_config import PanelCostTable
 from trading_bot.panel_reader import FundingEvent
 from trading_bot.panel_universe import ContractHistory
@@ -73,14 +78,6 @@ def evaluate_carry_episode(
         cost_table=panel_table,
         fee_overrides=overrides,
     )
-    pair_net: dict[str, Decimal] = {}
-    pair_gross: dict[str, Decimal] = {}
-    for leg, value in result.contract_net_contributions:
-        pair = pair_of_leg[leg]
-        pair_net[pair] = pair_net.get(pair, Decimal(0)) + value
-    for leg, value in result.contract_contributions:
-        pair = pair_of_leg[leg]
-        pair_gross[pair] = pair_gross.get(pair, Decimal(0)) + value
     aggregated = EpisodeResult(
         sample_id=result.sample_id,
         member=result.member,
@@ -94,8 +91,10 @@ def evaluate_carry_episode(
         gross_exposure=result.gross_exposure,
         net_exposure=result.net_exposure,
         forced_close_count=result.forced_close_count,
-        contract_contributions=tuple(sorted(pair_gross.items())),
-        contract_net_contributions=tuple(sorted(pair_net.items())),
+        contract_contributions=_aggregate_to_pairs(result.contract_contributions, pair_of_leg),
+        contract_net_contributions=_aggregate_to_pairs(
+            result.contract_net_contributions, pair_of_leg
+        ),
         drifted_weights=result.drifted_weights,
     )
     spot_cost, perp_cost = _leg_turnover_costs(leg_weights, previous_leg_weights, tiers, cost_table)
@@ -106,6 +105,33 @@ def evaluate_carry_episode(
         spot_trading_cost=spot_cost,
         perpetual_trading_cost=perp_cost,
     )
+
+
+def _aggregate_to_pairs(
+    contributions: tuple[tuple[str, Decimal], ...],
+    pair_of_leg: dict[str, str],
+) -> tuple[tuple[str, Decimal], ...]:
+    """Regroup leg-level contributions to pair level.
+
+    Summed under ``_NET_RETURN_CONTEXT``, the same context ``net_return``
+    itself is summed under in panel_accounting.py, for the same reason: this
+    regrouping must reconstitute the episode's net_return exactly, not
+    approximately, whatever precision the upstream per-leg contributions
+    reach.
+    """
+    pairs: dict[str, Decimal] = {}
+    try:
+        with localcontext(_NET_RETURN_CONTEXT):
+            for leg, value in contributions:
+                pair = pair_of_leg[leg]
+                pairs[pair] = pairs.get(pair, Decimal(0)) + value
+    except Inexact as error:
+        raise PanelAccountingError(
+            "pair attribution summation exceeded its precision headroom "
+            "(_NET_RETURN_CONTEXT) -- pair contributions can no longer be "
+            "guaranteed to match the episode's net return"
+        ) from error
+    return tuple(sorted(pairs.items()))
 
 
 def _leg_turnover_costs(
