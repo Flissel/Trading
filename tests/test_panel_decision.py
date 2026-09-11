@@ -465,6 +465,30 @@ def test_member_clearing_every_gate_is_eligible(tmp_path: Path) -> None:
     assert "xs_mom_4w" in document["eligible_member_names"]
 
 
+def test_context_control_does_not_enter_the_dominance_baseline(tmp_path: Path) -> None:
+    # `passive_long_ew` is the third, contextual benchmark control (kind
+    # "passive_long"), not one of the two "no active view" dominance
+    # controls (no_trade, random_ranks). Giving it a dominant base and
+    # adverse return alongside the same clean, otherwise-eligible member
+    # profile `test_member_clearing_every_gate_is_eligible` uses must leave
+    # the member's eligibility untouched -- a regression back to selecting
+    # dominance controls by position (e.g. `control_names[:3]`, or any
+    # selection that includes the context control) would instead reject it
+    # via BASE_CONTROL_DOMINANCE_NOT_MET / ADVERSE_CONTROL_DOMINANCE_NOT_MET.
+    output_path = build(
+        tmp_path,
+        {"xs_mom_4w": ("0.01", "0.001"), "passive_long_ew": ("0.05", "0.05")},
+    )
+    document = json.loads(output_path.read_text(encoding="utf-8"))
+    momentum = next(
+        item for item in document["members"] if item["candidate_name"] == "xs_mom_4w"
+    )
+    assert momentum["decision_status"] == "eligible_for_further_review"
+    assert momentum["reason_codes"] == []
+    assert document["decision_status"] == "eligible_member_available"
+    assert "xs_mom_4w" in document["eligible_member_names"]
+
+
 def test_pooled_counts_and_hashes_are_recorded(tmp_path: Path) -> None:
     output_path = build(tmp_path, {})
     document = json.loads(output_path.read_text(encoding="utf-8"))
@@ -950,6 +974,22 @@ def test_hedge_linkage_must_agree_across_folds(tmp_path: Path) -> None:
 def test_hedge_linkage_must_be_present_on_every_fold_or_none(tmp_path: Path) -> None:
     paths = _six_folds(tmp_path)
     _rewrite_report(paths[2], _add_hedge("a" * 64))
+    with pytest.raises(PanelDecisionError, match="hedge"):
+        _decide(tmp_path, paths)
+
+
+def test_hedge_linkage_with_one_key_missing_is_rejected(tmp_path: Path) -> None:
+    # Every fold agrees on a hedge_capture_root_hash but none carries a
+    # hedge_dataset_root_hash at all -- the cross-document set check alone
+    # cannot see this (it agrees, at size 1, on the single half-populated
+    # tuple), so the half-present pair must be caught by a separate check.
+    paths = _six_folds(tmp_path)
+
+    def add_capture_hash_only(document: dict[str, object]) -> None:
+        document["hedge_capture_root_hash"] = "a" * 64
+
+    for path in paths:
+        _rewrite_report(path, add_capture_hash_only)
     with pytest.raises(PanelDecisionError, match="hedge"):
         _decide(tmp_path, paths)
 

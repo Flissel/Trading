@@ -90,6 +90,16 @@ class PanelDecisionError(RuntimeError):
 # anything else about the carry family.
 FamilySpec = PanelFamilySpec | CarryFamilySpec
 
+# Control dominance (a member must beat both) is measured against the two
+# "no active view" baseline controls -- no-trade and a random assignment --
+# never the third, contextual benchmark control every family also declares
+# (the momentum panel's passive-long-every-week, the carry family's
+# all-pairs-every-week). Selecting on `kind` rather than name or position
+# means this keeps meaning the same two *roles* even if a family's control
+# order or names ever changed; selecting on position (`control_names[:2]`)
+# was only correct by coincidence of both families' current frozen order.
+_CONTEXT_CONTROL_KINDS: frozenset[str] = frozenset({"passive_long", "all_pairs"})
+
 
 @dataclass(frozen=True, slots=True)
 class PanelDecisionArtifact:
@@ -240,6 +250,13 @@ def build_panel_decision(
     if len(hedge_links) != 1:
         raise PanelDecisionError("fold reports do not agree on the hedge capture linkage")
     hedge_capture_root_hash, hedge_dataset_root_hash = next(iter(hedge_links))
+    # The set-agreement check above only catches disagreement *across*
+    # documents; it is blind to a value every document agrees on together
+    # being half-missing, e.g. every fold declaring a capture hash but none a
+    # dataset hash -- one `("a"*64, None)` tuple, set size 1, no error. Only
+    # a fully-present or fully-absent pair is a coherent hedge linkage.
+    if (hedge_capture_root_hash is None) != (hedge_dataset_root_hash is None):
+        raise PanelDecisionError("fold reports do not agree on the hedge capture linkage")
     documents.sort(key=lambda item: _int_field(item, "fold_index"))
 
     member_names = tuple(item.name for item in spec.members)
@@ -288,19 +305,16 @@ def build_panel_decision(
         except PanelStatisticsError:
             trial_sharpes.append(Decimal(0))
 
-    # Control dominance is measured against the "no trade" and "random"
-    # baseline controls only, never the third (passive/all-pairs) benchmark
-    # control -- both families' frozen `CONTROL_NAMES` declare that pair in
-    # the same first two slots (panel: no_trade, random_ranks; carry:
-    # no_trade, random_pairs), so naming them by position keeps this the
-    # same two controls for either family rather than one literal pair of
-    # strings that only the momentum panel's own names happen to match.
-    dominance_control_names = control_names[:2]
+    dominance_controls = tuple(
+        item.name for item in spec.controls if item.kind not in _CONTEXT_CONTROL_KINDS
+    )
+    if len(dominance_controls) != 2:
+        raise PanelDecisionError("family must declare exactly two dominance controls")
     strongest_base = max(
-        (pooled[name].base_total for name in dominance_control_names), default=Decimal(0)
+        (pooled[name].base_total for name in dominance_controls), default=Decimal(0)
     )
     strongest_adverse = max(
-        (pooled[name].adverse_total for name in dominance_control_names),
+        (pooled[name].adverse_total for name in dominance_controls),
         default=Decimal(0),
     )
 
