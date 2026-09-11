@@ -8,13 +8,14 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.carry_config import CarryFamilySpec
 from trading_bot.evaluation import (
     BootstrapMeanTest,
     benjamini_hochberg,
     block_bootstrap_mean_test,
 )
 from trading_bot.evaluation import _maximum_drawdown as _shared_maximum_drawdown
-from trading_bot.panel_config import PanelFamilySpec, load_panel_family_spec
+from trading_bot.panel_config import PanelFamilySpec, load_family_spec
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE, verify_panel_fold_report
 from trading_bot.panel_statistics import (
     PanelStatisticsError,
@@ -83,6 +84,13 @@ class PanelDecisionError(RuntimeError):
     """Raised when the panel decision cannot be derived or published."""
 
 
+# `build_panel_decision` reads only `members`, `controls`, `statistics` and
+# `family_name` from the loaded spec -- fields both family models declare --
+# so either can be pooled through the same gates without this module knowing
+# anything else about the carry family.
+FamilySpec = PanelFamilySpec | CarryFamilySpec
+
+
 @dataclass(frozen=True, slots=True)
 class PanelDecisionArtifact:
     output_path: Path
@@ -143,6 +151,13 @@ class _Pooled:
     adverse_held_nothing_net_return_rolled_forward: Decimal
     base_held_nothing_turnover_rolled_forward: Decimal
     adverse_held_nothing_turnover_rolled_forward: Decimal
+    # Sum, per extras key, of that key's Decimal value across this candidate's
+    # retained base episodes only -- the same retained set `base_returns`
+    # holds, with the same MEMBER_HELD_NOTHING episodes excluded. Populated
+    # only for families whose fold reports carry an `extras` mapping per
+    # episode (funding carry); empty (count 0) for the momentum panel.
+    base_extras_totals: dict[str, Decimal]
+    base_extras_count: int
 
 
 def build_panel_decision(
@@ -156,7 +171,7 @@ def build_panel_decision(
         raise PanelDecisionError("at least one fold report is required")
     if output_path.exists():
         raise PanelDecisionError("panel decision already exists and is immutable")
-    spec, family_spec_hash = load_panel_family_spec(family_spec_path)
+    spec, family_spec_hash = load_family_spec(family_spec_path)
 
     documents = []
     for path in fold_report_paths:
@@ -210,6 +225,21 @@ def build_panel_decision(
         raise PanelDecisionError(
             "fold reports were built by different code versions (code_hash mismatch)"
         )
+    # A funding-carry fold report additionally links to the hedge leg's own
+    # capture and dataset: `hedge_capture_root_hash` and
+    # `hedge_dataset_root_hash`. Presence must be all-or-none across the fold
+    # report family (a report set where some folds carry the keys and others
+    # do not is caught here too, since the set below then holds one tuple of
+    # `None`s alongside the real one). The momentum panel's reports carry
+    # neither key, so both members of the tuple are `None` on every document
+    # and the set collapses to the single `(None, None)` entry harmlessly.
+    hedge_links = {
+        (document.get("hedge_capture_root_hash"), document.get("hedge_dataset_root_hash"))
+        for document in documents
+    }
+    if len(hedge_links) != 1:
+        raise PanelDecisionError("fold reports do not agree on the hedge capture linkage")
+    hedge_capture_root_hash, hedge_dataset_root_hash = next(iter(hedge_links))
     documents.sort(key=lambda item: _int_field(item, "fold_index"))
 
     member_names = tuple(item.name for item in spec.members)
@@ -258,11 +288,19 @@ def build_panel_decision(
         except PanelStatisticsError:
             trial_sharpes.append(Decimal(0))
 
+    # Control dominance is measured against the "no trade" and "random"
+    # baseline controls only, never the third (passive/all-pairs) benchmark
+    # control -- both families' frozen `CONTROL_NAMES` declare that pair in
+    # the same first two slots (panel: no_trade, random_ranks; carry:
+    # no_trade, random_pairs), so naming them by position keeps this the
+    # same two controls for either family rather than one literal pair of
+    # strings that only the momentum panel's own names happen to match.
+    dominance_control_names = control_names[:2]
     strongest_base = max(
-        (pooled[name].base_total for name in ("no_trade", "random_ranks")), default=Decimal(0)
+        (pooled[name].base_total for name in dominance_control_names), default=Decimal(0)
     )
     strongest_adverse = max(
-        (pooled[name].adverse_total for name in ("no_trade", "random_ranks")),
+        (pooled[name].adverse_total for name in dominance_control_names),
         default=Decimal(0),
     )
 
@@ -300,6 +338,7 @@ def build_panel_decision(
             "pooled_retained_episode_count": pooled[name].episode_count,
             "base_total_net_return": pooled[name].base_total,
             "adverse_total_net_return": pooled[name].adverse_total,
+            **_extras_mean_field(pooled[name]),
         }
         for name in control_names
     ]
@@ -326,6 +365,9 @@ def build_panel_decision(
         "eligible_member_names": eligible,
         "decision_status": decision_status,
     }
+    if hedge_capture_root_hash is not None and hedge_dataset_root_hash is not None:
+        material["hedge_capture_root_hash"] = str(hedge_capture_root_hash)
+        material["hedge_dataset_root_hash"] = str(hedge_dataset_root_hash)
     report_hash = content_sha256(material)
     document = dict(material)
     document["report_hash"] = report_hash
@@ -384,6 +426,7 @@ class _ScenarioFoldResult:
     held_nothing_net_return: Decimal
     held_nothing_turnover: Decimal
     forced_close_count: int
+    extras_count: int
 
 
 def _pool_scenario_fold(
@@ -394,6 +437,7 @@ def _pool_scenario_fold(
     gross_exposures: list[Decimal],
     net_exposures: list[Decimal],
     contract_totals: dict[str, Decimal] | None,
+    extras_totals: dict[str, Decimal] | None = None,
 ) -> _ScenarioFoldResult:
     """Pool one fold's one-scenario episode list, appending each retained
     episode's (possibly cost-adjusted) values to the accumulator lists.
@@ -442,6 +486,7 @@ def _pool_scenario_fold(
     held_nothing_net_return = Decimal(0)
     held_nothing_turnover = Decimal(0)
     forced_close_count = 0
+    extras_count = 0
     pending_return = Decimal(0)
     pending_turnover = Decimal(0)
     retained_before = len(values)
@@ -470,6 +515,23 @@ def _pool_scenario_fold(
         net_exposures.append(Decimal(str(episode["net_exposure"])))
         pending_return = Decimal(0)
         pending_turnover = Decimal(0)
+        # `extras` is retained-episode bookkeeping (funding collected, basis
+        # P&L, cost split by leg for the funding-carry family): accumulated
+        # only here, in the same branch and over the same set of episodes
+        # `values`/`turnovers` are, so a held-nothing episode's extras leave
+        # no trace, exactly like its net_return and turnover leave no trace
+        # in the pooled series (theirs is rolled forward/backward instead;
+        # extras carries no such rolling, since it has no defined meaning for
+        # an episode that held nothing). Absent on older-shaped episodes and
+        # on every panel-family report, which is why this is `None` there.
+        if extras_totals is not None:
+            extras = episode.get("extras")
+            if isinstance(extras, dict):
+                for key, value in extras.items():
+                    extras_totals[str(key)] = extras_totals.get(
+                        str(key), Decimal(0)
+                    ) + Decimal(str(value))
+                extras_count += 1
     if (pending_return != 0 or pending_turnover != 0) and len(values) > retained_before:
         # A held-nothing run at the tail of this fold, with nothing after it to
         # roll forward into: roll it backward onto this fold's own last
@@ -485,6 +547,7 @@ def _pool_scenario_fold(
         held_nothing_net_return=held_nothing_net_return,
         held_nothing_turnover=held_nothing_turnover,
         forced_close_count=forced_close_count,
+        extras_count=extras_count,
     )
 
 
@@ -512,6 +575,8 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
     base_total = Decimal(0)
     adverse_total = Decimal(0)
     raw_episode_count = 0
+    base_extras_totals: dict[str, Decimal] = {}
+    base_extras_count = 0
     # Elevated precision, scoped to this pooling pass only: `base_total` is
     # accumulated episode-by-episode (in `_pool_scenario_fold`) while
     # `contract_totals` accumulates the very same underlying money grouped by
@@ -552,6 +617,7 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
                     gross_exposures=base_gross_exposures,
                     net_exposures=base_net_exposures,
                     contract_totals=contracts,
+                    extras_totals=base_extras_totals,
                 )
                 fold_totals.append(base_result.fold_total)
                 base_fold_retained_counts.append(len(base) - base_retained_before)
@@ -560,6 +626,7 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
                 base_held_nothing_rolled += base_result.held_nothing_net_return
                 base_held_nothing_turnover_rolled += base_result.held_nothing_turnover
                 base_forced_close_count += base_result.forced_close_count
+                base_extras_count += base_result.extras_count
 
                 adverse_retained_before = len(adverse)
                 adverse_result = _pool_scenario_fold(
@@ -606,6 +673,8 @@ def _pool(documents: list[dict[str, object]], name: str) -> _Pooled:
         adverse_held_nothing_net_return_rolled_forward=adverse_held_nothing_rolled,
         base_held_nothing_turnover_rolled_forward=base_held_nothing_turnover_rolled,
         adverse_held_nothing_turnover_rolled_forward=adverse_held_nothing_turnover_rolled,
+        base_extras_totals=base_extras_totals,
+        base_extras_count=base_extras_count,
     )
 
 
@@ -645,11 +714,28 @@ def _win_rate(values: tuple[Decimal, ...]) -> Decimal:
     return Decimal(wins) / Decimal(len(values))
 
 
+def _extras_mean_field(pooled: _Pooled) -> dict[str, dict[str, Decimal]]:
+    """`{"extras_mean": ...}` when this candidate's fold reports carried an
+    `extras` mapping, computed with ordinary Decimal division outside the
+    trapped `_POOLING_CONTEXT`; `{}` (the key absent entirely) otherwise, so a
+    family without extras (the momentum panel) produces byte-identical
+    records to before this feature existed.
+    """
+    if pooled.base_extras_count == 0:
+        return {}
+    count = Decimal(pooled.base_extras_count)
+    return {
+        "extras_mean": {
+            key: total / count for key, total in sorted(pooled.base_extras_totals.items())
+        }
+    }
+
+
 def _member_record(
     name: str,
     pooled: _Pooled,
     *,
-    spec: PanelFamilySpec,
+    spec: FamilySpec,
     fold_count: int,
     test: BootstrapMeanTest | None,
     q_value: Decimal | None,
@@ -783,6 +869,7 @@ def _member_record(
         "concentration": shares,
         "decision_status": status,
         "reason_codes": evidence + economic,
+        **_extras_mean_field(pooled),
     }
     return record, status
 

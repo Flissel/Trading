@@ -1,5 +1,6 @@
 import json
 import random
+from collections.abc import Callable
 from decimal import Context, Decimal, Inexact
 from pathlib import Path
 
@@ -7,6 +8,9 @@ import pytest
 
 import trading_bot.panel_decision as panel_decision_module
 from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.carry_config import CONTROL_NAMES as CARRY_CONTROLS
+from trading_bot.carry_config import MEMBER_NAMES as CARRY_MEMBERS
+from trading_bot.carry_config import load_carry_family_spec
 from trading_bot.evaluation import _maximum_drawdown, evaluate_signals
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_decision import PanelDecisionError, _pool, _win_rate, build_panel_decision
@@ -880,3 +884,195 @@ def test_folds_where_a_member_retained_nothing_are_reported(tmp_path: Path) -> N
         item for item in document["members"] if item["candidate_name"] == "xs_mom_1w"
     )
     assert other["base_folds_with_no_retained_episodes"] == []
+
+
+CARRY_SPEC_PATH = Path("configs/funding-carry-panel-v1.json")
+CARRY_SPEC, CARRY_SPEC_HASH = load_carry_family_spec(CARRY_SPEC_PATH)
+EXTRAS = {
+    "funding_collected": "0.001",
+    "basis_pnl": "-0.0005",
+    "spot_trading_cost": "0.0002",
+    "perpetual_trading_cost": "0.0001",
+}
+
+
+def _rewrite_report(path: Path, mutate: Callable[[dict[str, object]], None]) -> None:
+    """Mutate a fold report in place and re-derive its report_hash."""
+    document = json.loads(path.read_text(encoding="utf-8"))
+    mutate(document)
+    material = {key: value for key, value in document.items() if key != "report_hash"}
+    document["report_hash"] = content_sha256(material)
+    path.write_bytes(canonical_json(document))
+
+
+def _six_folds(tmp_path: Path) -> list[Path]:
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"fold{fold_index}.json"
+        write_fold(path, fold_index, {})
+        paths.append(path)
+    return paths
+
+
+def _decide(tmp_path: Path, paths: list[Path], spec_path: Path = SPEC_PATH) -> dict[str, object]:
+    artifact = build_panel_decision(
+        tuple(paths),
+        family_spec_path=spec_path,
+        output_path=tmp_path / "decision.json",
+        registry_path=tmp_path / "registry.sqlite3",
+    )
+    document: dict[str, object] = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    return document
+
+
+def _add_hedge(capture_hash: str) -> Callable[[dict[str, object]], None]:
+    def mutate(document: dict[str, object]) -> None:
+        document["hedge_capture_root_hash"] = capture_hash
+        document["hedge_dataset_root_hash"] = "c" * 64
+
+    return mutate
+
+
+def _member_record(decision: dict[str, object], name: str) -> dict[str, object]:
+    members = decision["members"]
+    assert isinstance(members, list)
+    return next(item for item in members if item["candidate_name"] == name)
+
+
+def test_hedge_linkage_must_agree_across_folds(tmp_path: Path) -> None:
+    paths = _six_folds(tmp_path)
+    for index, path in enumerate(paths):
+        _rewrite_report(path, _add_hedge(("a" if index < 5 else "b") * 64))
+    with pytest.raises(PanelDecisionError, match="hedge"):
+        _decide(tmp_path, paths)
+
+
+def test_hedge_linkage_must_be_present_on_every_fold_or_none(tmp_path: Path) -> None:
+    paths = _six_folds(tmp_path)
+    _rewrite_report(paths[2], _add_hedge("a" * 64))
+    with pytest.raises(PanelDecisionError, match="hedge"):
+        _decide(tmp_path, paths)
+
+
+def test_hedge_linkage_is_copied_when_it_agrees(tmp_path: Path) -> None:
+    paths = _six_folds(tmp_path)
+    for path in paths:
+        _rewrite_report(path, _add_hedge("a" * 64))
+    decision = _decide(tmp_path, paths)
+    assert decision["hedge_capture_root_hash"] == "a" * 64
+    assert decision["hedge_dataset_root_hash"] == "c" * 64
+
+
+def test_panel_reports_without_hedge_or_extras_are_unchanged(tmp_path: Path) -> None:
+    decision = _decide(tmp_path, _six_folds(tmp_path))
+    assert not any(key.startswith("hedge_") for key in decision)
+    assert "extras_mean" not in _member_record(decision, MEMBERS[0])
+
+
+def test_extras_are_averaged_over_retained_base_episodes(tmp_path: Path) -> None:
+    paths = _six_folds(tmp_path)
+    member = MEMBERS[0]
+
+    def add_extras(document: dict[str, object]) -> None:
+        candidates = document["candidates"]
+        assert isinstance(candidates, list)
+        for candidate in candidates:
+            if candidate["candidate_name"] != member:
+                continue
+            for scenario in ("base", "adverse"):
+                for index, episode in enumerate(candidate[scenario]["episodes"]):
+                    episode["extras"] = dict(EXTRAS)
+                    if index == 0:
+                        # a held-nothing episode is excluded from the mean, so its
+                        # absurd extras value must leave no trace
+                        episode["reason_codes"] = [MEMBER_HELD_NOTHING_REASON_CODE]
+                        episode["extras"]["funding_collected"] = "9"
+
+    for path in paths:
+        _rewrite_report(path, add_extras)
+    decision = _decide(tmp_path, paths)
+    record = _member_record(decision, member)
+    assert record["extras_mean"] == EXTRAS
+    assert "extras_mean" not in _member_record(decision, MEMBERS[1])
+
+
+def write_carry_fold(path: Path, fold_index: int) -> None:
+    candidates: list[dict[str, object]] = []
+    for name in CARRY_MEMBERS + CARRY_CONTROLS:
+        value = "0.001" if name in CARRY_MEMBERS else "0"
+        rows = episodes(f"f{fold_index}", value, EPISODES_PER_FOLD)
+        for row in rows:
+            row["extras"] = dict(EXTRAS)
+        candidates.append(
+            {
+                "candidate_name": name,
+                "role": "member" if name in CARRY_MEMBERS else "control",
+                "episode_count": EPISODES_PER_FOLD,
+                "no_carry_cohort_sample_ids": [],
+                "base": {
+                    "total_net_return": str(Decimal(value) * EPISODES_PER_FOLD),
+                    "episodes": rows,
+                },
+                "adverse": {
+                    "total_net_return": str(Decimal(value) * EPISODES_PER_FOLD),
+                    "episodes": [dict(row) for row in rows],
+                },
+            }
+        )
+    material = {
+        "report_version": "1.0.0",
+        "status": "development_only",
+        "reason_codes": [],
+        "family_name": CARRY_SPEC.family_name,
+        "family_spec_hash": CARRY_SPEC_HASH,
+        "capture_root_hash": "c" * 64,
+        "dataset_root_hash": "d" * 64,
+        "hedge_capture_root_hash": "a" * 64,
+        "hedge_dataset_root_hash": "b" * 64,
+        "split_manifest_hash": "e" * 64,
+        "manifest_hash": "f" * 64,
+        "fold_index": fold_index,
+        "fold_count": 6,
+        "train_sample_count": 10,
+        "validation_sample_count": 10,
+        "test_sample_count": EPISODES_PER_FOLD,
+        "train_membership_hash": "0" * 64,
+        "validation_membership_hash": "1" * 64,
+        "test_membership_hash": "2" * 64,
+        "random_seed": 17,
+        "block_length": 4,
+        "bootstrap_repetitions": 2000,
+        "skipped_sample_ids": [],
+        "code_hash": "3" * 64,
+        "candidates": candidates,
+    }
+    document = dict(material)
+    document["report_hash"] = content_sha256(material)
+    path.write_bytes(canonical_json(document))
+
+
+def test_carry_family_is_pooled_through_the_same_gates(tmp_path: Path) -> None:
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"carry{fold_index}.json"
+        write_carry_fold(path, fold_index)
+        paths.append(path)
+    decision = _decide(tmp_path, paths, CARRY_SPEC_PATH)
+    assert decision["family_name"] == "funding_carry_panel_v1"
+    assert decision["family_spec_hash"] == CARRY_SPEC_HASH
+    assert decision["decision_status"] in {"eligible_member_available", "no_eligible_member"}
+    members = decision["members"]
+    assert isinstance(members, list)
+    assert [item["candidate_name"] for item in members] == list(CARRY_MEMBERS)
+    assert all(item["extras_mean"] == EXTRAS for item in members)
+    assert decision["hedge_capture_root_hash"] == "a" * 64
+
+
+def test_carry_reports_are_rejected_against_the_panel_declaration(tmp_path: Path) -> None:
+    paths = []
+    for fold_index in range(6):
+        path = tmp_path / f"carry{fold_index}.json"
+        write_carry_fold(path, fold_index)
+        paths.append(path)
+    with pytest.raises(PanelDecisionError):
+        _decide(tmp_path, paths, SPEC_PATH)
