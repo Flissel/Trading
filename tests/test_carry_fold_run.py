@@ -10,6 +10,7 @@ from tests.carry_fixtures import (
     build_captures,
     perp_fetch_with_a_hole,
     perp_fetch_with_a_liquidity_dip,
+    perp_fetch_with_a_warm_up_hole,
     perp_fetch_with_negative_funding_weeks,
     small_carry_config,
 )
@@ -353,3 +354,29 @@ def test_family_spec_mismatch_is_rejected(workspace: Workspace) -> None:
     other.write_text(json.dumps(document), encoding="utf-8")
     with pytest.raises(CarryFoldError, match="declaration"):
         _run((root, perp, spot, other))
+
+
+@pytest.fixture
+def workspace_with_a_warm_up_hole(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_warm_up_hole)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot)
+
+
+def test_pair_gone_dark_during_warm_up_is_dropped_before_the_first_entry(
+    workspace_with_a_warm_up_hole: Workspace,
+) -> None:
+    """C10USDT sits in every warmed cohort but has no bar at the first decision.
+    The runner must drop it before assembling the book (no entry close exists
+    to trade it), leaving its cohort shares undeployed like a forced close, and
+    the fold must run through instead of raising a missing-entry-close error."""
+    document = _run(workspace_with_a_warm_up_hole)
+    episodes = _episodes(document, "carry_l1w_h4w")
+    assert len(episodes) == 3
+    first = episodes[0]
+    # warmed cohorts 88, 95, 102 each formed with two pairs and stripped of C10
+    # -> three eighths; the fresh 109 cohort (C10 ineligible) adds one quarter
+    assert _decimal(first["gross_exposure"]) == Decimal("0.625")
+    assert first["forced_close_count"] == 0
+    contributions = _pairs(first["contract_net_contributions"])
+    assert not any(cid.startswith(f"{HOLE_SYMBOL}:") for cid, _ in contributions)
+    assert document["skipped_sample_ids"] == []

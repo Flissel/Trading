@@ -230,3 +230,26 @@ def small_carry_config(tmp_path: Path) -> Path:
     path = tmp_path / "small-carry.json"
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
+
+
+# C10USDT's perpetual is dark from day offset 103 through 109: it enters the
+# warm-up cohorts formed on Sundays 88, 95 and 102 and has no bar at fold 0's
+# first decision (day 109), the case a forced close cannot catch because no
+# episode runs during the warm-up. The seven days are absent from the daily
+# dumps too, so the quality gate treats them as proven absent at source.
+WARM_UP_HOLE_DAY_OFFSETS = frozenset(range(103, 110))
+
+
+def perp_fetch_with_a_warm_up_hole(url: str) -> PanelPayload:
+    if "/daily/klines/" in url or "fundingRate" in url:
+        return perp_fetch(url)
+    symbol, month = _symbol_and_month(url)
+    if symbol != HOLE_SYMBOL:
+        return perp_fetch(url)
+    lines = kline_csv(symbol, month).splitlines()
+    kept = [lines[0]] + [
+        line
+        for line in lines[1:]
+        if int(line.split(",")[0]) // DAY_MS - EPOCH_DAY_2020 not in WARM_UP_HOLE_DAY_OFFSETS
+    ]
+    return _payload(url, "k.csv", "\n".join(kept) + "\n")

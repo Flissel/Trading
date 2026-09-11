@@ -226,6 +226,20 @@ def run_carry_fold(
             if "NO_CARRY_COHORT" in cohort.reason_codes:
                 no_carry[name].append(sample_id)
             cohorts[name].append(cohort)
+            # A pair whose leg has no bar at this decision cannot be entered or
+            # held. In-window that leg was already force-closed and its pair
+            # stripped when it lost its exit bar; a pair that went dark during
+            # the warm-up, where no episode runs, is caught only here. Its
+            # cohort share stays undeployed, exactly as after a forced close.
+            untradeable = {
+                entry.pair_id
+                for retained in cohorts[name]
+                for entry in retained.entries
+                if decision_close_ns not in leg_histories[entry.perpetual_leg].closes
+                or decision_close_ns not in leg_histories[entry.spot_leg].closes
+            }
+            if untradeable:
+                cohorts[name] = _without_pairs(cohorts[name], untradeable)
             weights = assemble_book(
                 tuple(cohorts[name]), hold_weeks=hold_of[name], decision_close_ns=decision_close_ns
             )
@@ -245,17 +259,9 @@ def run_carry_fold(
                 for leg in forced_legs(weights, episode.result.drifted_weights):
                     forced_pairs.add(pair_of_leg[leg])
             if forced_pairs:
-                cohorts[name] = [
-                    Cohort(
-                        c.decision_close_ns,
-                        tuple(e for e in c.entries if e.pair_id not in forced_pairs),
-                        c.reason_codes,
-                        formed_size=c.formed_size if c.formed_size is not None else len(c.entries),
-                    )
-                    for c in cohorts[name]
-                ]
+                cohorts[name] = _without_pairs(cohorts[name], forced_pairs)
         # prune cohorts older than the longest hold so state stays bounded
-        longest = max(hold_of.values()) * 604_800_000_000_000
+        longest = max(hold_of.values()) * WEEK_NS
         for name in names:
             cohorts[name] = [
                 c for c in cohorts[name] if decision_close_ns - c.decision_close_ns < longest
@@ -320,6 +326,20 @@ def run_carry_fold(
     temporary.replace(output_path)
     _register(spec, manifest, report_hash, registry_path)
     return CarryFoldArtifact(output_path, report_hash, fold_index, episode_count, len(skipped))
+
+
+def _without_pairs(cohorts: list[Cohort], pair_ids: set[str]) -> list[Cohort]:
+    """Strip `pair_ids` from every cohort, keeping each cohort's size at
+    formation so the removed pairs' capital stays undeployed (spec 8.1)."""
+    return [
+        Cohort(
+            c.decision_close_ns,
+            tuple(e for e in c.entries if e.pair_id not in pair_ids),
+            c.reason_codes,
+            formed_size=c.formed_size if c.formed_size is not None else len(c.entries),
+        )
+        for c in cohorts
+    ]
 
 
 def _cohort_for(
