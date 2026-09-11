@@ -212,6 +212,26 @@ def discover_panel_months(
     return _parse_listing_months(payload.raw_bytes, symbol=symbol, kind=kind, market=market)
 
 
+# Binance's spot daily dumps switched from 13-digit millisecond to 16-digit
+# microsecond timestamps with the 2025-01 files; the USD-M perpetual dumps
+# and the earlier spot dumps carry milliseconds. Any millisecond stamp of a
+# real date is far below this bound and any microsecond stamp far above it.
+_MICROSECOND_TIMESTAMP_FLOOR = 10**15
+
+
+def _kline_timestamp_ns(raw: str) -> int:
+    """Nanoseconds for a kline open/close time in either Binance era.
+
+    Microsecond stamps are floored to millisecond precision before the
+    conversion, so a daily close is `open + 1d - 1ms` in both eras and a spot
+    close matches the perpetual calendar's decision close to the nanosecond.
+    """
+    value = int(raw)
+    if value >= _MICROSECOND_TIMESTAMP_FLOOR:
+        value //= 1000
+    return value * 1_000_000
+
+
 def parse_kline_zip(
     payload: PanelPayload, *, symbol: str, venue: str = _VENUE
 ) -> tuple[PanelCandleRow, ...]:
@@ -222,8 +242,8 @@ def parse_kline_zip(
             continue
         if len(record) < 9:
             raise PanelCaptureError("kline row has too few columns")
-        open_time_ns = int(record[0]) * 1_000_000
-        close_time_ns = int(record[6]) * 1_000_000
+        open_time_ns = _kline_timestamp_ns(record[0])
+        close_time_ns = _kline_timestamp_ns(record[6])
         rows.append(
             PanelCandleRow(
                 venue=venue,

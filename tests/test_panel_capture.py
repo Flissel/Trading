@@ -1932,3 +1932,33 @@ def test_repair_of_a_spot_capture_stays_on_the_spot_market(tmp_path: Path) -> No
     assert manifest["market"] == "spot"
     assert manifest["venue"] == "BINANCE_SPOT"
     assert verify_panel_capture(repaired.capture_root) == (True, ())
+
+
+def test_parse_kline_zip_normalises_microsecond_timestamps_to_millisecond_precision() -> None:
+    """Binance's spot daily dumps carry 16-digit microsecond open/close times
+    from 2025-01 onward (the perpetual dumps and earlier spot dumps carry
+    13-digit milliseconds). Both eras must parse to the same nanosecond
+    timestamps: the open is a whole day either way, and the close is
+    normalised to `open + 1d - 1ms`, so a spot close still matches the
+    perpetual calendar's decision close to the nanosecond."""
+    from trading_bot.panel_capture import parse_kline_zip
+
+    header = (
+        "open_time,open,high,low,close,volume,close_time,quote_volume,count,"
+        "taker_buy_volume,taker_buy_quote_volume,ignore\n"
+    )
+    ms_row = "1733011200000,1,1,1,1,10,1733097599999,100,1,1,1,0\n"
+    us_row = "1733011200000000,1,1,1,1,10,1733097599999999,100,1,1,1,0\n"
+    ms_rows = parse_kline_zip(
+        PanelPayload(url="u", raw_bytes=zip_bytes("k.csv", header + ms_row), received_time_ns=1),
+        symbol="BTCUSDT",
+    )
+    us_rows = parse_kline_zip(
+        PanelPayload(url="u", raw_bytes=zip_bytes("k.csv", header + us_row), received_time_ns=1),
+        symbol="BTCUSDT",
+    )
+    assert ms_rows[0].open_time_ns == 1733011200000 * 1_000_000
+    assert ms_rows[0].close_time_ns == 1733097599999 * 1_000_000
+    assert us_rows[0].open_time_ns == ms_rows[0].open_time_ns
+    assert us_rows[0].close_time_ns == ms_rows[0].close_time_ns
+    assert us_rows[0].available_time_ns == ms_rows[0].available_time_ns
