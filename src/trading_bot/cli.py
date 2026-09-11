@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from trading_bot.backtest import BacktestCase, BacktestRunner, write_report
+from trading_bot.carry_fold_run import run_carry_fold
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
@@ -108,6 +109,15 @@ def main(arguments: list[str] | None = None) -> int:
     panel_decision.add_argument("--family-spec", type=Path, required=True)
     panel_decision.add_argument("--output", type=Path, required=True)
     panel_decision.add_argument("--registry", type=Path, required=True)
+    carry_fold = commands.add_parser("carry-fold")
+    carry_fold.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    carry_fold.add_argument("--capture", type=Path, required=True)
+    carry_fold.add_argument("--hedge-capture", type=Path, required=True)
+    carry_fold.add_argument("--manifest", type=Path, required=True)
+    carry_fold.add_argument("--family-spec", type=Path, required=True)
+    carry_fold.add_argument("--output", type=Path, required=True)
+    carry_fold.add_argument("--registry", type=Path, required=True)
+    carry_fold.add_argument("--fold-index", type=int, required=True)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -302,6 +312,28 @@ def main(arguments: list[str] | None = None) -> int:
             family_spec_path=parsed.family_spec.resolve(),
             output_path=parsed.output.resolve(),
             registry_path=parsed.registry.resolve(),
+        )
+        return 0
+    if parsed.command == "carry-fold":
+        workspace = parsed.workspace_root.resolve()
+        carry_paths = (
+            parsed.capture.resolve(),
+            parsed.hedge_capture.resolve(),
+            parsed.manifest.resolve(),
+            parsed.family_spec.resolve(),
+            parsed.output.resolve(),
+            parsed.registry.resolve(),
+        )
+        if any(not path.is_relative_to(workspace) for path in carry_paths):
+            raise ValueError("carry fold paths must stay inside workspace")
+        run_carry_fold(
+            carry_paths[0],
+            carry_paths[1],
+            manifest_path=carry_paths[2],
+            family_spec_path=carry_paths[3],
+            output_path=carry_paths[4],
+            registry_path=carry_paths[5],
+            fold_index=parsed.fold_index,
         )
         return 0
     raise AssertionError("unreachable command")

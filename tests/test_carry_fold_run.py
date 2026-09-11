@@ -1,0 +1,228 @@
+import json
+from decimal import Decimal
+from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
+
+import pytest
+
+from tests.carry_fixtures import (
+    HOLE_SYMBOL,
+    build_captures,
+    perp_fetch_with_a_hole,
+    small_carry_config,
+)
+from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.carry_config import CONTROL_NAMES, MEMBER_NAMES
+from trading_bot.carry_fold_run import CarryFoldError, run_carry_fold
+from trading_bot.panel_config import load_family_spec
+from trading_bot.panel_fold_run import verify_panel_fold_report
+from trading_bot.panel_samples import publish_panel_walk_forward
+from trading_bot.registry import MetadataRegistry
+
+Workspace = tuple[Path, Path, Path, Path]  # root, perp capture, spot capture, config
+
+
+def _publish(root: Path, perp: Path, spot: Path) -> Path:
+    config_path = small_carry_config(root)
+    spec, spec_hash = load_family_spec(config_path)
+    publish_panel_walk_forward(
+        perp, output_path=root / "manifest.json", spec=spec,
+        family_spec_hash=spec_hash, hedge_capture_root=spot,
+    )
+    return config_path
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot)
+
+
+@pytest.fixture
+def workspace_with_a_hole(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_hole)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot)
+
+
+def _run(space: Workspace, fold_index: int = 0) -> dict[str, object]:
+    root, perp, spot, config_path = space
+    artifact = run_carry_fold(
+        perp, spot, manifest_path=root / "manifest.json", family_spec_path=config_path,
+        output_path=root / f"fold{fold_index}.json", registry_path=root / "registry.sqlite3",
+        fold_index=fold_index,
+    )
+    assert artifact.episode_count > 0
+    assert verify_panel_fold_report(artifact.output_path)
+    document: dict[str, object] = json.loads(artifact.output_path.read_text(encoding="utf-8"))
+    return document
+
+
+def _object_list(value: object) -> list[object]:
+    assert isinstance(value, list)
+    return value
+
+
+def _object_dict(value: object) -> dict[str, object]:
+    assert isinstance(value, dict)
+    return value
+
+
+def _decimal(value: object) -> Decimal:
+    assert isinstance(value, str)
+    return Decimal(value)
+
+
+def _pairs(value: object) -> list[tuple[str, str]]:
+    """Decode a `contract_net_contributions`-shaped `[[id, decimal-string], ...]` list."""
+    result: list[tuple[str, str]] = []
+    for item in _object_list(value):
+        assert isinstance(item, list) and len(item) == 2
+        contract_id, amount = item
+        assert isinstance(contract_id, str)
+        assert isinstance(amount, str)
+        result.append((contract_id, amount))
+    return result
+
+
+def _candidate(document: dict[str, object], name: str) -> dict[str, object]:
+    candidates = (_object_dict(item) for item in _object_list(document["candidates"]))
+    return next(item for item in candidates if item["candidate_name"] == name)
+
+
+def _episodes(
+    document: dict[str, object], name: str, scenario: str = "base"
+) -> list[dict[str, object]]:
+    scenario_record = _object_dict(_candidate(document, name)[scenario])
+    return [_object_dict(item) for item in _object_list(scenario_record["episodes"])]
+
+
+def test_carry_fold_report_has_the_panel_schema_plus_extras(workspace: Workspace) -> None:
+    document = _run(workspace)
+    manifest = json.loads((workspace[0] / "manifest.json").read_text(encoding="utf-8"))
+    assert document["status"] == "development_only"
+    assert document["family_name"] == "funding_carry_panel_v1"
+    assert document["hedge_capture_root_hash"] == manifest["hedge_capture_root_hash"]
+    assert document["hedge_dataset_root_hash"] == manifest["hedge_dataset_root_hash"]
+    assert document["capture_root_hash"] == manifest["capture_root_hash"]
+    assert document["fold_index"] == 0 and document["fold_count"] == len(manifest["folds"])
+    assert document["reason_codes"] == ["FOLD_FINAL_EXIT_COST_UNCHARGED"]
+    names = [_object_dict(item)["candidate_name"] for item in _object_list(document["candidates"])]
+    assert names == list(MEMBER_NAMES + CONTROL_NAMES)
+    member = _candidate(document, "carry_l1w_h4w")
+    assert member["role"] == "member" and member["no_carry_cohort_sample_ids"] == []
+    assert _candidate(document, "no_trade")["role"] == "control"
+    episode = _episodes(document, "carry_l1w_h4w")[0]
+    assert set(episode) == {
+        "sample_id", "net_return", "gross_return", "turnover", "trading_cost", "funding_cost",
+        "forced_close_cost", "gross_exposure", "net_exposure", "forced_close_count",
+        "reason_codes", "contract_net_contributions", "extras",
+    }
+    extras = _object_dict(episode["extras"])
+    assert set(extras) == {
+        "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
+    }
+    contributions = _pairs(episode["contract_net_contributions"])
+    # per-pair attribution sums to the episode's net return exactly
+    total = sum((Decimal(value) for _, value in contributions), Decimal(0))
+    assert total == _decimal(episode["net_return"])
+    # pair ids are perpetual contract ids, not leg ids
+    assert all(not cid.startswith(("perp:", "spot:")) for cid, _ in contributions)
+    # the two legs of every pair are hedged: zero net exposure
+    assert _decimal(episode["net_exposure"]) == 0
+
+
+def test_no_trade_control_is_flat(workspace: Workspace) -> None:
+    document = _run(workspace)
+    for scenario in ("base", "adverse"):
+        for episode in _episodes(document, "no_trade", scenario):
+            assert _decimal(episode["net_return"]) == 0
+            assert _decimal(episode["gross_exposure"]) == 0
+            assert episode["reason_codes"] == []
+
+
+def test_book_ramps_over_the_first_hold_weeks(workspace: Workspace) -> None:
+    """A fold starts flat; with H = 4 the first three Sundays deploy 1/4, 2/4, 3/4."""
+    document = _run(workspace)
+    exposures = [_decimal(e["gross_exposure"]) for e in _episodes(document, "carry_l1w_h4w")]
+    assert exposures == [Decimal("0.25"), Decimal("0.5"), Decimal("0.75")]
+    # the funding leg collects: every member episode has positive funding_collected
+    assert all(
+        _decimal(_object_dict(e["extras"])["funding_collected"]) > 0
+        for e in _episodes(document, "carry_l1w_h4w")
+    )
+    # the adverse scenario haircuts receipts by a quarter
+    base = _episodes(document, "carry_l1w_h4w", "base")
+    adverse = _episodes(document, "carry_l1w_h4w", "adverse")
+    for b, a in zip(base, adverse, strict=True):
+        b_funding = _decimal(_object_dict(b["extras"])["funding_collected"])
+        a_funding = _decimal(_object_dict(a["extras"])["funding_collected"])
+        assert a_funding == b_funding * Decimal("0.75")
+
+
+def test_all_pairs_control_excludes_negative_funding(workspace: Workspace) -> None:
+    document = _run(workspace)
+    episode = _episodes(document, "all_pairs_ew")[0]
+    contributions = _pairs(episode["contract_net_contributions"])
+    assert not any(cid.startswith("C11USDT:") for cid, _ in contributions)
+
+
+def test_forced_leg_closes_its_partner_at_the_next_rebalance(
+    workspace_with_a_hole: Workspace,
+) -> None:
+    document = _run(workspace_with_a_hole)
+    episodes = _episodes(document, "carry_l1w_h4w")
+    assert len(episodes) == 3
+    # week 2 (decision 116): the perpetual leg of the hole symbol has no exit bar
+    assert episodes[1]["forced_close_count"] == 1
+    assert _decimal(episodes[1]["forced_close_cost"]) > 0
+    # week 3 (decision 123): the pair is out of the universe and out of the book, and its
+    # spot leg is charged its exit through ordinary turnover under the pair's id
+    third_contributions = _pairs(episodes[2]["contract_net_contributions"])
+    assert any(cid.startswith(f"{HOLE_SYMBOL}:") for cid, _ in third_contributions)
+    assert episodes[2]["forced_close_count"] == 0
+    assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.75")
+    assert _decimal(episodes[2]["turnover"]) > Decimal("0.25")
+
+
+def test_members_are_registered(workspace: Workspace) -> None:
+    document = _run(workspace)
+    manifest = json.loads((workspace[0] / "manifest.json").read_text(encoding="utf-8"))
+    family_id = uuid5(NAMESPACE_URL, f"{manifest['split_manifest_hash']}:funding_carry_panel_v1")
+    with MetadataRegistry(workspace[0] / "registry.sqlite3") as registry:
+        records = registry.list_experiments(family_id)
+    assert sorted(record.candidate_name for record in records) == sorted(MEMBER_NAMES)
+    assert {record.result_hash for record in records} == {document["report_hash"]}
+    assert {record.code_hash for record in records} == {document["code_hash"]}
+
+
+def test_report_is_immutable(workspace: Workspace) -> None:
+    _run(workspace)
+    with pytest.raises(CarryFoldError, match="immutable"):
+        _run(workspace)
+
+
+def _rewrite_manifest_field(path: Path, key: str, value: object) -> None:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    document[key] = value
+    material = {k: v for k, v in document.items() if k != "manifest_hash"}
+    document["manifest_hash"] = content_sha256(material)
+    path.write_bytes(canonical_json(document))
+
+
+@pytest.mark.parametrize(
+    "key", ["hedge_capture_root_hash", "hedge_dataset_root_hash", "capture_root_hash"]
+)
+def test_linkage_to_both_captures_is_enforced(workspace: Workspace, key: str) -> None:
+    _rewrite_manifest_field(workspace[0] / "manifest.json", key, "0" * 64)
+    with pytest.raises(CarryFoldError, match=key):
+        _run(workspace)
+
+
+def test_family_spec_mismatch_is_rejected(workspace: Workspace) -> None:
+    root, perp, spot, config_path = workspace
+    document = json.loads(config_path.read_text(encoding="utf-8"))
+    document["hypothesis"] += " (edited)"
+    other = root / "other.json"
+    other.write_text(json.dumps(document), encoding="utf-8")
+    with pytest.raises(CarryFoldError, match="declaration"):
+        _run((root, perp, spot, other))
