@@ -9,6 +9,8 @@ from tests.carry_fixtures import (
     HOLE_SYMBOL,
     build_captures,
     perp_fetch_with_a_hole,
+    perp_fetch_with_a_liquidity_dip,
+    perp_fetch_with_negative_funding_weeks,
     small_carry_config,
 )
 from trading_bot.canonical import canonical_json, content_sha256
@@ -41,6 +43,20 @@ def workspace(tmp_path: Path) -> Workspace:
 @pytest.fixture
 def workspace_with_a_hole(tmp_path: Path) -> Workspace:
     perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_hole)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot)
+
+
+@pytest.fixture
+def workspace_with_a_liquidity_dip(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_liquidity_dip)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot)
+
+
+@pytest.fixture
+def workspace_with_negative_funding_weeks(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(
+        tmp_path, perp_fetch_function=perp_fetch_with_negative_funding_weeks
+    )
     return tmp_path, perp, spot, _publish(tmp_path, perp, spot)
 
 
@@ -180,8 +196,84 @@ def test_forced_leg_closes_its_partner_at_the_next_rebalance(
     third_contributions = _pairs(episodes[2]["contract_net_contributions"])
     assert any(cid.startswith(f"{HOLE_SYMBOL}:") for cid, _ in third_contributions)
     assert episodes[2]["forced_close_count"] == 0
-    assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.75")
+    assert _decimal(episodes[2]["forced_close_cost"]) == 0
+    # the hole pair's only week-3 cost is its spot leg's ordinary exit turnover
+    # (one side only -- the perpetual leg was already force-closed in week 2)
+    hole_contribution = next(
+        value for cid, value in third_contributions if cid.startswith(f"{HOLE_SYMBOL}:")
+    )
+    assert Decimal(hole_contribution) < 0
+    # cohorts 109 [C10,C09] and 116 [C10,C09] each lose C10 to the week-2 forced
+    # close but keep their formed_size of 2, so each still contributes only 1/8
+    # gross (its surviving pair, C09, is not reinvested into); the new 123
+    # cohort [C09,C08] contributes 1/4: 1/8 + 1/8 + 1/4 = 1/2.
+    assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.5")
     assert _decimal(episodes[2]["turnover"]) > Decimal("0.25")
+
+
+def _ordered_test_sample_ids(root: Path) -> list[str]:
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    fold = next(f for f in manifest["folds"] if f["fold_index"] == 0)
+    return sorted((str(v) for v in fold["test_ids"]), key=lambda v: int(v.split(":")[1]))
+
+
+def test_universe_too_small_week_is_skipped_and_resets_the_book(
+    workspace_with_a_liquidity_dip: Workspace,
+) -> None:
+    document = _run(workspace_with_a_liquidity_dip)
+    middle_id = _ordered_test_sample_ids(workspace_with_a_liquidity_dip[0])[1]
+    middle_ns = middle_id.split(":")[1]
+    skipped = document["skipped_sample_ids"]
+    assert isinstance(skipped, list) and len(skipped) == 1
+    skipped_id = skipped[0]
+    assert isinstance(skipped_id, str) and middle_ns in skipped_id
+    reason_codes = document["reason_codes"]
+    assert isinstance(reason_codes, list)
+    assert "SKIPPED_WEEK_EXIT_COST_UNCHARGED" in reason_codes
+    # the week is skipped, not evaluated: only the two untouched decisions remain
+    episodes = _episodes(document, "carry_l1w_h4w")
+    assert len(episodes) == 2
+    exposures = [_decimal(e["gross_exposure"]) for e in episodes]
+    # both are 0.25, not 0.25/0.5: the skip resets cohorts AND carried weights,
+    # so the post-skip episode is a fresh start, not a continuation of the ramp
+    assert exposures == [Decimal("0.25"), Decimal("0.25")]
+    # no exit of the pre-skip book is charged (P1.27's uncharged-skip semantics)
+    assert _decimal(episodes[1]["turnover"]) == Decimal("0.25")
+
+
+def test_no_carry_cohort_is_not_a_skip_and_marks_held_nothing(
+    workspace_with_negative_funding_weeks: Workspace,
+) -> None:
+    document = _run(workspace_with_negative_funding_weeks)
+    root = workspace_with_negative_funding_weeks[0]
+    ordered_ids = _ordered_test_sample_ids(root)
+    assert document["skipped_sample_ids"] == []
+    assert document["reason_codes"] == ["FOLD_FINAL_EXIT_COST_UNCHARGED"]
+
+    member = _candidate(document, "carry_l1w_h4w")
+    assert member["no_carry_cohort_sample_ids"] == ordered_ids[:2]
+    base = _episodes(document, "carry_l1w_h4w")
+    assert base[0]["reason_codes"] == ["MEMBER_HELD_NOTHING"]
+    assert _decimal(base[0]["gross_exposure"]) == 0
+    assert base[1]["reason_codes"] == ["MEMBER_HELD_NOTHING"]
+    assert _decimal(base[1]["gross_exposure"]) == 0
+    assert base[2]["reason_codes"] == []
+    assert _decimal(base[2]["gross_exposure"]) == Decimal("0.25")
+
+    # the 4-week members still see the positive rows outside the negative
+    # window and keep ramping normally, with no NO_CARRY_COHORT sample ids and
+    # no older cohorts to lose: this pins that the book isn't reset for them
+    l4w_member = _candidate(document, "carry_l4w_h4w")
+    assert l4w_member["no_carry_cohort_sample_ids"] == []
+    l4w_episodes = _episodes(document, "carry_l4w_h4w")
+    l4w_exposures = [_decimal(e["gross_exposure"]) for e in l4w_episodes]
+    assert l4w_exposures == [Decimal("0.25"), Decimal("0.5"), Decimal("0.75")]
+
+    # controls are never marked MEMBER_HELD_NOTHING, in either scenario
+    for name in CONTROL_NAMES:
+        for scenario in ("base", "adverse"):
+            for episode in _episodes(document, name, scenario):
+                assert episode["reason_codes"] == []
 
 
 def test_members_are_registered(workspace: Workspace) -> None:

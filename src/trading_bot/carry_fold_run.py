@@ -207,6 +207,7 @@ def run_carry_fold(
                         c.decision_close_ns,
                         tuple(e for e in c.entries if e.pair_id not in forced_pairs),
                         c.reason_codes,
+                        formed_size=c.formed_size if c.formed_size is not None else len(c.entries),
                     )
                     for c in cohorts[name]
                 ]

@@ -33,6 +33,10 @@ class Cohort:
     decision_close_ns: int
     entries: tuple[CohortEntry, ...]
     reason_codes: tuple[str, ...]
+    # The entry count the cohort was formed with, when that differs from
+    # ``len(entries)`` today (a pair stripped out after a forced close).
+    # ``None`` means "formed with exactly len(entries)", the common case.
+    formed_size: int | None = None
 
 
 def trailing_funding(
@@ -125,7 +129,12 @@ def assemble_book(
     A pair share ``c`` is expressed as spot ``+c/2`` and perpetual ``-c/2``,
     so a full book has unit gross across both legs and zero net exposure,
     which is the capital basis spec section 3.1 declares. An empty cohort
-    leaves its share of capital undeployed rather than redistributing it.
+    leaves its share of capital undeployed rather than redistributing it,
+    and so does a pair removed from a cohort after a forced close: its share
+    stays undeployed until the cohort ages out, rather than being reinvested
+    into its surviving siblings. ``Cohort.formed_size`` carries the entry
+    count the cohort was assembled with, so a shrunken cohort still divides
+    its capital by the count it started with, not by how many pairs remain.
     """
     if hold_weeks < 1:
         raise ValueError("hold_weeks must be positive")
@@ -135,7 +144,8 @@ def assemble_book(
         age = decision_close_ns - cohort.decision_close_ns
         if age < 0 or age >= hold_weeks * WEEK_NS or not cohort.entries:
             continue
-        pair_share = share_per_cohort / Decimal(len(cohort.entries))
+        size = cohort.formed_size if cohort.formed_size is not None else len(cohort.entries)
+        pair_share = share_per_cohort / Decimal(size)
         for entry in cohort.entries:
             weights[entry.spot_leg] = weights.get(entry.spot_leg, Decimal(0)) + pair_share / 2
             weights[entry.perpetual_leg] = (

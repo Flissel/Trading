@@ -33,6 +33,18 @@ NEGATIVE_FUNDING_SYMBOL = "C11USDT"
 # bar on 123 and is force-closed, and the pair is ineligible on 123.
 HOLE_SYMBOL = "C10USDT"
 HOLE_DAY_OFFSETS = frozenset({121, 122, 123})
+# The liquidity window ending on the middle decision (day 116) is the five days
+# 112..116 (`liquidity_window_days` is 5 under `small_carry_config`). Dropping
+# every symbol's quote volume there below the base config's unmodified
+# `minimum_median_quote_volume` (5,000,000) floor pushes that one decision's
+# universe empty while the weeks before and after are untouched.
+LIQUIDITY_DIP_DAY_OFFSETS = frozenset({112, 113, 114, 115, 116})
+# The two weekly funding rows inside decisions 109's and 116's one-week
+# lookback windows -- (102, 109] contains only day 105, (109, 116] contains
+# only day 112 -- forced negative for every symbol so `carry_l1w_h4w` (lookback
+# 1 week) sees no positive-funding pairs at those two decisions, while the
+# 4-week members still see the positive rows at 88, 91 and 98.
+NEGATIVE_FUNDING_DAY_OFFSETS = frozenset({105, 112})
 
 
 def funding_rate(symbol: str) -> str:
@@ -47,6 +59,17 @@ def funding_csv(symbol: str, month: str) -> str:
     for offset in range(0, MONTH_DAYS[month], 7):
         day = EPOCH_DAY_2020 + MONTH_START_DAY[month] + offset
         text += f"{day * DAY_MS},8,{funding_rate(symbol)}\n"
+    return text
+
+
+def funding_csv_with_negative_weeks(symbol: str, month: str) -> str:
+    """Every symbol's funding, with the rows at `NEGATIVE_FUNDING_DAY_OFFSETS` forced negative."""
+    text = "calc_time,funding_interval_hours,last_funding_rate\n"
+    for offset in range(0, MONTH_DAYS[month], 7):
+        day = EPOCH_DAY_2020 + MONTH_START_DAY[month] + offset
+        day_offset = day - EPOCH_DAY_2020
+        rate = "-0.0001" if day_offset in NEGATIVE_FUNDING_DAY_OFFSETS else funding_rate(symbol)
+        text += f"{day * DAY_MS},8,{rate}\n"
     return text
 
 
@@ -94,6 +117,37 @@ def perp_fetch_with_a_hole(url: str) -> PanelPayload:
         if int(line.split(",")[0]) // DAY_MS - EPOCH_DAY_2020 not in HOLE_DAY_OFFSETS
     ]
     return _payload(url, "k.csv", "\n".join(kept) + "\n")
+
+
+def kline_csv_with_liquidity_dip(symbol: str, month: str) -> str:
+    """The perpetual's bars with `LIQUIDITY_DIP_DAY_OFFSETS`'s quote volume dropped."""
+    lines = kline_csv(symbol, month).splitlines()
+    out = [lines[0]]
+    for line in lines[1:]:
+        fields = line.split(",")
+        day_offset = int(fields[0]) // DAY_MS - EPOCH_DAY_2020
+        if day_offset in LIQUIDITY_DIP_DAY_OFFSETS:
+            fields[7] = "1000000"
+        out.append(",".join(fields))
+    return "\n".join(out) + "\n"
+
+
+def perp_fetch_with_a_liquidity_dip(url: str) -> PanelPayload:
+    if "/daily/klines/" in url:
+        raise PanelSourceAbsent("404: no daily dump")
+    symbol, month = _symbol_and_month(url)
+    if "fundingRate" in url:
+        return _payload(url, "f.csv", funding_csv(symbol, month))
+    return _payload(url, "k.csv", kline_csv_with_liquidity_dip(symbol, month))
+
+
+def perp_fetch_with_negative_funding_weeks(url: str) -> PanelPayload:
+    if "/daily/klines/" in url:
+        raise PanelSourceAbsent("404: no daily dump")
+    symbol, month = _symbol_and_month(url)
+    if "fundingRate" in url:
+        return _payload(url, "f.csv", funding_csv_with_negative_weeks(symbol, month))
+    return _payload(url, "k.csv", kline_csv(symbol, month))
 
 
 def spot_fetch(url: str) -> PanelPayload:

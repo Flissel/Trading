@@ -161,3 +161,22 @@ def test_book_with_an_empty_cohort_deploys_less_than_unit_gross() -> None:
     )
     book = dict(assemble_book(cohorts, hold_weeks=2, decision_close_ns=10 * WEEK_NS))
     assert sum(abs(v) for v in book.values()) == Decimal("0.5")
+
+
+def test_a_shrunken_cohort_leaves_its_stripped_pair_undeployed() -> None:
+    """A pair stripped from a cohort after a forced close is not reinvested into
+    its surviving siblings: the cohort still divides its capital by the size it
+    was formed with (`formed_size`), not by how many entries remain."""
+    cohorts = (
+        Cohort(
+            10 * WEEK_NS,
+            (CohortEntry("A:0", "perp:A:0", "spot:A:7", 1),),
+            (),
+            formed_size=2,
+        ),
+    )
+    book = dict(assemble_book(cohorts, hold_weeks=4, decision_close_ns=10 * WEEK_NS))
+    # H=4, formed with 2 entries: 1/4 / 2 = 1/8 gross for this pair, not 1/4.
+    assert book["spot:A:7"] == Decimal("0.0625")
+    assert book["perp:A:0"] == Decimal("-0.0625")
+    assert sum(abs(v) for v in book.values()) == Decimal("0.125")
