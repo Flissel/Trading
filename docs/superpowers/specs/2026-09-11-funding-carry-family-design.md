@@ -128,12 +128,18 @@ test"; this family answers "does it survive".
   contracts, 637,308 bars, 2,629,011 settlements at 1, 2, 4 and 8-hour
   intervals. Funding is summed per settlement over the holding window; no
   interval assumption is made.
-- Spot daily bars: not yet captured. Of the 860 perpetuals, 467 have a
-  same-symbol spot pair in the bucket and 7 more a spot pair under a 1000x or
-  1,000,000x multiplier; 386 have no spot leg and are out of scope. Spot daily
-  klines carry the same twelve-column schema as the perpetual ones. Estimated
-  capture: 474 symbols across their listed months, roughly 24,000 sources,
-  about five hours at the measured rate, well under 200 MB.
+- Spot daily bars: not yet captured. Of the 860 perpetuals, 470 have a
+  same-symbol spot pair in the bucket (three of them, 1000CATUSDT,
+  1000CHEEMSUSDT and 1000SATSUSDT, are listed on spot under that same
+  symbol and are direct pairs with multiplier one; the spike of 2026-09-11
+  counted 467 because it classified every `1000` prefix as scaled before
+  checking for a same-named spot symbol) and 7 more a spot pair under a
+  1000x or 1,000,000x multiplier; 383 have no spot leg and are out of scope.
+  Spot daily klines carry the same twelve-column schema as the perpetual
+  ones. Estimated capture: 477 symbols across their listed months, roughly
+  24,000 sources, about five hours at the measured rate, well under 200 MB.
+  Corrected 2026-09-11 while freezing the declaration, before any spot data
+  was captured.
 - Both captures go through the same quality gate and the same daily-dump
   repair as P1.27.
 

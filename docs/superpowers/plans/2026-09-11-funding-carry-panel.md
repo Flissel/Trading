@@ -152,7 +152,7 @@ sys.stdout.write(f"pairs {len(pairs)} excluded {len(excluded)}\n")
 ```
 
 Run: `uv run python <scratchpad>/build_carry_declaration.py`
-Expected: `pairs 467 excluded 7`. If the counts differ from those verified on 2026-09-11, stop and report; the bucket has changed and the spec's section 3.2 needs updating before the family is frozen.
+Expected: `pairs 470 excluded 7` (spec section 3.2 as corrected on 2026-09-11). If the counts differ, stop and report; the bucket has changed and the spec's section 3.2 needs updating before the family is frozen.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -185,7 +185,7 @@ def test_repository_declaration_is_the_frozen_family() -> None:
     assert spec.costs.base.spot_fee_bps_per_side == Decimal("10")
     assert spec.costs.adverse.funding_receipt_multiplier == Decimal("0.75")
     assert spec.selection.minimum_selected == 8
-    assert len(spec.pairs) == 467
+    assert len(spec.pairs) == 470
     assert len(spec.excluded_pairs) == 7
     assert all(p.multiplier == 1 for p in spec.pairs)
     assert all(p.multiplier > 1 for p in spec.excluded_pairs)
@@ -2818,7 +2818,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>"
 
 ## After the plan
 
-Not part of this plan, and to be run in this order per spec section 12: spot capture of the 467 declared spot symbols (discovery mode, no bounds, about five hours), repair it, build the manifest with the repaired P1.27 perpetual capture as `--capture` and the repaired spot capture as `--hedge-capture`, run all folds, build the decision, write `P1_28_DECISION_<date>.md`. The decision record must repeat the spec's section 2.2 contamination disclosure.
+Not part of this plan, and to be run in this order per spec section 12: spot capture of the 470 declared spot symbols (discovery mode, no bounds, about five hours), repair it, build the manifest with the repaired P1.27 perpetual capture as `--capture` and the repaired spot capture as `--hedge-capture`, run all folds, build the decision, write `P1_28_DECISION_<date>.md`. The decision record must repeat the spec's section 2.2 contamination disclosure.
 
 ## Self-review
 
