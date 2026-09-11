@@ -1671,7 +1671,10 @@ def small_carry_config(tmp_path: Path) -> Path:
         {
             "minimum_history_days": 20,
             "liquidity_window_days": 5,
-            "maximum_pairs": 10,
+            # 12, not 10: every fixture symbol shares one quote volume, so a
+            # cap below the symbol count would drop the top-funding symbols by
+            # the lexicographic tie-break at every decision
+            "maximum_pairs": 12,
             "minimum_pairs": 6,
             "tier_one_rank_limit": 4,
         }
