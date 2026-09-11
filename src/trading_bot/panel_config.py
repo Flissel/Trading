@@ -3,11 +3,14 @@
 import json
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from trading_bot.canonical import content_sha256
+
+if TYPE_CHECKING:
+    from trading_bot.carry_config import CarryFamilySpec
 
 MEMBER_NAMES: tuple[str, ...] = (
     "xs_mom_1w",
@@ -132,3 +135,19 @@ def load_panel_family_spec(path: Path) -> tuple[PanelFamilySpec, str]:
     document = json.loads(path.read_text(encoding="utf-8"))
     spec = PanelFamilySpec.model_validate(document)
     return spec, content_sha256(document)
+
+
+def load_family_spec(path: Path) -> "tuple[PanelFamilySpec | CarryFamilySpec, str]":
+    """Load whichever frozen family declaration the file holds.
+
+    Dispatches on ``family_name`` so the walk-forward manifest and the
+    decision module can serve every family without each family's model
+    knowing about the others. Any unknown name falls through to the panel
+    model, whose closed ``family_name`` literal rejects it.
+    """
+    from trading_bot.carry_config import CarryFamilySpec  # local: avoids an import cycle
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(document, dict) and document.get("family_name") == "funding_carry_panel_v1":
+        return CarryFamilySpec.model_validate(document), content_sha256(document)
+    return PanelFamilySpec.model_validate(document), content_sha256(document)
