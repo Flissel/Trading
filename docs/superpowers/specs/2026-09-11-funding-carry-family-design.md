@@ -1,7 +1,7 @@
 # Funding Carry Family Design
 
-Status: Draft for review on 2026-09-11. `research_only`. Not approved for
-implementation. Pre-registers experiment family `funding_carry_panel_v1` under
+Status: Approved in chat on 2026-09-11. `research_only`. Approved for
+implementation planning only. Pre-registers experiment family `funding_carry_panel_v1` under
 `PHASE_0_EVALUATION_PROTOCOL.md` sections 1 to 16 as they stand on 2026-09-11.
 No live, paper, or shadow authority follows from it.
 
