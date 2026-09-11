@@ -39,12 +39,17 @@ HOLE_DAY_OFFSETS = frozenset({121, 122, 123})
 # `minimum_median_quote_volume` (5,000,000) floor pushes that one decision's
 # universe empty while the weeks before and after are untouched.
 LIQUIDITY_DIP_DAY_OFFSETS = frozenset({112, 113, 114, 115, 116})
-# The two weekly funding rows inside decisions 109's and 116's one-week
-# lookback windows -- (102, 109] contains only day 105, (109, 116] contains
-# only day 112 -- forced negative for every symbol so `carry_l1w_h4w` (lookback
-# 1 week) sees no positive-funding pairs at those two decisions, while the
-# 4-week members still see the positive rows at 88, 91 and 98.
-NEGATIVE_FUNDING_DAY_OFFSETS = frozenset({105, 112})
+# The weekly funding rows inside `carry_l1w_h4w`'s one-week lookback windows
+# for the three warm-up Sundays 88, 95 and 102 and the first two decisions 109
+# and 116 -- (81, 88] holds only day 88, (88, 95] only day 91, (95, 102] only
+# day 98, (102, 109] only day 105, (109, 116] only day 112 -- forced negative
+# for every symbol, so the one-week member sees no positive-funding pair at
+# any of them and enters the fold with no book at all. Decision 123's window
+# (116, 123] still holds the positive row at day 119, and the 4-week members
+# still see March's positive rows at 67, 74 and 81.
+# Funding rows restart at each month's first day, so March's are 60, 67, 74,
+# 81, 88 -- day 88, not 84, is the row inside the Sunday-88 window.
+NEGATIVE_FUNDING_DAY_OFFSETS = frozenset({88, 91, 98, 105, 112})
 
 
 def funding_rate(symbol: str) -> str:

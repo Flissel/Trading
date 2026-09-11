@@ -917,6 +917,8 @@ EXTRAS = {
     "basis_pnl": "-0.0005",
     "spot_trading_cost": "0.0002",
     "perpetual_trading_cost": "0.0001",
+    "forced_spot_legs": "0",
+    "forced_perpetual_legs": "1",
 }
 
 
@@ -1022,6 +1024,10 @@ def test_extras_are_averaged_over_retained_base_episodes(tmp_path: Path) -> None
             for scenario in ("base", "adverse"):
                 for index, episode in enumerate(candidate[scenario]["episodes"]):
                     episode["extras"] = dict(EXTRAS)
+                    if scenario == "adverse":
+                        # the mean is over base episodes only, so an adverse
+                        # value must leave no trace in it
+                        episode["extras"]["funding_collected"] = "5"
                     if index == 0:
                         # a held-nothing episode is excluded from the mean, so its
                         # absurd extras value must leave no trace

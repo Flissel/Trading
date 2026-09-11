@@ -101,8 +101,37 @@ def test_forced_leg_is_closed_and_its_partner_keeps_drifting() -> None:
     assert drifted["spot:A:7"] > 0
     # forced close of the perp leg at the last close 105: 0.5 * 10 bps * multiplier 1
     assert r.forced_close_cost == Decimal("0.0005")
+    # spec section 8.4: the forced close is attributed to the leg it happened on
+    assert episode.forced_perpetual_legs == 1
+    assert episode.forced_spot_legs == 0
     # pair attribution still sums to net
     assert dict(r.contract_net_contributions) == {"A:0": r.net_return}
+
+
+def test_forced_spot_leg_pays_the_spot_fee_once() -> None:
+    """The spot leg can lose its exit bar too, and then it -- not the perpetual
+    leg -- is the one force-closed, charged the spot fee rather than the
+    perpetual one, while its partner keeps drifting."""
+    hist = dict(HIST)
+    hist["spot:A:7"] = ContractHistory(
+        contract_id="spot:A:7", instrument_id="spot:A:7",
+        closes={DECISION: Decimal("100"), EXIT - DAY_NS: Decimal("105")},
+        quote_volumes={}, close_times=(DECISION, EXIT - DAY_NS),
+    )
+    episode = evaluate_carry_episode(
+        sample_id="s", member="carry_l1w_h4w", decision_close_ns=DECISION, holding_days=7,
+        leg_weights=LEGS, previous_leg_weights=(), histories=hist, tiers=TIERS,
+        funding_by_leg={}, cost_table=BASE, pair_of_leg=PAIR_OF,
+    )
+    r = episode.result
+    assert r.forced_close_count == 1
+    assert episode.forced_spot_legs == 1
+    assert episode.forced_perpetual_legs == 0
+    # 0.5 * (10 bps spot fee + 5 bps tier-one slippage) * multiplier 1
+    assert r.forced_close_cost == Decimal("0.00075")
+    drifted = dict(r.drifted_weights)
+    assert drifted["spot:A:7"] == Decimal(0)
+    assert drifted["perp:A:0"] != Decimal(0)
 
 
 def test_previous_spot_leg_exit_is_charged_the_spot_fee() -> None:

@@ -130,12 +130,30 @@ def publish_panel_walk_forward(
 
     hedge: dict[str, object] = {}
     if hedge_capture_root is not None:
+        # The hedge leg of a funding-carry pair is the spot leg, and it is a
+        # different capture from the perpetual one. Neither is inferable from
+        # the manifest the two are bound into afterwards, so both are checked
+        # here: a second perpetual capture, or the same capture passed twice,
+        # would bind a manifest to a book that is not the position under test.
+        if hedge_capture_root.resolve() == capture_root.resolve():
+            raise PanelSamplesError("hedge capture must differ from the primary capture")
+        # P1.27's capture predates the `market` key, so its absence means "um".
+        if capture_manifest.get("market", "um") != "um":
+            raise PanelSamplesError(
+                f"primary capture must be a perpetual capture, got market "
+                f"{capture_manifest.get('market', 'um')}"
+            )
         hedge_valid, hedge_errors = verify_panel_capture(hedge_capture_root)
         if not hedge_valid:
             raise PanelSamplesError(
                 "hedge capture verification failed: " + ",".join(hedge_errors)
             )
         hedge_manifest = _load_object(hedge_capture_root / "capture-manifest.json")
+        if hedge_manifest.get("market") != "spot":
+            raise PanelSamplesError(
+                f"hedge capture must be a spot capture, got market "
+                f"{hedge_manifest.get('market')}"
+            )
         hedge_dataset = _load_object(hedge_capture_root / "dataset" / "dataset-manifest.json")
         hedge_bars = load_panel_bars(hedge_capture_root / "dataset")
         hedge_absent = _enforce_capture_quality(

@@ -10,7 +10,13 @@ from pathlib import Path
 import pytest
 
 import trading_bot.panel_samples as panel_samples_module
-from tests.carry_fixtures import build_captures, small_carry_config, spot_fetch_with_a_hole
+from tests.carry_fixtures import (
+    build_captures,
+    perp_fetch,
+    small_carry_config,
+    spot_fetch_with_a_hole,
+)
+from tests.test_panel_fold_run import MONTHS, SYMBOLS
 from trading_bot.canonical import content_sha256
 from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_panel
 from trading_bot.panel_config import PanelFoldGeometry, load_family_spec, load_panel_family_spec
@@ -695,6 +701,36 @@ def test_hedge_capture_names_its_absent_at_source_days(tmp_path: Path) -> None:
     assert set(manifest["hedge_absent_at_source_days"]) == {"C00USDT"}
     assert len(manifest["hedge_absent_at_source_days"]["C00USDT"]) == 3
     assert manifest["absent_at_source_days"] == {}
+
+
+def test_hedge_capture_must_not_be_the_primary_capture(tmp_path: Path) -> None:
+    """One capture passed twice would bind a manifest to a perp-versus-perp
+    book, which is not the position the family declares."""
+    perp, _ = build_captures(tmp_path)
+    spec, spec_hash = load_family_spec(small_carry_config(tmp_path))
+    with pytest.raises(PanelSamplesError, match="differ"):
+        publish_panel_walk_forward(
+            perp, output_path=tmp_path / "m.json", spec=spec,
+            family_spec_hash=spec_hash, hedge_capture_root=perp,
+        )
+    assert not (tmp_path / "m.json").exists()
+
+
+def test_hedge_capture_must_be_a_spot_capture(tmp_path: Path) -> None:
+    """Two distinct captures are not enough: the hedge leg is the spot leg, so
+    a second perpetual capture must be rejected on its declared market."""
+    perp, _ = build_captures(tmp_path)
+    second_perp = capture_panel(
+        workspace_root=tmp_path, output_directory=tmp_path / "perp2", reserve_bytes=0,
+        symbols=SYMBOLS, months=MONTHS, fetch=perp_fetch,
+    ).capture_root
+    spec, spec_hash = load_family_spec(small_carry_config(tmp_path))
+    with pytest.raises(PanelSamplesError, match="spot"):
+        publish_panel_walk_forward(
+            perp, output_path=tmp_path / "m.json", spec=spec,
+            family_spec_hash=spec_hash, hedge_capture_root=second_perp,
+        )
+    assert not (tmp_path / "m.json").exists()
 
 
 def test_hedge_capture_goes_through_the_same_quality_gate(

@@ -136,7 +136,7 @@ test"; this family answers "does it survive".
   checking for a same-named spot symbol) and 7 more a spot pair under a
   1000x or 1,000,000x multiplier; 383 have no spot leg and are out of scope.
   Spot daily klines carry the same twelve-column schema as the perpetual
-  ones. Estimated capture: 477 symbols across their listed months, roughly
+  ones. Estimated capture: 470 symbols across their listed months, roughly
   24,000 sources, about five hours at the measured rate, well under 200 MB.
   Corrected 2026-09-11 while freezing the declaration, before any spot data
   was captured.

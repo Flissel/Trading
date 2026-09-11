@@ -150,6 +150,27 @@ def test_book_holds_the_last_h_cohorts_at_equal_capital() -> None:
     assert list(book) == sorted(book)
 
 
+def test_book_at_thirteen_weeks_drops_the_fourteenth_cohort() -> None:
+    """The longest declared hold, H = 13: the book is the last thirteen cohorts
+    and the fourteenth is out, with unit gross split across 13 * 2 legs. The
+    1/13 share is not exact in Decimal, so gross is bounded, not equal."""
+    cohorts = tuple(
+        Cohort(
+            week * WEEK_NS,
+            (CohortEntry(f"P{week}:0", f"perp:P{week}:0", f"spot:P{week}:7", 1),),
+            (),
+        )
+        for week in range(14)
+    )
+    book = dict(assemble_book(cohorts, hold_weeks=13, decision_close_ns=13 * WEEK_NS))
+    # week 0 is out of the window: 13 - 0 = 13 >= H
+    assert "perp:P0:0" not in book and "spot:P0:7" not in book
+    assert len(book) == 26
+    share = Decimal(1) / Decimal(13) / 2
+    assert all(abs(weight) == share for weight in book.values())
+    assert abs(sum(abs(weight) for weight in book.values()) - Decimal(1)) < Decimal("1e-25")
+
+
 def test_book_with_an_empty_cohort_deploys_less_than_unit_gross() -> None:
     cohorts = (
         Cohort(9 * WEEK_NS, (), ("NO_CARRY_COHORT",)),

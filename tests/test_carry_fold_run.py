@@ -121,7 +121,10 @@ def test_carry_fold_report_has_the_panel_schema_plus_extras(workspace: Workspace
     assert document["hedge_dataset_root_hash"] == manifest["hedge_dataset_root_hash"]
     assert document["capture_root_hash"] == manifest["capture_root_hash"]
     assert document["fold_index"] == 0 and document["fold_count"] == len(manifest["folds"])
-    assert document["reason_codes"] == ["FOLD_FINAL_EXIT_COST_UNCHARGED"]
+    assert document["reason_codes"] == [
+        "FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS", "FOLD_FINAL_EXIT_COST_UNCHARGED",
+    ]
+    assert document["warm_up_weeks"] == 12
     names = [_object_dict(item)["candidate_name"] for item in _object_list(document["candidates"])]
     assert names == list(MEMBER_NAMES + CONTROL_NAMES)
     member = _candidate(document, "carry_l1w_h4w")
@@ -136,6 +139,7 @@ def test_carry_fold_report_has_the_panel_schema_plus_extras(workspace: Workspace
     extras = _object_dict(episode["extras"])
     assert set(extras) == {
         "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
+        "forced_spot_legs", "forced_perpetual_legs",
     }
     contributions = _pairs(episode["contract_net_contributions"])
     # per-pair attribution sums to the episode's net return exactly
@@ -156,11 +160,17 @@ def test_no_trade_control_is_flat(workspace: Workspace) -> None:
             assert episode["reason_codes"] == []
 
 
-def test_book_ramps_over_the_first_hold_weeks(workspace: Workspace) -> None:
-    """A fold starts flat; with H = 4 the first three Sundays deploy 1/4, 2/4, 3/4."""
+def test_book_is_fully_deployed_from_the_first_decision(workspace: Workspace) -> None:
+    """Every fold opens on a book warmed from the twelve Sundays before it, so
+    the first test decision is already fully deployed -- no 1/H ramp, and no
+    member-dependent haircut between an H = 4 and an H = 13 member."""
     document = _run(workspace)
     exposures = [_decimal(e["gross_exposure"]) for e in _episodes(document, "carry_l1w_h4w")]
-    assert exposures == [Decimal("0.25"), Decimal("0.5"), Decimal("0.75")]
+    # 1/4-based shares are exact in Decimal, so this is an equality
+    assert exposures == [Decimal(1), Decimal(1), Decimal(1)]
+    # 1/13-based shares are not exact, so the long-hold member is bounded
+    for episode in _episodes(document, "carry_l4w_h13w"):
+        assert abs(Decimal(1) - _decimal(episode["gross_exposure"])) < Decimal("1e-25")
     # the funding leg collects: every member episode has positive funding_collected
     assert all(
         _decimal(_object_dict(e["extras"])["funding_collected"]) > 0
@@ -173,6 +183,16 @@ def test_book_ramps_over_the_first_hold_weeks(workspace: Workspace) -> None:
         b_funding = _decimal(_object_dict(b["extras"])["funding_collected"])
         a_funding = _decimal(_object_dict(a["extras"])["funding_collected"])
         assert a_funding == b_funding * Decimal("0.75")
+
+
+def test_warm_up_uses_only_data_before_each_warm_up_sunday(workspace: Workspace) -> None:
+    """The warm-up forms cohorts but carries no weights into the fold: the
+    first in-window episode buys the whole warmed book from flat, so its
+    turnover equals its gross exposure and the full entry cost is charged
+    inside the window rather than being inherited untaxed from outside it."""
+    document = _run(workspace)
+    first = _episodes(document, "carry_l1w_h4w")[0]
+    assert _decimal(first["turnover"]) == _decimal(first["gross_exposure"]) == Decimal(1)
 
 
 def test_all_pairs_control_excludes_negative_funding(workspace: Workspace) -> None:
@@ -203,11 +223,12 @@ def test_forced_leg_closes_its_partner_at_the_next_rebalance(
         value for cid, value in third_contributions if cid.startswith(f"{HOLE_SYMBOL}:")
     )
     assert Decimal(hole_contribution) < 0
-    # cohorts 109 [C10,C09] and 116 [C10,C09] each lose C10 to the week-2 forced
-    # close but keep their formed_size of 2, so each still contributes only 1/8
+    # week 3 retains the cohorts of 102, 109 and 116 (the warmed 95 cohort is
+    # four weeks old and has aged out). Each lost C10 to the week-2 forced
+    # close but kept its formed_size of 2, so each still contributes only 1/8
     # gross (its surviving pair, C09, is not reinvested into); the new 123
-    # cohort [C09,C08] contributes 1/4: 1/8 + 1/8 + 1/4 = 1/2.
-    assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.5")
+    # cohort [C09,C08] contributes 1/4: 3 * 1/8 + 1/4 = 5/8.
+    assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.625")
     assert _decimal(episodes[2]["turnover"]) > Decimal("0.25")
 
 
@@ -230,13 +251,15 @@ def test_universe_too_small_week_is_skipped_and_resets_the_book(
     reason_codes = document["reason_codes"]
     assert isinstance(reason_codes, list)
     assert "SKIPPED_WEEK_EXIT_COST_UNCHARGED" in reason_codes
+    assert "FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS" in reason_codes
     # the week is skipped, not evaluated: only the two untouched decisions remain
     episodes = _episodes(document, "carry_l1w_h4w")
     assert len(episodes) == 2
     exposures = [_decimal(e["gross_exposure"]) for e in episodes]
-    # both are 0.25, not 0.25/0.5: the skip resets cohorts AND carried weights,
-    # so the post-skip episode is a fresh start, not a continuation of the ramp
-    assert exposures == [Decimal("0.25"), Decimal("0.25")]
+    # the first decision opens on a warmed, fully deployed book; the skip then
+    # resets cohorts AND carried weights and is not re-warmed (P1.27: after a
+    # skip the fold restarts flat), so the post-skip episode holds one cohort
+    assert exposures == [Decimal(1), Decimal("0.25")]
     # no exit of the pre-skip book is charged (P1.27's uncharged-skip semantics)
     assert _decimal(episodes[1]["turnover"]) == Decimal("0.25")
 
@@ -248,11 +271,15 @@ def test_no_carry_cohort_is_not_a_skip_and_marks_held_nothing(
     root = workspace_with_negative_funding_weeks[0]
     ordered_ids = _ordered_test_sample_ids(root)
     assert document["skipped_sample_ids"] == []
-    assert document["reason_codes"] == ["FOLD_FINAL_EXIT_COST_UNCHARGED"]
+    assert document["reason_codes"] == [
+        "FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS", "FOLD_FINAL_EXIT_COST_UNCHARGED",
+    ]
 
     member = _candidate(document, "carry_l1w_h4w")
     assert member["no_carry_cohort_sample_ids"] == ordered_ids[:2]
     base = _episodes(document, "carry_l1w_h4w")
+    # the warm-up Sundays 88, 95 and 102 see only negative funding too, so the
+    # one-week member enters the fold with no book at all
     assert base[0]["reason_codes"] == ["MEMBER_HELD_NOTHING"]
     assert _decimal(base[0]["gross_exposure"]) == 0
     assert base[1]["reason_codes"] == ["MEMBER_HELD_NOTHING"]
@@ -261,13 +288,11 @@ def test_no_carry_cohort_is_not_a_skip_and_marks_held_nothing(
     assert _decimal(base[2]["gross_exposure"]) == Decimal("0.25")
 
     # the 4-week members still see the positive rows outside the negative
-    # window and keep ramping normally, with no NO_CARRY_COHORT sample ids and
-    # no older cohorts to lose: this pins that the book isn't reset for them
-    l4w_member = _candidate(document, "carry_l4w_h4w")
-    assert l4w_member["no_carry_cohort_sample_ids"] == []
+    # window -- at the warm-up Sundays as well -- so they are warmed and hold
+    # something in every episode: this pins that the book isn't reset for them
     l4w_episodes = _episodes(document, "carry_l4w_h4w")
-    l4w_exposures = [_decimal(e["gross_exposure"]) for e in l4w_episodes]
-    assert l4w_exposures == [Decimal("0.25"), Decimal("0.5"), Decimal("0.75")]
+    assert all(episode["reason_codes"] == [] for episode in l4w_episodes)
+    assert all(_decimal(episode["gross_exposure"]) > 0 for episode in l4w_episodes)
 
     # controls are never marked MEMBER_HELD_NOTHING, in either scenario
     for name in CONTROL_NAMES:
@@ -308,6 +333,16 @@ def test_linkage_to_both_captures_is_enforced(workspace: Workspace, key: str) ->
     _rewrite_manifest_field(workspace[0] / "manifest.json", key, "0" * 64)
     with pytest.raises(CarryFoldError, match=key):
         _run(workspace)
+
+
+def test_the_hedge_capture_must_not_be_the_perpetual_capture(workspace: Workspace) -> None:
+    root, perp, _spot, config_path = workspace
+    with pytest.raises(CarryFoldError):
+        run_carry_fold(
+            perp, perp, manifest_path=root / "manifest.json", family_spec_path=config_path,
+            output_path=root / "fold0.json", registry_path=root / "registry.sqlite3",
+            fold_index=0,
+        )
 
 
 def test_family_spec_mismatch_is_rejected(workspace: Workspace) -> None:

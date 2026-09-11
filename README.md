@@ -238,9 +238,9 @@ schreibt das P1.27-Reportschema, und `panel-decision` bleibt dieselbe Instanz.
 
 ```powershell
 uv run trading-research panel-capture --market spot --output data/captures/<datum>-binance-spot-usdt-1d --symbols <liste>
-uv run trading-research panel-manifest --capture <perp> --hedge-capture <spot> --output artifacts/carry/carry-walk-forward-v1.json --family-spec configs/funding-carry-panel-v1.json
-uv run trading-research carry-fold --capture <perp> --hedge-capture <spot> --manifest <manifest> --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/fold0.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3 --fold-index 0
-uv run trading-research panel-decision --fold-report artifacts/carry/fold0.json --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/decision-v1.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3
+uv run trading-research panel-manifest --capture <perp> --hedge-capture <spot> --output artifacts/carry/carry-walk-forward-<datum>-usdt-pairs-1d-w1-v1.json --family-spec configs/funding-carry-panel-v1.json
+uv run trading-research carry-fold --capture <perp> --hedge-capture <spot> --manifest <manifest> --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/funding-carry-<datum>-fold0-v1.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3 --fold-index 0
+uv run trading-research panel-decision --fold-report artifacts/carry/funding-carry-<datum>-fold0-v1.json --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/funding-carry-<datum>-decision-v1.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3
 ```
 
 ## Harte Grenzen

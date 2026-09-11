@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
 from trading_bot.canonical import canonical_json, content_sha256
-from trading_bot.carry_accounting import CarryEpisode, evaluate_carry_episode
+from trading_bot.carry_accounting import CarryEpisode, evaluate_carry_episode, forced_legs
 from trading_bot.carry_config import (
     CarryControl,
     CarryCostTable,
@@ -17,19 +17,30 @@ from trading_bot.carry_config import (
     load_carry_family_spec,
 )
 from trading_bot.carry_signals import (
+    WEEK_NS,
     Cohort,
     assemble_book,
     select_control_cohort,
     select_member_cohort,
     trailing_funding,
 )
-from trading_bot.carry_universe import select_pair_universe
+from trading_bot.carry_universe import PairUniverseSnapshot, select_pair_universe
 from trading_bot.panel_capture import verify_panel_capture
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
 from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
 from trading_bot.panel_samples import verify_panel_manifest
 from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.registry import ExperimentRecord, MetadataRegistry
+
+# Spec section 8.1 defines the book at t as the union of the last H cohorts.
+# A fold that opened flat would instead ramp 1/H per week for H-1 weeks, and
+# because H differs between members that ramp is a member-dependent haircut on
+# the primary metric. Each fold therefore warms its cohort state over the
+# twelve Sundays preceding its first test decision -- twelve because the
+# longest declared hold is thirteen weeks, so twelve prior cohorts plus the
+# first test decision's own cohort fill the book exactly.
+WARM_UP_WEEKS = 12
+FOLD_WARMED_REASON_CODE = "FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS"
 
 _CARRY_MODULES = (
     "panel_config.py", "panel_dataset.py", "panel_capture.py", "panel_reader.py",
@@ -75,18 +86,30 @@ def run_carry_fold(
     manifest = _load_object(manifest_path)
     if manifest.get("family_spec_hash") != family_spec_hash:
         raise CarryFoldError("family declaration does not match the manifest")
-    _require_link(
-        manifest, "capture_root_hash",
-        _load_object(perp_capture_root / "capture-manifest.json")["capture_root_hash"],
-    )
+    # The two captures are not interchangeable: the perpetual leg carries the
+    # funding and the spot leg is the hedge. Passing one capture twice, or a
+    # second perpetual capture as the hedge, would silently evaluate a
+    # perp-versus-perp book that is not the position under test.
+    if spot_capture_root.resolve() == perp_capture_root.resolve():
+        raise CarryFoldError("hedge capture must differ from the primary capture")
+    perp_manifest = _load_object(perp_capture_root / "capture-manifest.json")
+    spot_manifest = _load_object(spot_capture_root / "capture-manifest.json")
+    # P1.27's capture predates the `market` key, so its absence means "um".
+    if perp_manifest.get("market", "um") != "um":
+        raise CarryFoldError(
+            f"primary capture must be a perpetual capture, got market "
+            f"{perp_manifest.get('market', 'um')}"
+        )
+    if spot_manifest.get("market") != "spot":
+        raise CarryFoldError(
+            f"hedge capture must be a spot capture, got market {spot_manifest.get('market')}"
+        )
+    _require_link(manifest, "capture_root_hash", perp_manifest["capture_root_hash"])
     _require_link(
         manifest, "dataset_root_hash",
         _load_object(perp_capture_root / "dataset" / "dataset-manifest.json")["root_hash"],
     )
-    _require_link(
-        manifest, "hedge_capture_root_hash",
-        _load_object(spot_capture_root / "capture-manifest.json")["capture_root_hash"],
-    )
+    _require_link(manifest, "hedge_capture_root_hash", spot_manifest["capture_root_hash"])
     _require_link(
         manifest, "hedge_dataset_root_hash",
         _load_object(spot_capture_root / "dataset" / "dataset-manifest.json")["root_hash"],
@@ -140,6 +163,38 @@ def run_carry_fold(
         **{c.name: members["carry_l1w_h4w"].lookback_weeks for c in spec.controls},
     }
 
+    # Warm-up: form (only) the cohorts of the twelve Sundays before the fold's
+    # first test decision, so the first test episode opens on a full book
+    # instead of a 1/H stub. No episode is evaluated, nothing is carried and
+    # nothing is reported for these weeks -- `carried` stays empty, so the
+    # first test episode buys the whole warmed book and pays its full entry
+    # turnover inside the window. Bars were loaded with
+    # `available_before_ns = test_end_ns + 1`, which covers these Sundays, and
+    # `select_pair_universe`/`trailing_funding` each read only data at or
+    # before the Sunday they are asked about, so no future data enters here.
+    # A warm-up Sunday whose universe is too small simply contributes no
+    # cohort; there is no state yet to reset.
+    warm_up_closes = (
+        [decisions[0] - weeks * WEEK_NS for weeks in range(WARM_UP_WEEKS, 0, -1)]
+        if decisions
+        else []
+    )
+    for warm_up_close_ns in warm_up_closes:
+        warm_up = select_pair_universe(
+            perp_histories, spot_histories, pairs=spec.pairs,
+            decision_close_ns=warm_up_close_ns, rules=spec.universe,
+        )
+        if not warm_up.pairs:
+            continue
+        for pair in warm_up.pairs:
+            pair_of_leg.setdefault(f"perp:{pair.perpetual_contract_id}", pair.pair_id)
+            pair_of_leg.setdefault(f"spot:{pair.spot_contract_id}", pair.pair_id)
+        for name in names:
+            cohorts[name].append(_cohort_for(
+                name, warm_up, spec=spec, controls=controls,
+                funding_by_leg=funding_by_leg, lookback_weeks=lookback_of[name],
+            ))
+
     for decision_close_ns in decisions:
         sample_id = f"BINANCE_UM:{decision_close_ns}:w1"
         snapshot = select_pair_universe(
@@ -164,20 +219,10 @@ def run_carry_fold(
             pair_of_leg.setdefault(perp_key, pair.pair_id)
             pair_of_leg.setdefault(spot_key, pair.pair_id)
         for name in names:
-            trailing = {
-                pair.pair_id: trailing_funding(
-                    funding_by_leg.get(f"perp:{pair.perpetual_contract_id}", ()),
-                    decision_close_ns=decision_close_ns, lookback_weeks=lookback_of[name],
-                )
-                for pair in snapshot.pairs
-            }
-            if name in members:
-                cohort = select_member_cohort(snapshot, trailing=trailing, selection=spec.selection)
-            else:
-                cohort = select_control_cohort(
-                    snapshot, kind=controls[name].kind, trailing=trailing,
-                    selection=spec.selection, random_seed=spec.statistics.random_seed,
-                )
+            cohort = _cohort_for(
+                name, snapshot, spec=spec, controls=controls,
+                funding_by_leg=funding_by_leg, lookback_weeks=lookback_of[name],
+            )
             if "NO_CARRY_COHORT" in cohort.reason_codes:
                 no_carry[name].append(sample_id)
             cohorts[name].append(cohort)
@@ -197,10 +242,8 @@ def run_carry_fold(
                 )
                 episodes[key].append(episode)
                 carried[key] = episode.result.drifted_weights
-                drifted = dict(episode.result.drifted_weights)
-                for leg, weight in weights:
-                    if weight != 0 and drifted.get(leg, Decimal(0)) == 0:
-                        forced_pairs.add(pair_of_leg[leg])
+                for leg in forced_legs(weights, episode.result.drifted_weights):
+                    forced_pairs.add(pair_of_leg[leg])
             if forced_pairs:
                 cohorts[name] = [
                     Cohort(
@@ -220,6 +263,8 @@ def run_carry_fold(
 
     episode_count = len(episodes[(names[0], "base")])
     reason_codes: list[str] = []
+    if decisions:
+        reason_codes.append(FOLD_WARMED_REASON_CODE)
     if skipped:
         reason_codes.append("SKIPPED_WEEK_EXIT_COST_UNCHARGED")
     if episode_count == 0:
@@ -262,6 +307,7 @@ def run_carry_fold(
         "block_length": spec.statistics.block_length,
         "bootstrap_repetitions": spec.statistics.bootstrap_repetitions,
         "skipped_sample_ids": skipped,
+        "warm_up_weeks": WARM_UP_WEEKS,
         "code_hash": _code_hash(),
         "candidates": candidates,
     }
@@ -274,6 +320,37 @@ def run_carry_fold(
     temporary.replace(output_path)
     _register(spec, manifest, report_hash, registry_path)
     return CarryFoldArtifact(output_path, report_hash, fold_index, episode_count, len(skipped))
+
+
+def _cohort_for(
+    name: str,
+    snapshot: PairUniverseSnapshot,
+    *,
+    spec: CarryFamilySpec,
+    controls: dict[str, CarryControl],
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]],
+    lookback_weeks: int,
+) -> Cohort:
+    """Select one candidate's cohort for one Sunday.
+
+    Shared by the warm-up and the in-window loop so the two cannot drift:
+    a warmed cohort is formed by exactly the rule that forms an in-window
+    one, the only difference being that the warm-up does not evaluate,
+    carry or report anything around it.
+    """
+    trailing = {
+        pair.pair_id: trailing_funding(
+            funding_by_leg.get(f"perp:{pair.perpetual_contract_id}", ()),
+            decision_close_ns=snapshot.decision_close_ns, lookback_weeks=lookback_weeks,
+        )
+        for pair in snapshot.pairs
+    }
+    if name in controls:
+        return select_control_cohort(
+            snapshot, kind=controls[name].kind, trailing=trailing,
+            selection=spec.selection, random_seed=spec.statistics.random_seed,
+        )
+    return select_member_cohort(snapshot, trailing=trailing, selection=spec.selection)
 
 
 def _scenario_record(results: list[CarryEpisode], held_nothing: list[bool]) -> dict[str, object]:
@@ -300,6 +377,8 @@ def _scenario_record(results: list[CarryEpisode], held_nothing: list[bool]) -> d
                     "basis_pnl": item.basis_pnl,
                     "spot_trading_cost": item.spot_trading_cost,
                     "perpetual_trading_cost": item.perpetual_trading_cost,
+                    "forced_spot_legs": Decimal(item.forced_spot_legs),
+                    "forced_perpetual_legs": Decimal(item.forced_perpetual_legs),
                 },
             }
             for item, flag in zip(results, held_nothing, strict=True)

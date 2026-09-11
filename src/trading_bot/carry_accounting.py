@@ -24,6 +24,8 @@ class CarryEpisode:
     basis_pnl: Decimal
     spot_trading_cost: Decimal
     perpetual_trading_cost: Decimal
+    forced_spot_legs: int
+    forced_perpetual_legs: int
 
 
 def evaluate_carry_episode(
@@ -98,12 +100,35 @@ def evaluate_carry_episode(
         drifted_weights=result.drifted_weights,
     )
     spot_cost, perp_cost = _leg_turnover_costs(leg_weights, previous_leg_weights, tiers, cost_table)
+    forced = forced_legs(leg_weights, result.drifted_weights)
+    forced_spot = sum(1 for leg in forced if leg.startswith("spot:"))
     return CarryEpisode(
         result=aggregated,
         funding_collected=-result.funding_cost,
         basis_pnl=result.gross_return,
         spot_trading_cost=spot_cost,
         perpetual_trading_cost=perp_cost,
+        forced_spot_legs=forced_spot,
+        forced_perpetual_legs=len(forced) - forced_spot,
+    )
+
+
+def forced_legs(
+    leg_weights: tuple[tuple[str, Decimal], ...],
+    drifted_weights: tuple[tuple[str, Decimal], ...],
+) -> tuple[str, ...]:
+    """The legs this episode force-closed: held with capital, left at zero.
+
+    The single predicate for "this leg was force-closed", read both by the
+    per-leg counts on `CarryEpisode` (spec section 8.4) and by the fold
+    runner, which strips the whole pair from every retained cohort so the
+    surviving partner leaves at the next rebalance.
+    """
+    drifted = dict(drifted_weights)
+    return tuple(
+        leg
+        for leg, weight in leg_weights
+        if weight != 0 and drifted.get(leg, Decimal(0)) == 0
     )
 
 

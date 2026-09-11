@@ -6,7 +6,10 @@ from tests.carry_fixtures import perp_fetch, small_carry_config, spot_fetch
 from tests.test_panel_fold_run import MONTHS, SYMBOLS
 from trading_bot.cli import main
 
-EXTRAS = {"funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost"}
+EXTRAS = {
+    "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
+    "forced_spot_legs", "forced_perpetual_legs",
+}
 
 
 def test_spot_capture_manifest_carry_folds_and_decision_compose(tmp_path: Path) -> None:
