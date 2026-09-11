@@ -335,6 +335,27 @@ Acceptance:
   member, including the rejected ones, with turnover and deflated Sharpe;
 - the final holdout stays closed.
 
+### P1.28 Funding carry family
+
+Evaluate the pre-registered family `funding_carry_panel_v1`, long-spot short-perpetual
+pairs on Binance selected on trailing realised funding and held through overlapping
+weekly cohorts, under
+`docs/superpowers/specs/2026-09-11-funding-carry-family-design.md` and the evaluation
+protocol as of 2026-09-11.
+
+Acceptance:
+
+- both captures verify and pass the capture quality gate after repair;
+- the manifest binds both captures and reaches the 200-episode floor, otherwise the
+  family stops at `INSUFFICIENT_EVIDENCE`;
+- all three members and three controls are evaluated on every fold in one invocation
+  per fold, and the decision module's gates are the P1.27 gates unchanged;
+- the decision report carries per-member funding collected, basis P&L and the split of
+  turnover cost between legs;
+- the decision record `P1_28_DECISION_<date>.md` records every member, the two spikes
+  that informed the design, and the contamination of the holdout's funding aggregate;
+- the final holdout stays closed.
+
 ## Explicitly deferred
 
 - real-capital execution;

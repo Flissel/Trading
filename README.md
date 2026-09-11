@@ -229,6 +229,20 @@ Die Familie ist vor dem ersten Datenabruf eingefroren: sechs Mitglieder, drei
 Kontrollen, keine Parametersuche, alles in `configs/xs-momentum-panel-v1.json`,
 dessen SHA-256 in jedem Report als `family_spec_hash` steht.
 
+### Funding-Carry (P1.28)
+
+Zweite Panel-Familie: long Spot, short Perpetual, ausgewählt nach dem zuletzt gezahlten
+Funding, gehalten über überlappende Wochen-Kohorten. Das Spot-Bein kommt über
+`panel-capture --market spot`, das Manifest bindet beide Captures, der Fold-Runner
+schreibt das P1.27-Reportschema, und `panel-decision` bleibt dieselbe Instanz.
+
+```powershell
+uv run trading-research panel-capture --market spot --output data/captures/<datum>-binance-spot-usdt-1d --symbols <liste>
+uv run trading-research panel-manifest --capture <perp> --hedge-capture <spot> --output artifacts/carry/carry-walk-forward-v1.json --family-spec configs/funding-carry-panel-v1.json
+uv run trading-research carry-fold --capture <perp> --hedge-capture <spot> --manifest <manifest> --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/fold0.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3 --fold-index 0
+uv run trading-research panel-decision --fold-report artifacts/carry/fold0.json --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/decision-v1.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3
+```
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.
