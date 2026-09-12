@@ -5,8 +5,9 @@ leg on Binance's public order books at three notionals. This module holds the
 frozen record shapes, the two pure functions the sampler needs - the walk of a
 displayed book to a quote notional and the parse of one depth payload into an
 observation - and the journal itself: the sample derived from the two carry
-captures, the hash-chained run loop, its verification and the one fetcher that
-is allowed to reach Binance.
+captures, the hash-chained run loop, its verification, the one fetcher that is
+allowed to reach Binance and the finalisation receipt a carry declaration may
+cite once the journal has run its seven days.
 """
 
 import http.client
@@ -17,7 +18,7 @@ import shutil
 import time
 import urllib.request
 from collections.abc import Callable, Mapping, Sequence
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal, Self
 from urllib.parse import urlsplit
@@ -42,6 +43,7 @@ from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.storage import StoragePolicy
 
 JOURNAL_VERSION = "binance-cost-journal/1.0.0"
+RECEIPT_VERSION = "binance-cost-journal-receipt/1.0.0"
 NOTIONALS: tuple[Decimal, ...] = (Decimal("500"), Decimal("5000"), Decimal("50000"))
 DEPTH_LIMIT = 500
 SAMPLE_INTERVAL_SECONDS = 61
@@ -51,6 +53,18 @@ SAMPLE_INTERVAL_SECONDS = 61
 TARGET_ROUNDS = 11_000
 MINIMUM_OBSERVATIONS = 10_000
 MINIMUM_SPAN_NS = 7 * 86_400_000_000_000
+# Spec 4: both floors are read at the 5 000 USDT notional, over the observations
+# whose displayed book could fill it.
+ELIGIBILITY_NOTIONAL = "5000"
+# Spec 5, verbatim and unwrapped: the only admissible reading of a receipt,
+# declared before any number existed. A receipt carrying a different sentence is
+# refused by the model below.
+DECLARATION_RULE = (
+    "a v3 family sets `slippage_bps_per_side_tier_<t>` in its base table to "
+    "`tier_p50_of_p50` of the *worse leg* at 5 000 USDT and in its adverse table to "
+    "`tier_p50_of_p90` at 50 000 USDT, rounded **up** to the next whole basis point, and "
+    "cites the receipt hash. No other reading of the receipt is admissible for a declaration."
+)
 ALLOWED_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
 ZERO_HASH = "0" * 64
 # Spec 2: fees are declared, never measured. The evidence id names the schedule
@@ -71,6 +85,18 @@ type Fetcher = Callable[[str], Mapping[str, object]]
 
 _BPS = Decimal(10_000)
 _BPS_QUANTUM = Decimal("0.000001")
+_P50 = Decimal("0.5")
+_P90 = Decimal("0.9")
+_P99 = Decimal("0.99")
+_QUANTILES: tuple[tuple[str, Decimal], ...] = (("p50", _P50), ("p90", _P90), ("p99", _P99))
+_QUANTILE_NAMES: tuple[str, ...] = tuple(name for name, _ in _QUANTILES)
+_INSTRUMENT_STATISTIC_KEYS: tuple[str, ...] = ("count", "insufficient_depth", *_QUANTILE_NAMES)
+_TIER_STATISTIC_KEYS: tuple[str, ...] = ("p50_of_p50", "p50_of_p90")
+# Spec 5 reports every declared tier and leg, whether or not the sample reached it.
+_RECEIPT_TIERS: tuple[int, ...] = (1, 2)
+_RECEIPT_MARKETS: tuple[str, ...] = ("spot", "um")
+_OBSERVATION_FLOOR_CODE = "COST_OBSERVATION_FLOOR_NOT_MET"
+_SPAN_FLOOR_CODE = "COST_CAPTURE_SPAN_FLOOR_NOT_MET"
 _NOTIONAL_QUANTUM = Decimal("0.01")
 _MARKET_HOSTS: Mapping[str, str] = {"spot": "api.binance.com", "um": "fapi.binance.com"}
 _MARKET_PREFIXES: Mapping[str, str] = {"spot": "spot", "um": "perp"}
@@ -361,6 +387,163 @@ class ChainHead(_Frozen):
         if value < 0:
             raise ValueError("segment count and last sequence cannot be negative")
         return value
+
+
+class InstrumentStatistics(_Frozen):
+    """What one sampled instrument's measured rounds came to, and whether they count.
+
+    ``observation_count`` is how many rounds the instrument was measured in; a
+    notional's ``count`` is how many of those filled it and ``insufficient_depth``
+    how many did not, so the two always add up to the observation count.
+    ``first_time_ns`` and ``last_time_ns`` are the stamps the span floor is read
+    between - the first and the last observation that filled the eligibility
+    notional - so the eligibility decision can be recomputed from the receipt.
+    An ineligible instrument still carries its statistics; only the tier medians
+    pass it by (spec 4).
+    """
+
+    instrument_id: str
+    tier: int
+    market: str
+    eligible: bool
+    reason_codes: tuple[str, ...]
+    observation_count: int
+    first_time_ns: int | None
+    last_time_ns: int | None
+    spread_bps_p50: Decimal | None
+    slippage: dict[str, dict[str, Decimal | int | None]]
+    basis_bps_p50: Decimal | None
+
+    @field_validator("slippage")
+    @classmethod
+    def validate_slippage(
+        cls, value: dict[str, dict[str, Decimal | int | None]]
+    ) -> dict[str, dict[str, Decimal | int | None]]:
+        if not value:
+            raise ValueError("statistics carry one entry per sampled notional")
+        for entry in value.values():
+            if set(entry) != set(_INSTRUMENT_STATISTIC_KEYS):
+                raise ValueError(f"a notional's statistics are {_INSTRUMENT_STATISTIC_KEYS}")
+            for name in ("count", "insufficient_depth"):
+                count = entry[name]
+                if not isinstance(count, int) or count < 0:
+                    raise ValueError("counts are non-negative integers")
+            if any(not isinstance(entry[name], Decimal | None) for name in _QUANTILE_NAMES):
+                raise ValueError("a quantile is a decimal or absent")
+        return value
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> Self:
+        if not self.instrument_id:
+            raise ValueError("instrument_id must be set")
+        if self.tier not in _RECEIPT_TIERS or self.market not in _RECEIPT_MARKETS:
+            raise ValueError("statistics carry a declared tier and market")
+        if self.eligible != (not self.reason_codes):
+            raise ValueError("an instrument is eligible exactly when no floor was missed")
+        if self.observation_count < 0:
+            raise ValueError("the observation count cannot be negative")
+        if (self.first_time_ns is None) != (self.last_time_ns is None):
+            raise ValueError("the eligibility window is either absent or complete")
+        if self.first_time_ns is not None and self.last_time_ns is not None:
+            if self.first_time_ns <= 0:
+                raise ValueError("the eligibility window opens at a positive stamp")
+            if self.last_time_ns < self.first_time_ns:
+                raise ValueError("the eligibility window cannot close before it opens")
+        return self
+
+
+class TierStatistics(_Frozen):
+    """The medians one tier's eligible instruments reached on one market.
+
+    ``p50_of_p50`` and ``p50_of_p90`` are the medians of the members' p50s and
+    p90s at that notional, taken under the same quantile rule. A tier and market
+    with no eligible member is emitted all the same, with no members and no
+    numbers: the receipt says that it measured nothing there rather than leaving
+    the reader to infer it from an absence.
+    """
+
+    tier: int
+    market: str
+    instrument_count: int
+    slippage: dict[str, dict[str, Decimal | None]]
+
+    @field_validator("slippage")
+    @classmethod
+    def validate_slippage(
+        cls, value: dict[str, dict[str, Decimal | None]]
+    ) -> dict[str, dict[str, Decimal | None]]:
+        if not value:
+            raise ValueError("tier statistics carry one entry per sampled notional")
+        if any(set(entry) != set(_TIER_STATISTIC_KEYS) for entry in value.values()):
+            raise ValueError(f"a notional's tier statistics are {_TIER_STATISTIC_KEYS}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> Self:
+        if self.tier not in _RECEIPT_TIERS or self.market not in _RECEIPT_MARKETS:
+            raise ValueError("tier statistics carry a declared tier and market")
+        if self.instrument_count < 0:
+            raise ValueError("the instrument count cannot be negative")
+        if self.instrument_count == 0 and any(
+            value is not None for entry in self.slippage.values() for value in entry.values()
+        ):
+            raise ValueError("a tier with no eligible instrument carries no median")
+        return self
+
+
+class FinalizationReceipt(_Frozen):
+    """The immutable, self-hashed reading of a finished journal.
+
+    It binds the journal it was taken from (the spec hash, the chain head's own
+    hash and the number of segments), repeats the declared fees the journal
+    never measured, carries the sample's statistics and the tier medians, and
+    states in ``declaration_rule`` the one use a carry declaration may make of
+    it. Anything else on top of these numbers is not a reading of this receipt.
+    """
+
+    version: Literal["binance-cost-journal-receipt/1.0.0"]
+    spec_hash: str
+    chain_head_hash: str
+    segment_count: int
+    spot_fee_bps_per_side: Decimal
+    perpetual_fee_bps_per_side: Decimal
+    fee_evidence_id: str
+    instruments: tuple[InstrumentStatistics, ...]
+    tiers: tuple[TierStatistics, ...]
+    declaration_rule: str
+    content_hash: str
+
+    @field_validator("spec_hash", "chain_head_hash", "content_hash")
+    @classmethod
+    def validate_hashes(cls, value: str) -> str:
+        return _validated_hex(value, field_name="receipt hash")
+
+    @field_validator("fee_evidence_id")
+    @classmethod
+    def validate_identifier(cls, value: str) -> str:
+        if not _IDENTIFIER.match(value):
+            raise ValueError("identifiers are non-empty and free of whitespace")
+        return value
+
+    @field_validator("declaration_rule")
+    @classmethod
+    def validate_declaration_rule(cls, value: str) -> str:
+        if value != DECLARATION_RULE:
+            raise ValueError("a receipt carries spec section 5's declaration rule verbatim")
+        return value
+
+    @model_validator(mode="after")
+    def validate_content(self) -> Self:
+        if self.segment_count <= 0:
+            raise ValueError("a receipt summarises at least one segment")
+        if not self.instruments or not self.tiers:
+            raise ValueError("a receipt lists the sample and every declared tier")
+        identifiers = [item.instrument_id for item in self.instruments]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("an instrument is summarised at most once")
+        if min(self.spot_fee_bps_per_side, self.perpetual_fee_bps_per_side) < 0:
+            raise ValueError("declared fees cannot be negative")
+        return self
 
 
 def walk_notional(levels: Sequence[tuple[Decimal, Decimal]], notional: Decimal) -> Decimal | None:
@@ -800,6 +983,68 @@ def verify_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
     return not reasons, tuple(reasons)
 
 
+def finalize_journal(
+    *, workspace_root: Path, journal_root: Path, output_path: Path, reserve_bytes: int
+) -> Path:
+    """Publish the journal's finalisation receipt and return its path.
+
+    The whole chain is verified before a single number is computed, so a
+    tampered, unreadable or foreign journal produces no receipt at all, and the
+    receipt is immutable: an output that already exists is refused rather than
+    replaced. Statistics are computed over the measured (``ok``) observations of
+    every sampled instrument, eligible or not; only the tier medians are taken
+    over the eligible ones (spec 4). A journal that never sampled the
+    eligibility notional is refused - eligibility is declared at 5 000 USDT and
+    cannot be read off anything else.
+    """
+    root = _authorize(workspace_root, journal_root, reserve_bytes)
+    output = _authorize(workspace_root, output_path, reserve_bytes)
+    if output.exists():
+        raise BinanceCostJournalSpecError("this receipt already exists and is immutable")
+    spec, spec_hash = load_journal_spec(root)
+    keys = _notional_keys(spec.notionals)
+    if ELIGIBILITY_NOTIONAL not in keys:
+        raise BinanceCostJournalSpecError(
+            f"this journal never sampled the {ELIGIBILITY_NOTIONAL} USDT eligibility notional"
+        )
+    valid, reasons = verify_journal(root)
+    if not valid:
+        raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
+    head = _read_chain_head(root)
+    if head is None:
+        raise BinanceCostJournalSpecError("this journal holds no segment to finalise")
+    measured = _measured_observations(root)
+    instruments = tuple(
+        _instrument_statistics(
+            instrument, measured.get(instrument.instrument_id, ()), keys=keys
+        )
+        for instrument in spec.instruments
+    )
+    tiers = tuple(
+        _tier_statistics(instruments, tier=tier, market=market, keys=keys)
+        for tier in _RECEIPT_TIERS
+        for market in _RECEIPT_MARKETS
+    )
+    material: dict[str, object] = {
+        "version": RECEIPT_VERSION,
+        "spec_hash": spec_hash,
+        # The head's own hash binds the spec, the count and the final segment.
+        "chain_head_hash": head.content_hash,
+        "segment_count": head.segment_count,
+        "spot_fee_bps_per_side": str(spec.spot_fee_bps_per_side),
+        "perpetual_fee_bps_per_side": str(spec.perpetual_fee_bps_per_side),
+        "fee_evidence_id": spec.fee_evidence_id,
+        "instruments": [item.model_dump(mode="json") for item in instruments],
+        "tiers": [item.model_dump(mode="json") for item in tiers],
+        "declaration_rule": DECLARATION_RULE,
+    }
+    receipt = FinalizationReceipt.model_validate(
+        {**material, "content_hash": content_sha256(material)}
+    )
+    _publish(output, receipt.model_dump(mode="json"))
+    return output
+
+
 def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
     """GET one public Binance JSON object over HTTPS with a 20 s timeout.
 
@@ -1106,6 +1351,117 @@ def _chain_head_reasons(
     if head.final_segment_hash != final_segment_hash:
         reasons.append("CHAIN_HEAD_LINK_MISMATCH")
     return reasons
+
+
+def _measured_observations(journal_root: Path) -> dict[str, list[InstrumentObservation]]:
+    """Every ``ok`` observation of a verified journal, per instrument, in round order.
+
+    The segments are read again rather than kept from the verification pass, so
+    the numbers are computed from the bytes that verified and from nothing else.
+    """
+    directory = journal_root / SEGMENT_DIRECTORY_NAME
+    paths = sorted(path for path in directory.glob("*.json") if _SEGMENT_NAME.match(path.name))
+    measured: dict[str, list[InstrumentObservation]] = {}
+    for path in paths:
+        document = _read_object(path, label="a journal segment")
+        try:
+            segment = JournalSegment.model_validate(document)
+        except ValidationError as error:
+            raise BinanceCostJournalSpecError(f"a journal segment is invalid: {error}") from error
+        for observation in segment.observations:
+            if observation.ok:
+                measured.setdefault(observation.instrument_id, []).append(observation)
+    return measured
+
+
+def _instrument_statistics(
+    instrument: JournalInstrument,
+    observations: Sequence[InstrumentObservation],
+    *,
+    keys: Sequence[str],
+) -> InstrumentStatistics:
+    """Summarise one instrument's measured rounds and decide its eligibility."""
+    slippage: dict[str, dict[str, Decimal | int | None]] = {}
+    for key in keys:
+        values = [observation.slippage_bps_per_side.get(key) for observation in observations]
+        filled = [value for value in values if value is not None]
+        slippage[key] = {
+            "count": len(filled),
+            "insufficient_depth": len(values) - len(filled),
+            **{name: _quantile_or_none(filled, quantile) for name, quantile in _QUANTILES},
+        }
+    window = [
+        observation
+        for observation in observations
+        if observation.slippage_bps_per_side.get(ELIGIBILITY_NOTIONAL) is not None
+    ]
+    first_time_ns: int | None = None
+    last_time_ns: int | None = None
+    span_ns: int | None = None
+    if window:
+        first_time_ns = window[0].received_time_ns
+        last_time_ns = window[-1].received_time_ns
+        span_ns = last_time_ns - first_time_ns
+    reason_codes: list[str] = []
+    if len(window) < MINIMUM_OBSERVATIONS:
+        reason_codes.append(_OBSERVATION_FLOOR_CODE)
+    if span_ns is None or span_ns < MINIMUM_SPAN_NS:
+        reason_codes.append(_SPAN_FLOOR_CODE)
+    spreads = [item.spread_bps for item in observations if item.spread_bps is not None]
+    bases = [item.basis_bps for item in observations if item.basis_bps is not None]
+    return InstrumentStatistics(
+        instrument_id=instrument.instrument_id,
+        tier=instrument.tier,
+        market=instrument.market,
+        eligible=not reason_codes,
+        reason_codes=tuple(reason_codes),
+        observation_count=len(observations),
+        first_time_ns=first_time_ns,
+        last_time_ns=last_time_ns,
+        spread_bps_p50=_quantile_or_none(spreads, _P50),
+        slippage=slippage,
+        basis_bps_p50=_quantile_or_none(bases, _P50),
+    )
+
+
+def _tier_statistics(
+    instruments: Sequence[InstrumentStatistics], *, tier: int, market: str, keys: Sequence[str]
+) -> TierStatistics:
+    """The medians of one tier's eligible instruments on one market, notional by notional."""
+    members = [
+        item
+        for item in instruments
+        if item.eligible and item.tier == tier and item.market == market
+    ]
+    slippage: dict[str, dict[str, Decimal | None]] = {
+        key: {
+            "p50_of_p50": _quantile_or_none(_member_quantiles(members, key=key, name="p50"), _P50),
+            "p50_of_p90": _quantile_or_none(_member_quantiles(members, key=key, name="p90"), _P50),
+        }
+        for key in keys
+    }
+    return TierStatistics(
+        tier=tier, market=market, instrument_count=len(members), slippage=slippage
+    )
+
+
+def _member_quantiles(
+    members: Sequence[InstrumentStatistics], *, key: str, name: str
+) -> list[Decimal]:
+    """One quantile of every member at one notional, skipping those that never filled it."""
+    values = [item.slippage.get(key, {}).get(name) for item in members]
+    return [value for value in values if isinstance(value, Decimal)]
+
+
+def _quantile(values: Sequence[Decimal], quantile: Decimal) -> Decimal:
+    """The OKX journal's rule: the ``ceil(n * q) - 1`` index of the ascending values."""
+    ordered = sorted(values)
+    index = int((Decimal(len(ordered)) * quantile).to_integral_value(rounding=ROUND_CEILING)) - 1
+    return ordered[max(index, 0)]
+
+
+def _quantile_or_none(values: Sequence[Decimal], quantile: Decimal) -> Decimal | None:
+    return _quantile(values, quantile) if values else None
 
 
 def _authorize(workspace_root: Path, journal_root: Path, reserve_bytes: int) -> Path:

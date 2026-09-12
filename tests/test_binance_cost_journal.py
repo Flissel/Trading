@@ -14,6 +14,7 @@ from tests.carry_fixtures import build_captures, small_carry_config
 from tests.test_panel_fold_run import DAY_MS, EPOCH_DAY_2020, MONTH_START_DAY
 from trading_bot.binance_cost_journal import (
     ALLOWED_HOSTS,
+    DECLARATION_RULE,
     DEPTH_LIMIT,
     FEE_EVIDENCE_ID,
     JOURNAL_VERSION,
@@ -29,12 +30,16 @@ from trading_bot.binance_cost_journal import (
     BinanceCostJournalSpec,
     BinanceCostJournalSpecError,
     ChainHead,
+    FinalizationReceipt,
     InstrumentObservation,
+    InstrumentStatistics,
     JournalInstrument,
     JournalSegment,
+    TierStatistics,
     create_journal,
     depth_observation,
     derive_sample,
+    finalize_journal,
     public_binance_json_fetcher,
     run_journal,
     verify_journal,
@@ -1370,3 +1375,406 @@ def test_more_than_one_trailing_segment_is_corruption_not_a_kill(tmp_path: Path)
         )
     assert read_document(journal / "chain-head.json") == head_before
     assert len(segment_documents(journal)) == 3
+
+
+# --- Task 3: finalisation receipt ---------------------------------------------------
+
+SPEC_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-09-12-binance-cost-journal-design.md"
+)
+NOTIONAL_KEYS = ("500", "5000", "50000")
+FLOORS_NOT_MET = ("COST_OBSERVATION_FLOOR_NOT_MET", "COST_CAPTURE_SPAN_FLOOR_NOT_MET")
+
+
+class LadderVenue:
+    """A fetcher whose book is one deep level a side, widening by a round.
+
+    Round k of an instrument quotes bid `100 - m*k` and ask `100 + m*k` around a
+    mid of 100, where m is the symbol's multiplier (1 where none is declared), so
+    the spread is `200*m*k` bps and the slippage at every notional the level can
+    fill is exactly half of it: `100*m*k` bps. The round counter is kept per
+    depth URL, so a pair's two legs widen together. `depth` sets a symbol's level
+    quantity and `thin_rounds` overrides it for one round - both leave the larger
+    notionals unfillable, which is what `insufficient_depth` counts.
+    """
+
+    def __init__(
+        self,
+        *,
+        multipliers: Mapping[str, int] | None = None,
+        depth: Mapping[str, str] | None = None,
+        thin_rounds: Mapping[int, str] | None = None,
+    ) -> None:
+        self.multipliers = dict(multipliers or {})
+        self.depth = dict(depth or {})
+        self.thin_rounds = dict(thin_rounds or {})
+        self.rounds: dict[str, int] = {}
+
+    def __call__(self, url: str) -> Mapping[str, object]:
+        symbol = parse_qs(urlsplit(url).query)["symbol"][0]
+        if "premiumIndex" in url:
+            return {**premium_document(), "symbol": symbol}
+        round_index = self.rounds.get(url, 0) + 1
+        self.rounds[url] = round_index
+        width = self.multipliers.get(symbol, 1) * round_index
+        quantity = self.thin_rounds.get(round_index, self.depth.get(symbol, "1000"))
+        return {
+            "lastUpdateId": 1_000 + round_index,
+            "bids": [[str(100 - width), quantity]],
+            "asks": [[str(100 + width), quantity]],
+        }
+
+
+def leg_document(symbol: str, *, market: str, tier: int) -> dict[str, object]:
+    if market == "spot":
+        return {
+            "instrument_id": f"spot:{symbol}",
+            "market": "spot",
+            "symbol": symbol,
+            "pair_symbol": symbol,
+            "tier": tier,
+            "depth_url": f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=500",
+            "premium_index_url": None,
+        }
+    return {
+        "instrument_id": f"perp:{symbol}",
+        "market": "um",
+        "symbol": symbol,
+        "pair_symbol": symbol,
+        "tier": tier,
+        "depth_url": f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit=500",
+        "premium_index_url": f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}",
+    }
+
+
+def lower_the_eligibility_floors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Five observations over a nanosecond stand in for 10 000 over seven days."""
+    monkeypatch.setattr("trading_bot.binance_cost_journal.MINIMUM_OBSERVATIONS", 5)
+    monkeypatch.setattr("trading_bot.binance_cost_journal.MINIMUM_SPAN_NS", 1)
+
+
+def journal_with_rounds(
+    tmp_path: Path,
+    *,
+    rounds: int,
+    fetcher: Callable[[str], Mapping[str, object]],
+    **overrides: object,
+) -> Path:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal, **overrides)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=rounds,
+        fetcher=fetcher, clock=FakeClock(), sleep=FakeSleep(),
+    )
+    return journal
+
+
+def finalized_receipt(tmp_path: Path, journal: Path) -> tuple[FinalizationReceipt, Path]:
+    output = finalize_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        output_path=tmp_path / "receipt.json",
+        reserve_bytes=0,
+    )
+    return FinalizationReceipt.model_validate(read_document(output)), output
+
+
+def statistics_of(receipt: FinalizationReceipt, instrument_id: str) -> InstrumentStatistics:
+    return next(item for item in receipt.instruments if item.instrument_id == instrument_id)
+
+
+def tier_of(receipt: FinalizationReceipt, *, tier: int, market: str) -> TierStatistics:
+    return next(item for item in receipt.tiers if item.tier == tier and item.market == market)
+
+
+def spec_declaration_sentence() -> str:
+    """The rule as spec section 5 writes it, unwrapped to one line."""
+    text = SPEC_PATH.read_text(encoding="utf-8")
+    start = text.index("exists):**") + len("exists):**")
+    return " ".join(text[start : text.index("\n\n", start)].split())
+
+
+def test_the_receipt_carries_hand_computed_quantiles_and_depth_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eight widening rounds: round 3 fills 500 only, round 6 all but 50 000.
+
+    The slippage of round k is 100*k bps, so the samples are 100..800 at "500",
+    the same without 300 at "5000" and without 300 and 600 at "50000"; the
+    quantile index is ceil(n*q) - 1 over the ascending values.
+    """
+    lower_the_eligibility_floors(monkeypatch)
+    journal = journal_with_rounds(
+        tmp_path, rounds=8, fetcher=LadderVenue(thin_rounds={3: "30", 6: "100"})
+    )
+    receipt, _ = finalized_receipt(tmp_path, journal)
+
+    assert receipt.version == "binance-cost-journal-receipt/1.0.0"
+    assert [item.instrument_id for item in receipt.instruments] == ["spot:BTCUSDT", "perp:BTCUSDT"]
+    spot = statistics_of(receipt, "spot:BTCUSDT")
+    assert (spot.tier, spot.market, spot.eligible, spot.reason_codes) == (1, "spot", True, ())
+    assert spot.observation_count == 8
+    assert spot.spread_bps_p50 == Decimal("800")
+    assert spot.basis_bps_p50 is None
+    assert spot.slippage == {
+        "500": {
+            "count": 8, "insufficient_depth": 0,
+            "p50": Decimal("400"), "p90": Decimal("800"), "p99": Decimal("800"),
+        },
+        "5000": {
+            "count": 7, "insufficient_depth": 1,
+            "p50": Decimal("500"), "p90": Decimal("800"), "p99": Decimal("800"),
+        },
+        "50000": {
+            "count": 6, "insufficient_depth": 2,
+            "p50": Decimal("400"), "p90": Decimal("800"), "p99": Decimal("800"),
+        },
+    }
+    # A perpetual measures the same book and carries the premium index's basis.
+    perpetual = statistics_of(receipt, "perp:BTCUSDT")
+    assert (perpetual.tier, perpetual.market, perpetual.eligible) == (1, "um", True)
+    assert perpetual.slippage == spot.slippage
+    assert perpetual.basis_bps_p50 == Decimal("50")
+    # Counts stay integers through the canonical form; quantiles are strings.
+    document = read_document(tmp_path / "receipt.json")
+    instruments = document["instruments"]
+    assert isinstance(instruments, list)
+    assert instruments[0]["slippage"]["500"] == {
+        "count": 8, "insufficient_depth": 0,
+        "p50": "400.000000", "p90": "800.000000", "p99": "800.000000",
+    }
+
+
+def test_the_span_is_measured_between_the_eligibility_notional_s_observations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 1 fills 500 only, so the 5 000 USDT window opens in round 2."""
+    lower_the_eligibility_floors(monkeypatch)
+    journal = journal_with_rounds(tmp_path, rounds=8, fetcher=LadderVenue(thin_rounds={1: "30"}))
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    spot = statistics_of(receipt, "spot:BTCUSDT")
+    stamps = [
+        next(
+            item
+            for item in observations_of(document)
+            if item["instrument_id"] == "spot:BTCUSDT"
+        )["received_time_ns"]
+        for document in segment_documents(journal)
+    ]
+    assert spot.observation_count == 8
+    assert spot.slippage["5000"]["count"] == 7
+    assert (spot.first_time_ns, spot.last_time_ns) == (stamps[1], stamps[7])
+
+
+def test_an_instrument_that_never_reported_carries_no_statistics(tmp_path: Path) -> None:
+    journal = journal_with_rounds(
+        tmp_path, rounds=3, fetcher=FakeVenue(dark=("fapi.binance.com",))
+    )
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    perpetual = statistics_of(receipt, "perp:BTCUSDT")
+    assert perpetual.observation_count == 0
+    assert (perpetual.first_time_ns, perpetual.last_time_ns) == (None, None)
+    assert perpetual.spread_bps_p50 is None
+    assert perpetual.basis_bps_p50 is None
+    assert perpetual.slippage["5000"] == {
+        "count": 0, "insufficient_depth": 0, "p50": None, "p90": None, "p99": None,
+    }
+    assert perpetual.reason_codes == FLOORS_NOT_MET
+
+
+def test_a_journal_short_of_the_floors_leaves_every_tier_empty(tmp_path: Path) -> None:
+    """Eight rounds are neither 10 000 observations nor seven days."""
+    journal = journal_with_rounds(tmp_path, rounds=8, fetcher=LadderVenue())
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    spot = statistics_of(receipt, "spot:BTCUSDT")
+    assert spot.eligible is False
+    assert spot.reason_codes == FLOORS_NOT_MET
+    # An ineligible instrument still carries its own statistics (spec 4).
+    assert spot.spread_bps_p50 == Decimal("800")
+    assert [(item.tier, item.market) for item in receipt.tiers] == [
+        (1, "spot"), (1, "um"), (2, "spot"), (2, "um"),
+    ]
+    for tier in receipt.tiers:
+        assert tier.instrument_count == 0
+        assert tier.slippage == {
+            key: {"p50_of_p50": None, "p50_of_p90": None} for key in NOTIONAL_KEYS
+        }
+
+
+def test_tier_statistics_take_the_median_over_eligible_instruments_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three tier-one spot legs at 400/800/1200 bps and an ineligible tier-two leg.
+
+    The tier-two perpetual's book holds 3 000 USDT, so it never fills the
+    eligibility notional: it keeps its own statistics at 500 USDT and feeds no
+    tier median.
+    """
+    lower_the_eligibility_floors(monkeypatch)
+    instruments = [
+        leg_document("AAAUSDT", market="spot", tier=1),
+        leg_document("BBBUSDT", market="spot", tier=1),
+        leg_document("CCCUSDT", market="spot", tier=1),
+        leg_document("DDDUSDT", market="um", tier=2),
+    ]
+    venue = LadderVenue(multipliers={"BBBUSDT": 2, "CCCUSDT": 3}, depth={"DDDUSDT": "30"})
+    journal = journal_with_rounds(tmp_path, rounds=8, fetcher=venue, instruments=instruments)
+    receipt, _ = finalized_receipt(tmp_path, journal)
+
+    assert [item.eligible for item in receipt.instruments] == [True, True, True, False]
+    assert [
+        statistics_of(receipt, f"spot:{symbol}").slippage["5000"]["p50"]
+        for symbol in ("AAAUSDT", "BBBUSDT", "CCCUSDT")
+    ] == [Decimal("400"), Decimal("800"), Decimal("1200")]
+    tier_one_spot = tier_of(receipt, tier=1, market="spot")
+    assert tier_one_spot.instrument_count == 3
+    # Medians of (400, 800, 1200) and of (800, 1600, 2400) under the same rule.
+    assert tier_one_spot.slippage["5000"] == {
+        "p50_of_p50": Decimal("800"), "p50_of_p90": Decimal("1600"),
+    }
+    ineligible = statistics_of(receipt, "perp:DDDUSDT")
+    assert ineligible.reason_codes == FLOORS_NOT_MET
+    assert ineligible.slippage["500"]["count"] == 8
+    assert ineligible.slippage["5000"] == {
+        "count": 0, "insufficient_depth": 8, "p50": None, "p90": None, "p99": None,
+    }
+    for absent in (tier_of(receipt, tier=1, market="um"), tier_of(receipt, tier=2, market="um")):
+        assert absent.instrument_count == 0
+        assert absent.slippage["5000"] == {"p50_of_p50": None, "p50_of_p90": None}
+
+
+def test_the_receipt_binds_the_chain_the_fees_and_its_own_hash(tmp_path: Path) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=4, fetcher=LadderVenue())
+    receipt, output = finalized_receipt(tmp_path, journal)
+    document = read_document(output)
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    assert document["content_hash"] == content_sha256(material)
+    assert receipt.content_hash == content_sha256(material)
+    head = read_document(journal / "chain-head.json")
+    assert receipt.chain_head_hash == head["content_hash"]
+    assert receipt.segment_count == 4
+    assert receipt.spec_hash == read_document(journal / "journal-spec.json")["spec_hash"]
+    assert receipt.spot_fee_bps_per_side == SPOT_FEE_BPS_PER_SIDE
+    assert receipt.perpetual_fee_bps_per_side == PERPETUAL_FEE_BPS_PER_SIDE
+    assert receipt.fee_evidence_id == FEE_EVIDENCE_ID
+
+
+def test_the_declaration_rule_is_the_spec_s_sentence_verbatim(tmp_path: Path) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=1, fetcher=LadderVenue())
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    rule = spec_declaration_sentence()
+    assert rule.startswith("a v3 family sets ")
+    assert rule.endswith("No other reading of the receipt is admissible for a declaration.")
+    assert rule == DECLARATION_RULE
+    assert receipt.declaration_rule == rule
+    # No other rule may be published under this version.
+    with pytest.raises(ValidationError):
+        FinalizationReceipt.model_validate(
+            {**read_document(tmp_path / "receipt.json"), "declaration_rule": "round down"}
+        )
+
+
+def test_a_published_receipt_is_immutable(tmp_path: Path) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=2, fetcher=LadderVenue())
+    _, output = finalized_receipt(tmp_path, journal)
+    published = output.read_bytes()
+    with pytest.raises(BinanceCostJournalSpecError):
+        finalize_journal(
+            workspace_root=tmp_path, journal_root=journal, output_path=output, reserve_bytes=0
+        )
+    assert output.read_bytes() == published
+
+
+def test_finalisation_refuses_a_journal_that_does_not_verify(tmp_path: Path) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=3, fetcher=LadderVenue())
+    rewrite_segment(journal / "segments" / "0000000001.json", received_time_ns=RECEIVED_NS + 1)
+    assert verify_journal(journal)[0] is False
+    with pytest.raises(BinanceCostJournalSpecError, match="verification failed"):
+        finalize_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "receipt.json",
+            reserve_bytes=0,
+        )
+    assert not (tmp_path / "receipt.json").exists()
+
+
+def test_finalisation_refuses_an_empty_journal(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    with pytest.raises(BinanceCostJournalSpecError, match="holds no segment"):
+        finalize_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "receipt.json",
+            reserve_bytes=0,
+        )
+    assert not (tmp_path / "receipt.json").exists()
+
+
+def test_finalisation_refuses_a_journal_that_never_sampled_the_eligibility_notional(
+    tmp_path: Path,
+) -> None:
+    """Eligibility is declared at 5 000 USDT, so a journal without it decides nothing."""
+    journal = journal_with_rounds(tmp_path, rounds=1, fetcher=LadderVenue(), notionals=["500"])
+    with pytest.raises(BinanceCostJournalSpecError, match="eligibility notional"):
+        finalize_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "receipt.json",
+            reserve_bytes=0,
+        )
+
+
+@pytest.mark.parametrize("rounds", [1, 3])
+def test_the_cli_creates_runs_and_finalises_a_journal(
+    captures: Captures, rounds: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root, perpetual, spot, family_spec = captures
+    journal, receipt_path = root / "journal", root / "receipt.json"
+    # The spec records the cadence at creation and the CLI sleeps it for real, so
+    # a one-second interval keeps the multi-round case out of the declared 61 s.
+    monkeypatch.setattr("trading_bot.binance_cost_journal.SAMPLE_INTERVAL_SECONDS", 1)
+    assert main([
+        "binance-cost-journal-create", "--workspace-root", str(root),
+        "--journal", str(journal), "--run-id", "binance-carry-v1",
+        "--perp-capture", str(perpetual), "--spot-capture", str(spot),
+        "--family-spec", str(family_spec), "--reserve-bytes", "0",
+    ]) == 0
+    with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=FakeVenue()):
+        assert main([
+            "binance-cost-journal-run", "--workspace-root", str(root),
+            "--journal", str(journal), "--rounds", str(rounds), "--reserve-bytes", "0",
+        ]) == 0
+    finalize_arguments = [
+        "binance-cost-journal-finalize", "--workspace-root", str(root),
+        "--journal", str(journal), "--output", str(receipt_path), "--reserve-bytes", "0",
+    ]
+    assert main(finalize_arguments) == 0
+    document = read_document(receipt_path)
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    assert document["content_hash"] == content_sha256(material)
+    receipt = FinalizationReceipt.model_validate(document)
+    assert receipt.declaration_rule == spec_declaration_sentence()
+    assert receipt.segment_count == rounds
+    assert len(receipt.instruments) == 20
+    # A few rounds are not seven days: nothing is eligible and no tier carries a
+    # number, which is the receipt saying so rather than failing.
+    assert all(item.reason_codes == FLOORS_NOT_MET for item in receipt.instruments)
+    assert {item.instrument_count for item in receipt.tiers} == {0}
+    # The receipt is immutable: a second finalisation is the supervisor's stop code.
+    assert main(finalize_arguments) == 2
+
+
+def test_the_cli_refuses_a_receipt_outside_the_workspace(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    assert main([
+        "binance-cost-journal-finalize", "--workspace-root", str(tmp_path),
+        "--journal", str(journal), "--output", str(tmp_path.parent / "outside-receipt.json"),
+        "--reserve-bytes", "0",
+    ]) == 2

@@ -12,6 +12,7 @@ from trading_bot.binance_cost_journal import (
     TARGET_ROUNDS,
     BinanceCostJournalSpecError,
     create_journal,
+    finalize_journal,
     load_journal_spec,
     public_binance_json_fetcher,
     run_journal,
@@ -141,6 +142,11 @@ def main(arguments: list[str] | None = None) -> int:
     journal_run.add_argument("--journal", type=Path, required=True)
     journal_run.add_argument("--rounds", type=int, default=TARGET_ROUNDS)
     journal_run.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    journal_finalize = commands.add_parser("binance-cost-journal-finalize")
+    journal_finalize.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    journal_finalize.add_argument("--journal", type=Path, required=True)
+    journal_finalize.add_argument("--output", type=Path, required=True)
+    journal_finalize.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -363,6 +369,8 @@ def main(arguments: list[str] | None = None) -> int:
         return _binance_cost_journal_create(parsed)
     if parsed.command == "binance-cost-journal-run":
         return _binance_cost_journal_run(parsed)
+    if parsed.command == "binance-cost-journal-finalize":
+        return _binance_cost_journal_finalize(parsed)
     raise AssertionError("unreachable command")
 
 
@@ -413,6 +421,25 @@ def _binance_cost_journal_run(parsed: argparse.Namespace) -> int:
         )
     except Exception as error:  # the supervisor reads the code, not the traceback
         return _journal_failure(f"{type(error).__name__}: {error}", _journal_exit_code(error))
+    return 0
+
+
+def _binance_cost_journal_finalize(parsed: argparse.Namespace) -> int:
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    output: Path = parsed.output.resolve()
+    if any(not path.is_relative_to(workspace) for path in (journal, output)):
+        return _journal_failure("binance cost journal paths must stay inside workspace", 2)
+    try:
+        receipt = finalize_journal(
+            workspace_root=workspace,
+            journal_root=journal,
+            output_path=output,
+            reserve_bytes=parsed.reserve_bytes,
+        )
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _journal_exit_code(error))
+    print(f"binance cost journal finalised: {receipt}")
     return 0
 
 
