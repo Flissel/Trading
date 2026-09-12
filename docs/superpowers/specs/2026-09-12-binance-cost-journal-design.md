@@ -83,12 +83,36 @@ allow-listed; any other host is refused.
   and ≥ 7 days between first and last non-null observation. The receipt lists eligible
   and ineligible instruments; ineligible ones carry no tier statistics.
 
+### 4.1 Operational rules (added 2026-09-12 after the whole-branch review, before launch)
+
+- `sample_interval_seconds` is the period between the starts of consecutive rounds: the
+  loop sleeps `interval − round duration` (never negative). An HTTP 429/418 on any request
+  adds a `Retry-After` pause (default 60 s, capped at 300 s) before the next round.
+- Every published file is fsynced before its atomic rename. A trailing file that does not
+  parse (a torn write) is deleted on resume and the sequence continues; a torn or missing
+  chain head is rebuilt from the segments when they verify from the genesis hash; a file
+  that parses as a segment but fails its hash, spec or link is corruption and refuses.
+- A running journal holds an exclusive OS lock on `run.lock`; a second writer is refused.
+- `create` refuses a sample other than 16 pairs / 32 instruments unless
+  `--allow-short-sample` is given. A read-only `status` subcommand reports segment count,
+  last timestamp, mean period and per-instrument ok rates over the last N rounds.
+- A storage-reserve refusal is transient (exit 1, the supervisor retries); an excluded
+  drive or a path outside the workspace is permanent (exit 2).
+- Observations also record the number of bid and ask levels the venue returned.
+
 ## 5. Finalisation receipt
 
 Per eligible instrument and notional: count, `null` count, p50, p90 and p99 of
 `slippage_bps_per_side`, p50 of `spread_bps`; for perpetuals p50 of the basis.
 Per tier (one, two) and leg (spot, perpetual) at each notional: the median of the
-instruments' p50s (`tier_p50_of_p50`) and the median of their p90s (`tier_p50_of_p90`).
+instruments' p50s (`tier_p50_of_p50`) and the median of their p90s (`tier_p50_of_p90`),
+each emitted only when at least four eligible instruments contribute a value at that
+notional (`contributing_count`; instruments that never filled it are `absent_count`) and
+`null` otherwise. Per instrument the eligibility span is the min-to-max of the window's
+timestamps. The receipt records the floors it applied (minimum observations, minimum span,
+eligibility notional, minimum contributors), the target rounds, the notional ladder and the
+sample interval, so the `eligible` flags and the tier medians are recomputable from the
+receipt alone.
 The receipt carries the sample list, the fee evidence, the spec hash, the chain head hash,
 the observation count and its own hash; it is immutable.
 
