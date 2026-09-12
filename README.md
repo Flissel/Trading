@@ -243,13 +243,16 @@ uv run trading-research carry-fold --capture <perp> --hedge-capture <spot> --man
 uv run trading-research panel-decision --fold-report artifacts/carry/funding-carry-<datum>-fold0-v1.json --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/funding-carry-<datum>-decision-v1.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3
 ```
 
-Zweite Version der Familie (P1.29): `configs/funding-carry-panel-v2.json` hält Kohorten
-26 Wochen, schließt ein gehaltenes Paar, sobald dessen nachlaufendes Ein-Wochen-Funding
-nicht mehr positiv ist, und lässt ein Paar bei Aufnahme nur zu, wenn sein Funding das
-Doppelte der Round-Trip-Kosten deckt (Hurdle-Multiple 2). Manifest, Folds und
-Entscheidung heißen `artifacts/carry/carry-v2-walk-forward-<datum>-usdt-pairs-1d-w1-v1.json`,
-`artifacts/carry/funding-carry-v2-<datum>-fold<i>-v1.json` und
-`artifacts/carry/funding-carry-v2-<datum>-decision-v1.json`.
+Zweite Version der Familie (P1.29): `configs/funding-carry-panel-v2.json` deklariert vier
+Mitglieder, die drei Regeln einzeln und gestapelt testen — `carry_l4w_h26w` (nur Hold 26
+Wochen), `carry_l4w_h13w_exit` (Hold 13 plus Exit, sobald das nachlaufende Ein-Wochen-Funding
+eines gehaltenen Paars nicht mehr positiv ist), `carry_l4w_h26w_exit` (beides) und
+`carry_l4w_h26w_exit_hurdle2` (zusätzlich Aufnahme nur, wenn das Funding das Doppelte der
+Round-Trip-Kosten deckt). Manifest, Folds, Entscheidung und Registry heißen
+`artifacts/carry/carry-v2-walk-forward-<datum>-usdt-pairs-1d-w1-v1.json`,
+`artifacts/carry/funding-carry-v2-<datum>-fold<i>-v1.json`,
+`artifacts/carry/funding-carry-v2-<datum>-decision-v1.json` und
+`artifacts/carry/metadata-funding-carry-v2.sqlite3`. Ergebnis: `P1_29_DECISION_2026-09-12.md`.
 
 ## Harte Grenzen
 

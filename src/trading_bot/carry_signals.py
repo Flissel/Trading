@@ -126,8 +126,11 @@ def select_member_cohort(
     `hurdle` maps a pair id to the minimum trailing funding it must carry to
     be ranked at all (spec 3.3). A pair with no entry is not hurdle-checked.
     The decile width is unchanged by the hurdle: it is still computed from
-    every eligible pair, so hurdling pairs out thins the cohort rather than
-    concentrating the same capital into whichever few pairs qualified.
+    every eligible pair, so the hurdle can only cap how many pairs a cohort
+    holds, never widen it. A cohort that ends up with fewer pairs still
+    deploys its full 1/H share across them (`assemble_book` divides by the
+    entry count), so the per-pair weight is bounded only by
+    `minimum_selected`, which the declaration fixes at eight.
     """
     paying = [
         (value, pair.pair_id)
