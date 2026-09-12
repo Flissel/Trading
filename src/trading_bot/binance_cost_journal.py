@@ -1,20 +1,32 @@
-"""Models and book arithmetic for the Binance public cost journal.
+"""The Binance public cost journal: models, book arithmetic and the sampler.
 
 The journal measures what a taker pays to cross a spot leg and a USD-M perpetual
 leg on Binance's public order books at three notionals. This module holds the
-frozen record shapes and the two pure functions the sampler needs: the walk of a
+frozen record shapes, the two pure functions the sampler needs - the walk of a
 displayed book to a quote notional and the parse of one depth payload into an
-observation. Nothing here reaches the network.
+observation - and the journal itself: the sample derived from the two carry
+captures, the hash-chained run loop, its verification and the one fetcher that
+is allowed to reach Binance.
 """
 
+import http.client
+import json
 import re
-from collections.abc import Mapping, Sequence
+import shutil
+import time
+import urllib.request
+from collections.abc import Callable, Mapping, Sequence
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from pathlib import Path
 from typing import Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, field_validator, model_validator
 
+from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.carry_config import CarryUniverseRules, load_carry_family_spec
+from trading_bot.carry_signals import WEEK_NS
+from trading_bot.carry_universe import select_pair_universe
 from trading_bot.depth_adapters import (
     DepthPayloadError,
     _decimal_string,
@@ -23,6 +35,10 @@ from trading_bot.depth_adapters import (
     _mapping,
     _string,
 )
+from trading_bot.panel_capture import verify_panel_capture
+from trading_bot.panel_reader import load_panel_bars
+from trading_bot.panel_universe import ContractHistory, build_contract_histories
+from trading_bot.storage import StoragePolicy
 
 JOURNAL_VERSION = "binance-cost-journal/1.0.0"
 NOTIONALS: tuple[Decimal, ...] = (Decimal("500"), Decimal("5000"), Decimal("50000"))
@@ -33,6 +49,21 @@ MINIMUM_OBSERVATIONS = 10_000
 MINIMUM_SPAN_NS = 7 * 86_400_000_000_000
 ALLOWED_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
 ZERO_HASH = "0" * 64
+# Spec 2: fees are declared, never measured. The evidence id names the schedule
+# the two rates were read from.
+SPOT_FEE_BPS_PER_SIDE = Decimal("10")
+PERPETUAL_FEE_BPS_PER_SIDE = Decimal("5")
+FEE_EVIDENCE_ID = "BINANCE:fee-schedule:2026-09-11:standard-taker"
+# Spec 3: the sample is ranks 1-8 of the pair universe plus eight drawn evenly
+# from ranks 9-35. The journal's own tier, not the carry family's.
+SAMPLE_TIER_ONE_RANKS: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8)
+SAMPLE_TIER_TWO_RANKS: tuple[int, ...] = (9, 12, 15, 19, 23, 27, 31, 35)
+JOURNAL_SPEC_NAME = "journal-spec.json"
+CHAIN_HEAD_NAME = "chain-head.json"
+SEGMENT_DIRECTORY_NAME = "segments"
+
+# url -> parsed JSON object; raises on transport failure.
+type Fetcher = Callable[[str], Mapping[str, object]]
 
 _BPS = Decimal(10_000)
 _BPS_QUANTUM = Decimal("0.000001")
@@ -42,6 +73,25 @@ _MARKET_PREFIXES: Mapping[str, str] = {"spot": "spot", "um": "perp"}
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 _SYMBOL = re.compile(r"\A[A-Z0-9]{4,24}\Z")
 _IDENTIFIER = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9.:_-]{0,79}\Z")
+_SEGMENT_NAME = re.compile(r"\A[0-9]{10}\.json\Z")
+_WORST_CASE_REQUIRED_BYTES = 500_000_000
+_FETCH_TIMEOUT_SECONDS = 20
+# A 500-level depth payload is ~30 kB; the cap only bounds a hostile response.
+_MAX_RESPONSE_BYTES = 8_000_000
+_MAX_REASON_CHARACTERS = 200
+
+
+class BinanceCostJournalError(RuntimeError):
+    """Raised when a journal cannot be created, sampled or read safely."""
+
+
+class BinanceCostJournalSpecError(BinanceCostJournalError):
+    """Raised when the request does not match the journal on disk.
+
+    The CLI maps this to exit code 2 and every other failure to 1, so the
+    supervisor stops on a mismatched, missing or unverifiable journal instead
+    of restarting a process that can only fail the same way again.
+    """
 
 
 class _Frozen(BaseModel):
@@ -468,3 +518,488 @@ def _premium_values(
 
 def _displayed_notional(levels: Sequence[tuple[Decimal, Decimal]]) -> Decimal:
     return sum((price * quantity for price, quantity in levels), Decimal(0))
+
+
+def derive_sample(
+    perp_capture_root: Path,
+    spot_capture_root: Path,
+    *,
+    family_spec_path: Path,
+) -> tuple[int, tuple[JournalInstrument, ...]]:
+    """Derive the frozen instrument sample from the two carry captures.
+
+    The decision is the latest one both captures support: the earlier of their
+    two last daily closes, stepped back one week, because the family's
+    liquidity rule needs a complete window ending at the decision and the last
+    week of a capture is the one most likely to be incomplete. The universe is
+    the family's own pair rule with ``minimum_pairs`` lowered to one for this
+    derivation only - the sample must exist even in a thin regime, and a
+    journal that measures fewer pairs is still a measurement. Ranks 1-8 become
+    the journal's tier one and ranks 9, 12, 15, 19, 23, 27, 31, 35 its tier two
+    (the journal's tier, not the family's); a rank the universe does not reach
+    is simply absent. Both legs of every selected pair are sampled, spot first.
+    """
+    spec, _ = load_carry_family_spec(family_spec_path)
+    perp_histories = _capture_histories(perp_capture_root, label="perpetual")
+    spot_histories = _capture_histories(spot_capture_root, label="spot")
+    last_supported_close_ns = min(_last_close_ns(perp_histories), _last_close_ns(spot_histories))
+    decision_close_ns = last_supported_close_ns - WEEK_NS
+    rules = CarryUniverseRules(**{**spec.universe.model_dump(), "minimum_pairs": 1})
+    snapshot = select_pair_universe(
+        perp_histories,
+        spot_histories,
+        pairs=spec.pairs,
+        decision_close_ns=decision_close_ns,
+        rules=rules,
+    )
+    if not snapshot.pairs:
+        raise BinanceCostJournalError(
+            "the pair universe is empty at the latest supported decision: "
+            + ",".join(snapshot.reason_codes)
+        )
+    by_rank = {pair.liquidity_rank: pair for pair in snapshot.pairs}
+    ranks_by_tier: tuple[tuple[Literal[1, 2], tuple[int, ...]], ...] = (
+        (1, SAMPLE_TIER_ONE_RANKS),
+        (2, SAMPLE_TIER_TWO_RANKS),
+    )
+    instruments: list[JournalInstrument] = []
+    for tier, ranks in ranks_by_tier:
+        for rank in ranks:
+            pair = by_rank.get(rank)
+            if pair is None:
+                continue
+            perpetual_symbol = perp_histories[pair.perpetual_contract_id].instrument_id
+            spot_symbol = spot_histories[pair.spot_contract_id].instrument_id
+            instruments.append(_spot_leg(spot_symbol, pair_symbol=perpetual_symbol, tier=tier))
+            instruments.append(_perpetual_leg(perpetual_symbol, tier=tier))
+    return decision_close_ns, tuple(instruments)
+
+
+def create_journal(
+    *,
+    workspace_root: Path,
+    journal_root: Path,
+    reserve_bytes: int,
+    run_id: str,
+    perp_capture_root: Path,
+    spot_capture_root: Path,
+    family_spec_path: Path,
+) -> Path:
+    """Write ``<journal_root>/journal-spec.json`` and an empty ``segments/``.
+
+    The spec is immutable and binds the journal directory to it, so a root that
+    already holds one is refused: a new sample is a new journal (spec 3).
+    Returns the path of the spec.
+    """
+    root = _authorize(workspace_root, journal_root, reserve_bytes)
+    spec_path = root / JOURNAL_SPEC_NAME
+    if spec_path.exists():
+        raise BinanceCostJournalSpecError("this journal already exists and is immutable")
+    perpetual_root = perp_capture_root.resolve()
+    spot_root = spot_capture_root.resolve()
+    if perpetual_root == spot_root:
+        raise BinanceCostJournalSpecError("the spot capture must differ from the perpetual one")
+    perpetual_hash = _capture_root_hash(perpetual_root, market="um", label="perpetual")
+    spot_hash = _capture_root_hash(spot_root, market="spot", label="spot")
+    decision_close_ns, instruments = derive_sample(
+        perpetual_root, spot_root, family_spec_path=family_spec_path
+    )
+    document: dict[str, object] = {
+        "version": JOURNAL_VERSION,
+        "run_id": run_id,
+        "created_time_ns": time.time_ns(),
+        "sample_decision_close_ns": decision_close_ns,
+        "perpetual_capture_root_hash": perpetual_hash,
+        "spot_capture_root_hash": spot_hash,
+        "instruments": [instrument.model_dump(mode="json") for instrument in instruments],
+        "notionals": [str(notional) for notional in NOTIONALS],
+        "depth_limit": DEPTH_LIMIT,
+        "sample_interval_seconds": SAMPLE_INTERVAL_SECONDS,
+        "target_rounds": TARGET_ROUNDS,
+        "spot_fee_bps_per_side": str(SPOT_FEE_BPS_PER_SIDE),
+        "perpetual_fee_bps_per_side": str(PERPETUAL_FEE_BPS_PER_SIDE),
+        "fee_evidence_id": FEE_EVIDENCE_ID,
+    }
+    try:
+        spec = BinanceCostJournalSpec.model_validate(document)
+    except ValidationError as error:
+        raise BinanceCostJournalSpecError(
+            f"the derived journal spec is invalid: {error}"
+        ) from error
+    material: dict[str, object] = spec.model_dump(mode="json")
+    (root / SEGMENT_DIRECTORY_NAME).mkdir(parents=True, exist_ok=True)
+    _publish(spec_path, {**material, "spec_hash": content_sha256(material)})
+    return spec_path
+
+
+def load_journal_spec(journal_root: Path) -> tuple[BinanceCostJournalSpec, str]:
+    """Read a journal's frozen spec and return it with its recorded hash."""
+    document = _read_object(journal_root / JOURNAL_SPEC_NAME, label="the journal spec")
+    material = {key: value for key, value in document.items() if key != "spec_hash"}
+    spec_hash = content_sha256(material)
+    if document.get("spec_hash") != spec_hash:
+        raise BinanceCostJournalSpecError("the journal spec does not match its recorded hash")
+    try:
+        spec = BinanceCostJournalSpec.model_validate(material)
+    except ValidationError as error:
+        raise BinanceCostJournalSpecError(f"the journal spec is invalid: {error}") from error
+    return spec, spec_hash
+
+
+def run_journal(
+    *,
+    workspace_root: Path,
+    journal_root: Path,
+    reserve_bytes: int,
+    rounds: int,
+    fetcher: Fetcher,
+    clock: Callable[[], int] = time.time_ns,
+    sleep: Callable[[float], None] = time.sleep,
+) -> ChainHead:
+    """Append up to ``rounds`` sampled segments to a verified journal.
+
+    The whole chain is verified before anything is appended and the chain head
+    must name this journal's spec, so a tampered chain or a foreign spec stops
+    the run instead of extending it. One instrument's failure - a fetcher
+    exception or an unusable payload - becomes that observation's reason and
+    the round is still written; a round in which every instrument fails aborts
+    before writing, which is what the supervisor restarts. Sampling stops early
+    once the declared ``target_rounds`` is on disk.
+    """
+    if rounds <= 0:
+        raise BinanceCostJournalSpecError("a run appends at least one round")
+    root = _authorize(workspace_root, journal_root, reserve_bytes)
+    spec, spec_hash = load_journal_spec(root)
+    valid, reasons = verify_journal(root)
+    if not valid:
+        raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
+    head = _read_chain_head(root)
+    if head is not None and head.spec_hash != spec_hash:
+        raise BinanceCostJournalSpecError("this journal is bound to a different spec")
+    written = 0
+    while written < rounds and (head is None or head.segment_count < spec.target_rounds):
+        if written:
+            sleep(spec.sample_interval_seconds)
+        segment = _sample_round(
+            spec=spec, spec_hash=spec_hash, head=head, fetcher=fetcher, clock=clock
+        )
+        head = _publish_segment(root, segment=segment, spec_hash=spec_hash)
+        written += 1
+    if head is None:
+        raise BinanceCostJournalError("the journal is empty and no round was sampled")
+    return head
+
+
+def verify_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
+    """Recompute every segment's hash, every chain link and the chain head.
+
+    Never raises: an unreadable or malformed journal comes back as a reason
+    code, the way ``verify_panel_capture`` reports a broken capture. An empty
+    journal - a spec and no segment yet - is valid.
+    """
+    try:
+        _, spec_hash = load_journal_spec(journal_root)
+    except BinanceCostJournalError:
+        return False, ("JOURNAL_SPEC_UNVERIFIED",)
+    directory = journal_root / SEGMENT_DIRECTORY_NAME
+    if not directory.is_dir():
+        return False, ("SEGMENT_DIRECTORY_MISSING",)
+    paths = sorted(path for path in directory.glob("*.json") if _SEGMENT_NAME.match(path.name))
+    # A `.tmp` left by a write that died mid-flight carries nothing and is
+    # replaced by the next attempt at that sequence; anything else under
+    # `segments/` is not this journal's and is reported.
+    reasons: list[str] = [
+        f"SEGMENT_UNEXPECTED_FILE:{path.name}"
+        for path in sorted(directory.iterdir())
+        if not _SEGMENT_NAME.match(path.name) and path.suffix != ".tmp"
+    ]
+    previous_hash = ZERO_HASH
+    for expected_sequence, path in enumerate(paths):
+        try:
+            document = _read_object(path, label="a journal segment")
+            segment = JournalSegment.model_validate(document)
+        except (BinanceCostJournalError, ValidationError):
+            reasons.append(f"SEGMENT_UNREADABLE:{path.name}")
+            return False, tuple(reasons)
+        material = {key: value for key, value in document.items() if key != "content_hash"}
+        if segment.content_hash != content_sha256(material):
+            reasons.append(f"SEGMENT_HASH_MISMATCH:{path.name}")
+        if segment.sequence != expected_sequence:
+            reasons.append(f"SEGMENT_SEQUENCE_MISMATCH:{path.name}")
+        if segment.spec_hash != spec_hash:
+            reasons.append(f"SEGMENT_SPEC_MISMATCH:{path.name}")
+        if segment.previous_segment_hash != previous_hash:
+            reasons.append(f"SEGMENT_LINK_MISMATCH:{path.name}")
+        previous_hash = segment.content_hash
+    reasons.extend(
+        _chain_head_reasons(
+            journal_root,
+            spec_hash=spec_hash,
+            segment_count=len(paths),
+            final_segment_hash=previous_hash,
+        )
+    )
+    return not reasons, tuple(reasons)
+
+
+def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
+    """GET one public Binance JSON object over HTTPS with a 20 s timeout.
+
+    The host is checked against ``ALLOWED_HOSTS`` before any socket is opened,
+    so a URL this journal did not build never reaches the network. A non-200
+    response, a body that is not a JSON object and any transport failure are
+    refused as ``BinanceCostJournalError``, which the run loop records as that
+    instrument's reason for the round.
+    """
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.netloc not in ALLOWED_HOSTS:
+        raise BinanceCostJournalError("journal requests are limited to Binance's public hosts")
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": "hybrid-trading-research/0.1"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=_FETCH_TIMEOUT_SECONDS) as response:
+            if response.status != 200:
+                raise BinanceCostJournalError(f"public request returned {response.status}")
+            raw = response.read(_MAX_RESPONSE_BYTES + 1)
+    except (OSError, http.client.HTTPException) as error:
+        raise BinanceCostJournalError(f"public request failed: {error}") from error
+    if len(raw) > _MAX_RESPONSE_BYTES:
+        raise BinanceCostJournalError("public response exceeds the byte limit")
+    try:
+        document: object = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise BinanceCostJournalError("public response is not valid JSON") from error
+    if not isinstance(document, dict):
+        raise BinanceCostJournalError("public response is not a JSON object")
+    return document
+
+
+def _capture_histories(capture_root: Path, *, label: str) -> dict[str, ContractHistory]:
+    bars = load_panel_bars(capture_root / "dataset")
+    if not bars:
+        raise BinanceCostJournalError(f"the {label} capture holds no panel bars")
+    return build_contract_histories(bars)
+
+
+def _last_close_ns(histories: Mapping[str, ContractHistory]) -> int:
+    return max(history.close_times[-1] for history in histories.values())
+
+
+def _capture_root_hash(capture_root: Path, *, market: str, label: str) -> str:
+    valid, errors = verify_panel_capture(capture_root)
+    if not valid:
+        raise BinanceCostJournalError(
+            f"{label} capture verification failed: " + ",".join(errors)
+        )
+    manifest = _read_object(
+        capture_root / "capture-manifest.json", label=f"the {label} capture manifest"
+    )
+    # P1.27's perpetual capture predates the `market` key, so its absence means "um".
+    if str(manifest.get("market", "um")) != market:
+        raise BinanceCostJournalSpecError(f"the {label} capture is not a {market} capture")
+    digest = manifest.get("capture_root_hash")
+    if not isinstance(digest, str):
+        raise BinanceCostJournalError(f"the {label} capture manifest carries no root hash")
+    return digest
+
+
+def _depth_url(*, market: str, symbol: str) -> str:
+    if market == "spot":
+        return f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit={DEPTH_LIMIT}"
+    return f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol}&limit={DEPTH_LIMIT}"
+
+
+def _premium_index_url(symbol: str) -> str:
+    return f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
+
+
+def _spot_leg(symbol: str, *, pair_symbol: str, tier: Literal[1, 2]) -> JournalInstrument:
+    return JournalInstrument(
+        instrument_id=f"spot:{symbol}",
+        market="spot",
+        symbol=symbol,
+        pair_symbol=pair_symbol,
+        tier=tier,
+        depth_url=_depth_url(market="spot", symbol=symbol),
+        premium_index_url=None,
+    )
+
+
+def _perpetual_leg(symbol: str, *, tier: Literal[1, 2]) -> JournalInstrument:
+    return JournalInstrument(
+        instrument_id=f"perp:{symbol}",
+        market="um",
+        symbol=symbol,
+        pair_symbol=symbol,
+        tier=tier,
+        depth_url=_depth_url(market="um", symbol=symbol),
+        premium_index_url=_premium_index_url(symbol),
+    )
+
+
+def _sample_round(
+    *,
+    spec: BinanceCostJournalSpec,
+    spec_hash: str,
+    head: ChainHead | None,
+    fetcher: Fetcher,
+    clock: Callable[[], int],
+) -> JournalSegment:
+    received_time_ns = clock()
+    observations = tuple(
+        _observe(instrument, notionals=spec.notionals, fetcher=fetcher, clock=clock)
+        for instrument in spec.instruments
+    )
+    if all(not observation.ok for observation in observations):
+        raise BinanceCostJournalError("every instrument failed in this round")
+    material: dict[str, object] = {
+        "version": JOURNAL_VERSION,
+        "sequence": 0 if head is None else head.last_sequence + 1,
+        "spec_hash": spec_hash,
+        "previous_segment_hash": ZERO_HASH if head is None else head.final_segment_hash,
+        "received_time_ns": received_time_ns,
+        "observations": [observation.model_dump(mode="json") for observation in observations],
+    }
+    return JournalSegment.model_validate({**material, "content_hash": content_sha256(material)})
+
+
+def _observe(
+    instrument: JournalInstrument,
+    *,
+    notionals: Sequence[Decimal],
+    fetcher: Fetcher,
+    clock: Callable[[], int],
+) -> InstrumentObservation:
+    try:
+        payload: object = fetcher(instrument.depth_url)
+        premium_index: object = (
+            None
+            if instrument.premium_index_url is None
+            else fetcher(instrument.premium_index_url)
+        )
+    except Exception as error:  # one instrument's failure is an observation, not an abort
+        return _failed_observation(
+            instrument_id=instrument.instrument_id,
+            received_time_ns=clock(),
+            keys=_notional_keys(notionals),
+            reason=_failure_reason(error),
+        )
+    return depth_observation(
+        payload,
+        instrument=instrument,
+        received_time_ns=clock(),
+        notionals=notionals,
+        premium_index=premium_index,
+    )
+
+
+def _failure_reason(error: Exception) -> str:
+    """Name the failure without letting a hostile message bloat the segment."""
+    return f"{type(error).__name__}: {error}"[:_MAX_REASON_CHARACTERS]
+
+
+def _publish_segment(root: Path, *, segment: JournalSegment, spec_hash: str) -> ChainHead:
+    document: dict[str, object] = segment.model_dump(mode="json")
+    _publish(root / SEGMENT_DIRECTORY_NAME / f"{segment.sequence:010d}.json", document)
+    head = _build_chain_head(
+        spec_hash=spec_hash,
+        segment_count=segment.sequence + 1,
+        last_sequence=segment.sequence,
+        final_segment_hash=segment.content_hash,
+    )
+    head_document: dict[str, object] = head.model_dump(mode="json")
+    _publish(root / CHAIN_HEAD_NAME, head_document)
+    return head
+
+
+def _build_chain_head(
+    *, spec_hash: str, segment_count: int, last_sequence: int, final_segment_hash: str
+) -> ChainHead:
+    material: dict[str, object] = {
+        "version": JOURNAL_VERSION,
+        "spec_hash": spec_hash,
+        "segment_count": segment_count,
+        "last_sequence": last_sequence,
+        "final_segment_hash": final_segment_hash,
+    }
+    return ChainHead.model_validate({**material, "content_hash": content_sha256(material)})
+
+
+def _read_chain_head(journal_root: Path) -> ChainHead | None:
+    path = journal_root / CHAIN_HEAD_NAME
+    if not path.exists():
+        return None
+    head = _validated_chain_head(_read_object(path, label="the chain head"))
+    if head is None:
+        raise BinanceCostJournalSpecError("the chain head does not match its recorded hash")
+    return head
+
+
+def _validated_chain_head(document: Mapping[str, object]) -> ChainHead | None:
+    try:
+        head = ChainHead.model_validate(document)
+    except ValidationError:
+        return None
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    if head.content_hash != content_sha256(material):
+        return None
+    return head
+
+
+def _chain_head_reasons(
+    journal_root: Path, *, spec_hash: str, segment_count: int, final_segment_hash: str
+) -> list[str]:
+    path = journal_root / CHAIN_HEAD_NAME
+    if not path.exists():
+        return [] if segment_count == 0 else ["CHAIN_HEAD_MISSING"]
+    if segment_count == 0:
+        return ["CHAIN_HEAD_UNEXPECTED"]
+    try:
+        document = _read_object(path, label="the chain head")
+    except BinanceCostJournalError:
+        return ["CHAIN_HEAD_UNREADABLE"]
+    head = _validated_chain_head(document)
+    if head is None:
+        return ["CHAIN_HEAD_UNREADABLE"]
+    reasons: list[str] = []
+    if head.spec_hash != spec_hash:
+        reasons.append("CHAIN_HEAD_SPEC_MISMATCH")
+    if head.segment_count != segment_count:
+        reasons.append("CHAIN_HEAD_COUNT_MISMATCH")
+    if head.last_sequence != segment_count - 1:
+        reasons.append("CHAIN_HEAD_SEQUENCE_MISMATCH")
+    if head.final_segment_hash != final_segment_hash:
+        reasons.append("CHAIN_HEAD_LINK_MISMATCH")
+    return reasons
+
+
+def _authorize(workspace_root: Path, journal_root: Path, reserve_bytes: int) -> Path:
+    workspace = workspace_root.resolve()
+    root = journal_root.resolve()
+    StoragePolicy(workspace, reserve_bytes).authorize(
+        target=root,
+        temporary_directory=root.parent,
+        free_bytes=shutil.disk_usage(workspace).free,
+        worst_case_required_bytes=_WORST_CASE_REQUIRED_BYTES,
+    )
+    return root
+
+
+def _read_object(path: Path, *, label: str) -> dict[str, object]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BinanceCostJournalSpecError(f"{label} is unreadable: {error}") from error
+    if not isinstance(document, dict):
+        raise BinanceCostJournalSpecError(f"{label} must be a JSON object")
+    return document
+
+
+def _publish(path: Path, document: dict[str, object]) -> None:
+    """Write one immutable JSON artifact through a temporary file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_bytes(canonical_json(document))
+    temporary.replace(path)

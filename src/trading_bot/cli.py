@@ -2,10 +2,18 @@
 
 import argparse
 import shutil
+import sys
 from decimal import Decimal
 from pathlib import Path
 
 from trading_bot.backtest import BacktestCase, BacktestRunner, write_report
+from trading_bot.binance_cost_journal import (
+    TARGET_ROUNDS,
+    BinanceCostJournalSpecError,
+    create_journal,
+    public_binance_json_fetcher,
+    run_journal,
+)
 from trading_bot.carry_fold_run import run_carry_fold
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
@@ -118,6 +126,19 @@ def main(arguments: list[str] | None = None) -> int:
     carry_fold.add_argument("--output", type=Path, required=True)
     carry_fold.add_argument("--registry", type=Path, required=True)
     carry_fold.add_argument("--fold-index", type=int, required=True)
+    journal_create = commands.add_parser("binance-cost-journal-create")
+    journal_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    journal_create.add_argument("--journal", type=Path, required=True)
+    journal_create.add_argument("--run-id", required=True)
+    journal_create.add_argument("--perp-capture", type=Path, required=True)
+    journal_create.add_argument("--spot-capture", type=Path, required=True)
+    journal_create.add_argument("--family-spec", type=Path, required=True)
+    journal_create.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    journal_run = commands.add_parser("binance-cost-journal-run")
+    journal_run.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    journal_run.add_argument("--journal", type=Path, required=True)
+    journal_run.add_argument("--rounds", type=int, default=TARGET_ROUNDS)
+    journal_run.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -336,7 +357,67 @@ def main(arguments: list[str] | None = None) -> int:
             fold_index=parsed.fold_index,
         )
         return 0
+    if parsed.command == "binance-cost-journal-create":
+        return _binance_cost_journal_create(parsed)
+    if parsed.command == "binance-cost-journal-run":
+        return _binance_cost_journal_run(parsed)
     raise AssertionError("unreachable command")
+
+
+def _binance_cost_journal_create(parsed: argparse.Namespace) -> int:
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    perpetual: Path = parsed.perp_capture.resolve()
+    spot: Path = parsed.spot_capture.resolve()
+    family_spec: Path = parsed.family_spec.resolve()
+    paths = (journal, perpetual, spot, family_spec)
+    if any(not path.is_relative_to(workspace) for path in paths):
+        return _journal_failure("binance cost journal paths must stay inside workspace", 2)
+    try:
+        create_journal(
+            workspace_root=workspace,
+            journal_root=journal,
+            reserve_bytes=parsed.reserve_bytes,
+            run_id=parsed.run_id,
+            perp_capture_root=perpetual,
+            spot_capture_root=spot,
+            family_spec_path=family_spec,
+        )
+    except BinanceCostJournalSpecError as error:
+        return _journal_failure(f"{type(error).__name__}: {error}", 2)
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", 1)
+    return 0
+
+
+def _binance_cost_journal_run(parsed: argparse.Namespace) -> int:
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    if not journal.is_relative_to(workspace):
+        return _journal_failure("binance cost journal paths must stay inside workspace", 2)
+    try:
+        run_journal(
+            workspace_root=workspace,
+            journal_root=journal,
+            reserve_bytes=parsed.reserve_bytes,
+            rounds=parsed.rounds,
+            fetcher=public_binance_json_fetcher,
+        )
+    except BinanceCostJournalSpecError as error:
+        return _journal_failure(f"{type(error).__name__}: {error}", 2)
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", 1)
+    return 0
+
+
+def _journal_failure(message: str, code: int) -> int:
+    """Report a failure on stderr and hand the supervisor its exit code.
+
+    Code 2 is a usage or spec mismatch the supervisor must stop on; code 1 is
+    everything else, which a restart may well survive.
+    """
+    print(message, file=sys.stderr)
+    return code
 
 
 def _demo_runner() -> BacktestRunner:

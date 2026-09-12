@@ -1,26 +1,46 @@
+import json
+import urllib.request
+from collections.abc import Mapping
 from decimal import Decimal
+from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from pydantic import ValidationError
 
+from tests.carry_fixtures import build_captures, small_carry_config
+from tests.test_panel_fold_run import DAY_MS, EPOCH_DAY_2020, MONTH_START_DAY
 from trading_bot.binance_cost_journal import (
     ALLOWED_HOSTS,
     DEPTH_LIMIT,
+    FEE_EVIDENCE_ID,
     JOURNAL_VERSION,
     MINIMUM_OBSERVATIONS,
     MINIMUM_SPAN_NS,
     NOTIONALS,
+    PERPETUAL_FEE_BPS_PER_SIDE,
     SAMPLE_INTERVAL_SECONDS,
+    SPOT_FEE_BPS_PER_SIDE,
     TARGET_ROUNDS,
     ZERO_HASH,
+    BinanceCostJournalError,
     BinanceCostJournalSpec,
+    BinanceCostJournalSpecError,
     ChainHead,
     InstrumentObservation,
     JournalInstrument,
     JournalSegment,
+    create_journal,
     depth_observation,
+    derive_sample,
+    public_binance_json_fetcher,
+    run_journal,
+    verify_journal,
     walk_notional,
 )
+from trading_bot.canonical import canonical_json, content_sha256
+from trading_bot.cli import main
 
 RECEIVED_NS = 1_757_000_123_456_789
 SPOT_DEPTH_URL = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500"
@@ -588,3 +608,413 @@ def test_observation_model_binds_ok_to_its_evidence() -> None:
     with pytest.raises(ValidationError):
         # not ok but still carrying metrics.
         InstrumentObservation.model_validate({**document, "ok": False, "reason": "empty book"})
+
+
+# --- Task 2: sample derivation, journal creation, run loop, verification -------------
+
+Captures = tuple[Path, Path, Path, Path]  # workspace root, perpetual, spot, family spec
+# The reduced carry fixture's last daily bar closes on 2020-07-31; both captures share
+# that calendar, so the latest supported decision is one week earlier.
+LAST_CLOSE_NS = ((EPOCH_DAY_2020 + MONTH_START_DAY["2020-07"] + 31) * DAY_MS - 1) * 1_000_000
+SAMPLE_DECISION_NS = LAST_CLOSE_NS - 604_800_000_000_000
+# Twelve pairs are all the fixture has, so of the declared tier-two ranks
+# (9, 12, 15, 19, 23, 27, 31, 35) only 9 and 12 exist.
+SAMPLE_SYMBOLS = (*(f"C{index:02d}USDT" for index in range(8)), "C08USDT", "C11USDT")
+
+
+@pytest.fixture
+def captures(tmp_path: Path) -> Captures:
+    perpetual, spot = build_captures(tmp_path)
+    return tmp_path, perpetual, spot, small_carry_config(tmp_path)
+
+
+def perpetual_instrument_document() -> dict[str, object]:
+    return {
+        "instrument_id": "perp:BTCUSDT",
+        "market": "um",
+        "symbol": "BTCUSDT",
+        "pair_symbol": "BTCUSDT",
+        "tier": 1,
+        "depth_url": PERP_DEPTH_URL,
+        "premium_index_url": PREMIUM_URL,
+    }
+
+
+def write_journal_directory(journal_root: Path, **overrides: object) -> str:
+    """Write a two-instrument journal the way `create_journal` does; returns the spec hash."""
+    document: dict[str, object] = {
+        **spec_document(),
+        "instruments": [instrument_document(), perpetual_instrument_document()],
+        **overrides,
+    }
+    BinanceCostJournalSpec.model_validate(document)
+    spec_hash = content_sha256(document)
+    (journal_root / "segments").mkdir(parents=True)
+    (journal_root / "journal-spec.json").write_bytes(
+        canonical_json({**document, "spec_hash": spec_hash})
+    )
+    return spec_hash
+
+
+def read_document(path: Path) -> dict[str, object]:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(document, dict)
+    return document
+
+
+def segment_documents(journal_root: Path) -> list[dict[str, object]]:
+    return [read_document(path) for path in sorted((journal_root / "segments").glob("*.json"))]
+
+
+def observations_of(document: dict[str, object]) -> list[dict[str, object]]:
+    value = document["observations"]
+    assert isinstance(value, list)
+    return value
+
+
+class FakeVenue:
+    """A fetcher over the synthetic book; `dark` and `broken` are URL fragments.
+
+    `dark` raises the way a transport failure does, `broken` answers with an
+    unusable payload. Name the spot host with its scheme: "api.binance.com" is
+    a substring of the perpetual host "fapi.binance.com".
+    """
+
+    def __init__(self, *, dark: tuple[str, ...] = (), broken: tuple[str, ...] = ()) -> None:
+        self.urls: list[str] = []
+        self.dark = dark
+        self.broken = broken
+
+    def __call__(self, url: str) -> Mapping[str, object]:
+        self.urls.append(url)
+        symbol = parse_qs(urlsplit(url).query)["symbol"][0]
+        if any(fragment in url for fragment in self.dark):
+            raise ConnectionError(f"{symbol} is unreachable")
+        if any(fragment in url for fragment in self.broken):
+            return {"lastUpdateId": 1, "bids": [], "asks": []}
+        if "premiumIndex" in url:
+            return {**premium_document(), "symbol": symbol}
+        return depth_document()
+
+
+class FakeClock:
+    def __init__(self, start: int = RECEIVED_NS, step: int = 1_000_000) -> None:
+        self.now = start
+        self.step = step
+
+    def __call__(self) -> int:
+        self.now += self.step
+        return self.now
+
+
+class FakeSleep:
+    def __init__(self) -> None:
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+def test_derive_sample_takes_ranks_one_to_eight_and_the_declared_tier_two_ranks(
+    captures: Captures,
+) -> None:
+    _, perpetual, spot, family_spec = captures
+    decision_close_ns, instruments = derive_sample(perpetual, spot, family_spec_path=family_spec)
+    assert decision_close_ns == SAMPLE_DECISION_NS
+    assert decision_close_ns == 1_595_635_199_999_000_000
+    assert [item.instrument_id for item in instruments] == [
+        f"{prefix}:{symbol}" for symbol in SAMPLE_SYMBOLS for prefix in ("spot", "perp")
+    ]
+    # Ranks 1-8 are the journal's tier one, the rest its tier two.
+    assert [item.tier for item in instruments] == [1] * 16 + [2] * 4
+    assert all(item.pair_symbol == item.symbol for item in instruments)
+    assert [item.market for item in instruments[:2]] == ["spot", "um"]
+    assert instruments[0].depth_url == (
+        "https://api.binance.com/api/v3/depth?symbol=C00USDT&limit=500"
+    )
+    assert instruments[0].premium_index_url is None
+    assert instruments[1].depth_url == (
+        "https://fapi.binance.com/fapi/v1/depth?symbol=C00USDT&limit=500"
+    )
+    assert instruments[1].premium_index_url == (
+        "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=C00USDT"
+    )
+
+
+def test_create_journal_writes_an_immutable_spec_and_an_empty_segment_directory(
+    captures: Captures,
+) -> None:
+    root, perpetual, spot, family_spec = captures
+    journal = root / "journal"
+    path = create_journal(
+        workspace_root=root, journal_root=journal, reserve_bytes=0, run_id="binance-carry-v1",
+        perp_capture_root=perpetual, spot_capture_root=spot, family_spec_path=family_spec,
+    )
+    assert path == journal / "journal-spec.json"
+    document = read_document(path)
+    assert document.pop("spec_hash") == content_sha256(document)
+    spec = BinanceCostJournalSpec.model_validate(document)
+    assert spec.run_id == "binance-carry-v1"
+    assert spec.created_time_ns > 0
+    assert spec.sample_decision_close_ns == SAMPLE_DECISION_NS
+    assert len(spec.instruments) == 20
+    assert spec.notionals == NOTIONALS
+    assert spec.depth_limit == DEPTH_LIMIT
+    assert spec.sample_interval_seconds == SAMPLE_INTERVAL_SECONDS
+    assert spec.target_rounds == TARGET_ROUNDS
+    assert spec.spot_fee_bps_per_side == SPOT_FEE_BPS_PER_SIDE
+    assert spec.perpetual_fee_bps_per_side == PERPETUAL_FEE_BPS_PER_SIDE
+    assert spec.fee_evidence_id == FEE_EVIDENCE_ID
+    perpetual_manifest = read_document(perpetual / "capture-manifest.json")
+    spot_manifest = read_document(spot / "capture-manifest.json")
+    assert spec.perpetual_capture_root_hash == perpetual_manifest["capture_root_hash"]
+    assert spec.spot_capture_root_hash == spot_manifest["capture_root_hash"]
+    assert list((journal / "segments").iterdir()) == []
+    assert verify_journal(journal) == (True, ())
+    with pytest.raises(BinanceCostJournalSpecError):
+        create_journal(
+            workspace_root=root, journal_root=journal, reserve_bytes=0,
+            run_id="binance-carry-v1", perp_capture_root=perpetual, spot_capture_root=spot,
+            family_spec_path=family_spec,
+        )
+
+
+def test_run_journal_writes_linked_segments_and_a_chain_head(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    spec_hash = write_journal_directory(journal)
+    venue, clock, sleeper = FakeVenue(), FakeClock(), FakeSleep()
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=venue, clock=clock, sleep=sleeper,
+    )
+    assert (head.segment_count, head.last_sequence, head.spec_hash) == (3, 2, spec_hash)
+    # One spot depth, one perpetual depth and one premium index per round.
+    assert len(venue.urls) == 9
+    # The interval is waited between rounds, never before the first or after the last.
+    assert sleeper.calls == [SAMPLE_INTERVAL_SECONDS, SAMPLE_INTERVAL_SECONDS]
+    assert [path.name for path in sorted((journal / "segments").glob("*.json"))] == [
+        "0000000000.json", "0000000001.json", "0000000002.json",
+    ]
+    previous = ZERO_HASH
+    for sequence, document in enumerate(segment_documents(journal)):
+        assert document["version"] == JOURNAL_VERSION
+        assert document["sequence"] == sequence
+        assert document["spec_hash"] == spec_hash
+        assert document["previous_segment_hash"] == previous
+        material = {key: value for key, value in document.items() if key != "content_hash"}
+        assert document["content_hash"] == content_sha256(material)
+        assert [item["ok"] for item in observations_of(document)] == [True, True]
+        assert [item["instrument_id"] for item in observations_of(document)] == [
+            "spot:BTCUSDT", "perp:BTCUSDT",
+        ]
+        previous = str(document["content_hash"])
+    head_document = read_document(journal / "chain-head.json")
+    assert head_document["final_segment_hash"] == previous
+    assert head_document["segment_count"] == 3
+    assert head == ChainHead.model_validate(head_document)
+    assert verify_journal(journal) == (True, ())
+
+
+def test_run_journal_resumes_from_the_chain_head(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    first = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    second = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=FakeSleep(),
+    )
+    assert (first.segment_count, first.last_sequence) == (2, 1)
+    assert (second.segment_count, second.last_sequence) == (4, 3)
+    documents = segment_documents(journal)
+    assert len(documents) == 4
+    assert documents[2]["previous_segment_hash"] == documents[1]["content_hash"]
+    assert documents[3]["previous_segment_hash"] == documents[2]["content_hash"]
+    assert verify_journal(journal) == (True, ())
+
+
+def test_run_journal_stops_at_the_declared_target(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal, target_rounds=2)
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=5,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    assert head.segment_count == 2
+    venue = FakeVenue()
+    again = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=5,
+        fetcher=venue, clock=FakeClock(), sleep=FakeSleep(),
+    )
+    assert again == head
+    assert venue.urls == []
+    assert len(segment_documents(journal)) == 2
+
+
+def test_a_failing_instrument_is_recorded_and_the_round_is_still_written(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(dark=("https://api.binance.com",)), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    assert head.segment_count == 1
+    spot_observation, perpetual_observation = observations_of(segment_documents(journal)[0])
+    assert spot_observation["ok"] is False
+    assert "ConnectionError" in str(spot_observation["reason"])
+    assert spot_observation["slippage_bps_per_side"] == {"500": None, "5000": None, "50000": None}
+    assert spot_observation["spread_bps"] is None
+    assert perpetual_observation["ok"] is True
+    assert verify_journal(journal) == (True, ())
+
+
+def test_an_invalid_payload_is_recorded_as_a_failed_observation(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(broken=("https://api.binance.com",)),
+        clock=FakeClock(), sleep=FakeSleep(),
+    )
+    spot_observation = observations_of(segment_documents(journal)[0])[0]
+    assert spot_observation["ok"] is False
+    assert spot_observation["reason"] == "empty book"
+
+
+def test_a_round_in_which_every_instrument_fails_aborts_the_run(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    with pytest.raises(BinanceCostJournalError):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(dark=("binance.com",)), clock=FakeClock(), sleep=FakeSleep(),
+        )
+    assert list((journal / "segments").iterdir()) == []
+    assert not (journal / "chain-head.json").exists()
+    assert verify_journal(journal) == (True, ())
+
+
+def test_verify_journal_detects_a_tampered_segment(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    path = journal / "segments" / "0000000000.json"
+    document = read_document(path)
+    observations_of(document)[0]["spread_bps"] = "1"
+    path.write_bytes(canonical_json(document))
+    valid, reasons = verify_journal(journal)
+    assert valid is False
+    assert "SEGMENT_HASH_MISMATCH:0000000000.json" in reasons
+    # An unverified journal is never resumed.
+    with pytest.raises(BinanceCostJournalSpecError):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+
+
+def test_verify_journal_detects_a_rewritten_chain_head(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    path = journal / "chain-head.json"
+    document = read_document(path)
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    material["segment_count"] = 3
+    path.write_bytes(canonical_json({**material, "content_hash": content_sha256(material)}))
+    valid, reasons = verify_journal(journal)
+    assert valid is False
+    assert "CHAIN_HEAD_COUNT_MISMATCH" in reasons
+    # A head whose own hash no longer covers its fields is caught too.
+    path.write_bytes(canonical_json({**document, "last_sequence": 7}))
+    assert verify_journal(journal) == (False, ("CHAIN_HEAD_UNREADABLE",))
+
+
+def test_verify_journal_detects_a_spec_that_no_longer_matches(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    path = journal / "journal-spec.json"
+    document = read_document(path)
+    path.write_bytes(canonical_json({**document, "run_id": "someone-elses-journal"}))
+    assert verify_journal(journal) == (False, ("JOURNAL_SPEC_UNVERIFIED",))
+
+
+def test_the_public_fetcher_refuses_a_foreign_host_before_any_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def explode(*arguments: object, **keywords: object) -> object:
+        raise AssertionError("the journal fetcher must not open a connection")
+
+    monkeypatch.setattr(urllib.request, "urlopen", explode)
+    refused = (
+        "https://evil.example.com/api/v3/depth?symbol=BTCUSDT&limit=500",
+        "http://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500",
+        "https://api.binance.com:8443/api/v3/depth?symbol=BTCUSDT&limit=500",
+        "https://user:secret@api.binance.com/api/v3/depth?symbol=BTCUSDT",
+        "https://data.binance.vision/api/v3/depth?symbol=BTCUSDT",
+    )
+    for url in refused:
+        with pytest.raises(BinanceCostJournalError):
+            public_binance_json_fetcher(url)
+
+
+def test_the_cli_creates_runs_and_stops_a_journal(captures: Captures) -> None:
+    root, perpetual, spot, family_spec = captures
+    journal = root / "journal"
+    create_arguments = [
+        "binance-cost-journal-create", "--workspace-root", str(root),
+        "--journal", str(journal), "--run-id", "binance-carry-v1",
+        "--perp-capture", str(perpetual), "--spot-capture", str(spot),
+        "--family-spec", str(family_spec), "--reserve-bytes", "0",
+    ]
+    run_arguments = [
+        "binance-cost-journal-run", "--workspace-root", str(root),
+        "--journal", str(journal), "--rounds", "1", "--reserve-bytes", "0",
+    ]
+    assert main(create_arguments) == 0
+    with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=FakeVenue()):
+        assert main(run_arguments) == 0
+    assert (journal / "segments" / "0000000000.json").exists()
+    assert verify_journal(journal) == (True, ())
+    # An existing journal is immutable: the supervisor's stop code, not a retry.
+    assert main(create_arguments) == 2
+    # A round in which every instrument fails is retryable instead.
+    dark = FakeVenue(dark=("binance.com",))
+    with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=dark):
+        assert main(run_arguments) == 1
+
+
+def test_the_cli_stops_on_a_missing_or_foreign_journal(tmp_path: Path) -> None:
+    absent = [
+        "binance-cost-journal-run", "--workspace-root", str(tmp_path),
+        "--journal", str(tmp_path / "absent"), "--rounds", "1", "--reserve-bytes", "0",
+    ]
+    assert main(absent) == 2
+    outside = [
+        "binance-cost-journal-run", "--workspace-root", str(tmp_path),
+        "--journal", str(tmp_path.parent / "outside-journal"),
+        "--rounds", "1", "--reserve-bytes", "0",
+    ]
+    assert main(outside) == 2
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    path = journal / "journal-spec.json"
+    document = read_document(path)
+    path.write_bytes(canonical_json({**document, "run_id": "someone-elses-journal"}))
+    present = [
+        "binance-cost-journal-run", "--workspace-root", str(tmp_path),
+        "--journal", str(journal), "--rounds", "1", "--reserve-bytes", "0",
+    ]
+    assert main(present) == 2
