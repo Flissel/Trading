@@ -145,9 +145,15 @@ def load_family_spec(path: Path) -> "tuple[PanelFamilySpec | CarryFamilySpec, st
     knowing about the others. Any unknown name falls through to the panel
     model, whose closed ``family_name`` literal rejects it.
     """
-    from trading_bot.carry_config import CarryFamilySpec  # local: avoids an import cycle
+    # local: avoids an import cycle
+    from trading_bot.carry_config import MEMBER_NAMES_BY_FAMILY, CarryFamilySpec
 
     document = json.loads(path.read_text(encoding="utf-8"))
-    if isinstance(document, dict) and document.get("family_name") == "funding_carry_panel_v1":
+    family_name = document.get("family_name") if isinstance(document, dict) else None
+    if (
+        isinstance(family_name, str)
+        and family_name.startswith("funding_carry_panel_v")
+        and family_name in MEMBER_NAMES_BY_FAMILY
+    ):
         return CarryFamilySpec.model_validate(document), content_sha256(document)
     return PanelFamilySpec.model_validate(document), content_sha256(document)

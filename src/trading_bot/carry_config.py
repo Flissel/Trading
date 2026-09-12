@@ -5,12 +5,22 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from trading_bot.canonical import content_sha256
 from trading_bot.panel_config import PanelFoldGeometry, PanelStatistics
 
 MEMBER_NAMES: tuple[str, ...] = ("carry_l1w_h4w", "carry_l4w_h4w", "carry_l4w_h13w")
+MEMBER_NAMES_V2: tuple[str, ...] = (
+    "carry_l4w_h26w",
+    "carry_l4w_h13w_exit",
+    "carry_l4w_h26w_exit",
+    "carry_l4w_h26w_exit_hurdle2",
+)
+MEMBER_NAMES_BY_FAMILY: dict[str, tuple[str, ...]] = {
+    "funding_carry_panel_v1": MEMBER_NAMES,
+    "funding_carry_panel_v2": MEMBER_NAMES_V2,
+}
 CONTROL_NAMES: tuple[str, ...] = ("no_trade", "random_pairs", "all_pairs_ew")
 
 
@@ -19,15 +29,24 @@ class _Frozen(BaseModel):
 
 
 class CarryMember(_Frozen):
-    name: Literal["carry_l1w_h4w", "carry_l4w_h4w", "carry_l4w_h13w"]
+    name: str
     lookback_weeks: int
     hold_weeks: int
+    exit_on_negative_funding: bool = False
+    hurdle_multiple: Decimal | None = None
 
     @field_validator("lookback_weeks", "hold_weeks")
     @classmethod
     def validate_positive(cls, value: int) -> int:
         if value < 1:
             raise ValueError("lookback_weeks and hold_weeks must be positive")
+        return value
+
+    @field_validator("hurdle_multiple")
+    @classmethod
+    def validate_hurdle_multiple(cls, value: Decimal | None) -> Decimal | None:
+        if value is not None and value <= 0:
+            raise ValueError("hurdle_multiple must be positive when set")
         return value
 
 
@@ -81,7 +100,7 @@ class CarryCosts(_Frozen):
 
 class CarryFamilySpec(_Frozen):
     spec_version: Literal["1.0.0"]
-    family_name: Literal["funding_carry_panel_v1"]
+    family_name: Literal["funding_carry_panel_v1", "funding_carry_panel_v2"]
     hypothesis: str
     perpetual_venue: Literal["BINANCE_UM"]
     spot_venue: Literal["BINANCE_SPOT"]
@@ -96,12 +115,12 @@ class CarryFamilySpec(_Frozen):
     folds: PanelFoldGeometry
     statistics: PanelStatistics
 
-    @field_validator("members")
-    @classmethod
-    def validate_members(cls, value: tuple[CarryMember, ...]) -> tuple[CarryMember, ...]:
-        if tuple(item.name for item in value) != MEMBER_NAMES:
+    @model_validator(mode="after")
+    def validate_members(self) -> "CarryFamilySpec":
+        expected = MEMBER_NAMES_BY_FAMILY[self.family_name]
+        if tuple(member.name for member in self.members) != expected:
             raise ValueError("the member set is frozen and ordered")
-        return value
+        return self
 
     @field_validator("controls")
     @classmethod
