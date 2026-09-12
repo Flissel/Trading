@@ -9,7 +9,7 @@ observation. Nothing here reaches the network.
 
 import re
 from collections.abc import Mapping, Sequence
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Literal, Self
 from urllib.parse import urlsplit
 
@@ -20,6 +20,7 @@ from trading_bot.depth_adapters import (
     _decimal_string,
     _integer,
     _level_values,
+    _mapping,
     _string,
 )
 
@@ -34,6 +35,8 @@ ALLOWED_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
 ZERO_HASH = "0" * 64
 
 _BPS = Decimal(10_000)
+_BPS_QUANTUM = Decimal("0.000001")
+_NOTIONAL_QUANTUM = Decimal("0.01")
 _MARKET_HOSTS: Mapping[str, str] = {"spot": "api.binance.com", "um": "fapi.binance.com"}
 _MARKET_PREFIXES: Mapping[str, str] = {"spot": "spot", "um": "perp"}
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
@@ -314,25 +317,50 @@ def walk_notional(levels: Sequence[tuple[Decimal, Decimal]], notional: Decimal) 
 
 
 def depth_observation(
-    payload: Mapping[str, object],
+    payload: object,
     *,
     instrument: JournalInstrument,
     received_time_ns: int,
     notionals: Sequence[Decimal],
-    premium_index: Mapping[str, object] | None,
+    premium_index: object,
 ) -> InstrumentObservation:
     """Turn one Binance REST depth payload into an observation.
 
-    ``payload`` carries ``lastUpdateId`` and the ``bids``/``asks`` level arrays;
-    ``premium_index`` carries ``markPrice``, ``indexPrice`` and ``lastFundingRate``
-    and belongs to perpetual legs only. Any payload defect - malformed, empty or
-    crossed book, missing or foreign premium index - becomes ``ok=False`` with a
-    reason instead of an exception; the notional keys are always present.
+    ``payload`` and ``premium_index`` are parsed JSON of unknown shape: the depth
+    object carries ``lastUpdateId`` and the ``bids``/``asks`` level arrays, the
+    premium index object ``markPrice``, ``indexPrice`` and ``lastFundingRate``,
+    and the latter belongs to perpetual legs only (``None`` where a leg has none).
+    Any defect - a value that is not an object at all, a malformed, empty or
+    crossed book, a missing or foreign premium index, a book below the recorded
+    precision - becomes ``ok=False`` with a reason instead of an exception; the
+    notional keys are always present.
+
+    Every measured value is recorded at the journal's declared precision:
+    1e-6 bps for the spread, the slippage and the basis, 0.01 quote units for the
+    displayed notional, half-even. The funding rate is stored as received.
     """
     keys = _notional_keys(notionals)
     try:
         bids, asks = _validated_book(payload)
         funding_rate, basis_bps = _premium_values(premium_index, instrument=instrument)
+        best_bid = bids[0][0]
+        best_ask = asks[0][0]
+        mid = (best_bid + best_ask) / Decimal(2)
+        spread_bps = _quantised((best_ask - best_bid) / mid * _BPS, _BPS_QUANTUM)
+        displayed = _quantised(
+            min(_displayed_notional(bids), _displayed_notional(asks)), _NOTIONAL_QUANTUM
+        )
+        if spread_bps <= 0 or displayed <= 0:
+            raise DepthPayloadError("book below the recorded precision")
+        slippage: dict[str, Decimal | None] = {}
+        for key, notional in zip(keys, notionals, strict=True):
+            buy_vwap = walk_notional(asks, notional)
+            sell_vwap = walk_notional(bids, notional)
+            if buy_vwap is None or sell_vwap is None:
+                slippage[key] = None
+                continue
+            worse_side = max(buy_vwap / mid - 1, 1 - sell_vwap / mid) * _BPS
+            slippage[key] = _quantised(worse_side, _BPS_QUANTUM)
     except DepthPayloadError as error:
         return _failed_observation(
             instrument_id=instrument.instrument_id,
@@ -341,29 +369,25 @@ def depth_observation(
             reason=str(error),
         )
 
-    best_bid = bids[0][0]
-    best_ask = asks[0][0]
-    mid = (best_bid + best_ask) / Decimal(2)
-    slippage: dict[str, Decimal | None] = {}
-    for key, notional in zip(keys, notionals, strict=True):
-        buy_vwap = walk_notional(asks, notional)
-        sell_vwap = walk_notional(bids, notional)
-        if buy_vwap is None or sell_vwap is None:
-            slippage[key] = None
-            continue
-        slippage[key] = max(buy_vwap / mid - 1, 1 - sell_vwap / mid) * _BPS
-
     return InstrumentObservation(
         instrument_id=instrument.instrument_id,
         received_time_ns=received_time_ns,
         ok=True,
         reason=None,
-        spread_bps=(best_ask - best_bid) / mid * _BPS,
+        spread_bps=spread_bps,
         slippage_bps_per_side=slippage,
-        displayed_notional_thinner_side=min(_displayed_notional(bids), _displayed_notional(asks)),
+        displayed_notional_thinner_side=displayed,
         funding_rate=funding_rate,
         basis_bps=basis_bps,
     )
+
+
+def _quantised(value: Decimal, quantum: Decimal) -> Decimal:
+    """Record a measured value at the journal's declared precision."""
+    try:
+        return value.quantize(quantum, rounding=ROUND_HALF_EVEN)
+    except InvalidOperation as error:
+        raise DepthPayloadError("measurement exceeds the recorded precision") from error
 
 
 def _notional_keys(notionals: Sequence[Decimal]) -> tuple[str, ...]:
@@ -393,11 +417,12 @@ def _failed_observation(
 
 
 def _validated_book(
-    payload: Mapping[str, object],
+    payload: object,
 ) -> tuple[tuple[tuple[Decimal, Decimal], ...], tuple[tuple[Decimal, Decimal], ...]]:
-    _integer(payload.get("lastUpdateId"), field_name="lastUpdateId")
-    bids = _validated_side(payload.get("bids"), field_name="bids", ascending=False)
-    asks = _validated_side(payload.get("asks"), field_name="asks", ascending=True)
+    document = _mapping(payload, field_name="depth payload")
+    _integer(document.get("lastUpdateId"), field_name="lastUpdateId")
+    bids = _validated_side(document.get("bids"), field_name="bids", ascending=False)
+    asks = _validated_side(document.get("asks"), field_name="asks", ascending=True)
     if not bids or not asks:
         raise DepthPayloadError("empty book")
     if bids[0][0] >= asks[0][0]:
@@ -420,7 +445,7 @@ def _validated_side(
 
 
 def _premium_values(
-    premium_index: Mapping[str, object] | None, *, instrument: JournalInstrument
+    premium_index: object, *, instrument: JournalInstrument
 ) -> tuple[Decimal | None, Decimal | None]:
     if instrument.premium_index_url is None:
         if premium_index is not None:
@@ -428,17 +453,17 @@ def _premium_values(
         return None, None
     if premium_index is None:
         raise DepthPayloadError("missing premium index")
-    symbol = _string(premium_index.get("symbol"), field_name="premiumIndex.symbol")
+    document = _mapping(premium_index, field_name="premiumIndex")
+    symbol = _string(document.get("symbol"), field_name="premiumIndex.symbol")
     if symbol != instrument.symbol:
         raise DepthPayloadError("premium index symbol mismatch")
-    mark_price = _decimal_string(premium_index.get("markPrice"), field_name="markPrice")
-    index_price = _decimal_string(premium_index.get("indexPrice"), field_name="indexPrice")
-    funding_rate = _decimal_string(
-        premium_index.get("lastFundingRate"), field_name="lastFundingRate"
-    )
+    mark_price = _decimal_string(document.get("markPrice"), field_name="markPrice")
+    index_price = _decimal_string(document.get("indexPrice"), field_name="indexPrice")
+    funding_rate = _decimal_string(document.get("lastFundingRate"), field_name="lastFundingRate")
     if mark_price <= 0 or index_price <= 0:
         raise DepthPayloadError("premium index prices must be positive")
-    return funding_rate, (mark_price - index_price) / index_price * _BPS
+    basis_bps = (mark_price - index_price) / index_price * _BPS
+    return funding_rate, _quantised(basis_bps, _BPS_QUANTUM)
 
 
 def _displayed_notional(levels: Sequence[tuple[Decimal, Decimal]]) -> Decimal:

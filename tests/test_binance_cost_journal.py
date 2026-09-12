@@ -324,6 +324,128 @@ def test_malformed_depth_payloads_become_failed_observations(
     assert fragment in observation.reason
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [["a", "b"], "depth", None, 7, 1.5, [["125", "4"]]],
+)
+def test_payloads_that_are_not_objects_become_failed_observations(payload: object) -> None:
+    observation = depth_observation(
+        payload,
+        instrument=SPOT,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=None,
+    )
+
+    assert observation.ok is False
+    assert observation.reason is not None
+    assert "depth payload" in observation.reason
+
+
+@pytest.mark.parametrize("premium_index", [["a", "b"], "premium", 7, 1.5])
+def test_premium_indexes_that_are_not_objects_become_failed_observations(
+    premium_index: object,
+) -> None:
+    observation = depth_observation(
+        depth_document(),
+        instrument=PERP,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=premium_index,
+    )
+
+    assert observation.ok is False
+    assert observation.reason is not None
+    assert "premiumIndex" in observation.reason
+
+
+def test_measurements_are_quantised_to_the_declared_precision() -> None:
+    # A realistic book: every measurement repeats far past the recorded precision.
+    payload = {
+        "lastUpdateId": 8_100_201,
+        "bids": [["99.99", "12"], ["99.98", "40"]],
+        "asks": [["100.01", "12"], ["100.02", "40"]],
+    }
+    premium = premium_document()
+    premium["markPrice"] = "100.005"
+    premium["indexPrice"] = "99.997"
+
+    observation = depth_observation(
+        payload,
+        instrument=PERP,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=premium,
+    )
+
+    assert observation.ok is True
+    assert str(observation.spread_bps) == "2.000000"
+    # Half the spread, but the division leaves a tail 22 digits down.
+    assert str(observation.slippage_bps_per_side["500"]) == "1.000000"
+    assert str(observation.slippage_bps_per_side["5000"]) == "1.760042"
+    assert observation.slippage_bps_per_side["50000"] is None
+    # min(1 199.88 + 3 999.20, 1 200.12 + 4 000.80).
+    assert str(observation.displayed_notional_thinner_side) == "5199.08"
+    # (100.005 - 99.997) / 99.997 * 10 000 = 0.8000240007200216...
+    assert str(observation.basis_bps) == "0.800024"
+    # The funding rate is recorded as the venue sent it.
+    assert str(observation.funding_rate) == "0.0001"
+
+
+def test_hand_computed_values_carry_the_declared_precision() -> None:
+    observation = depth_observation(
+        depth_document(),
+        instrument=SPOT,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=None,
+    )
+
+    assert str(observation.spread_bps) == "5000.000000"
+    assert str(observation.slippage_bps_per_side["500"]) == "3750.000000"
+    assert str(observation.slippage_bps_per_side["5000"]) == "10000.000000"
+    assert str(observation.displayed_notional_thinner_side) == "8450.00"
+
+
+def test_a_book_below_the_recorded_precision_is_not_a_measurement() -> None:
+    payload = {
+        "lastUpdateId": 1,
+        "bids": [["100000000000000000000", "3"]],
+        "asks": [["100000000000000000001", "3"]],
+    }
+
+    observation = depth_observation(
+        payload,
+        instrument=SPOT,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=None,
+    )
+
+    assert observation.ok is False
+    assert observation.reason == "book below the recorded precision"
+
+
+def test_a_book_beyond_the_recorded_precision_is_not_a_measurement() -> None:
+    # A displayed notional so large that recording it to a cent overflows the context.
+    payload = {
+        "lastUpdateId": 1,
+        "bids": [["1" + "0" * 30, "1" + "0" * 10]],
+        "asks": [["2" + "0" * 30, "1" + "0" * 10]],
+    }
+
+    observation = depth_observation(
+        payload,
+        instrument=SPOT,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=None,
+    )
+
+    assert observation.ok is False
+    assert observation.reason == "measurement exceeds the recorded precision"
+
+
 def test_premium_index_failures_are_observations_not_exceptions() -> None:
     foreign = premium_document()
     foreign["symbol"] = "ETHUSDT"
