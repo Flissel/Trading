@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from tests.carry_fixtures import build_captures, small_carry_config
 from tests.test_panel_fold_run import DAY_MS, EPOCH_DAY_2020, MONTH_START_DAY
+from trading_bot import binance_cost_journal as journal_module
 from trading_bot.binance_cost_journal import (
     ALLOWED_HOSTS,
     DECLARATION_RULE,
@@ -1665,6 +1666,7 @@ def test_the_receipt_binds_the_chain_the_fees_and_its_own_hash(tmp_path: Path) -
     head = read_document(journal / "chain-head.json")
     assert receipt.chain_head_hash == head["content_hash"]
     assert receipt.segment_count == 4
+    assert receipt.segments_beyond_head == 0
     assert receipt.spec_hash == read_document(journal / "journal-spec.json")["spec_hash"]
     assert receipt.spot_fee_bps_per_side == SPOT_FEE_BPS_PER_SIDE
     assert receipt.perpetual_fee_bps_per_side == PERPETUAL_FEE_BPS_PER_SIDE
@@ -1740,7 +1742,10 @@ def test_finalisation_refuses_a_journal_that_never_sampled_the_eligibility_notio
 
 @pytest.mark.parametrize("rounds", [1, 3])
 def test_the_cli_creates_runs_and_finalises_a_journal(
-    captures: Captures, rounds: int, monkeypatch: pytest.MonkeyPatch
+    captures: Captures,
+    rounds: int,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     root, perpetual, spot, family_spec = captures
     journal, receipt_path = root / "journal", root / "receipt.json"
@@ -1766,9 +1771,14 @@ def test_the_cli_creates_runs_and_finalises_a_journal(
     document = read_document(receipt_path)
     material = {key: value for key, value in document.items() if key != "content_hash"}
     assert document["content_hash"] == content_sha256(material)
+    # The operator is handed the hash a declaration cites, not only the path.
+    printed = capsys.readouterr().out
+    assert str(receipt_path) in printed
+    assert f"receipt content hash: {document['content_hash']}" in printed
     receipt = FinalizationReceipt.model_validate(document)
     assert receipt.declaration_rule == spec_declaration_sentence()
     assert receipt.segment_count == rounds
+    assert receipt.segments_beyond_head == 0
     assert len(receipt.instruments) == 20
     # A few rounds are not seven days: nothing is eligible and no tier carries a
     # number, which is the receipt saying so rather than failing.
@@ -1824,3 +1834,76 @@ def test_an_adoptable_orphan_does_not_rescue_a_chain_broken_elsewhere(tmp_path: 
         ("SEGMENT_HASH_MISMATCH:0000000000.json", "CHAIN_HEAD_COUNT_MISMATCH",
          "CHAIN_HEAD_SEQUENCE_MISMATCH", "CHAIN_HEAD_LINK_MISMATCH"),
     )
+
+
+# --- Fix round 3: a receipt reads exactly the chain its head covers ------------------
+
+
+def test_finalisation_measures_the_head_s_range_while_a_run_appends(tmp_path: Path) -> None:
+    """A segment published past the head is counted in the receipt, never measured.
+
+    Four rounds with the head rewound to three is what a concurrent
+    `binance-cost-journal-run` leaves between its two publishes: a fourth valid,
+    self-verifying segment the head does not cover yet.
+    """
+    journal = journal_with_rounds(tmp_path, rounds=4, fetcher=LadderVenue())
+    rewind_chain_head(journal, segments=3)
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    assert len(segment_documents(journal)) == 4
+    assert receipt.segment_count == 3
+    assert receipt.segments_beyond_head == 1
+    assert receipt.chain_head_hash == read_document(journal / "chain-head.json")["content_hash"]
+    # Three rounds measured per instrument, not the four that are on disk.
+    assert {item.observation_count for item in receipt.instruments} == {3}
+    assert statistics_of(receipt, "spot:BTCUSDT").slippage["5000"]["count"] == 3
+
+
+def test_finalisation_refuses_a_segment_that_changes_under_the_measurement_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bytes the numbers come from are re-checked, not trusted from the gate.
+
+    The tamper is timed between the verification walk and the measurement pass -
+    the window a still-running writer used to slip through - and lands inside
+    the head's range, so the measurement pass has to catch it itself.
+    """
+    journal = journal_with_rounds(tmp_path, rounds=4, fetcher=LadderVenue())
+    original = journal_module._verified_chain
+
+    def verify_then_tamper(
+        journal_root: Path,
+        *,
+        candidate_head: ChainHead | None,
+        covered_segments: int | None = None,
+    ) -> tuple[bool, tuple[str, ...]]:
+        outcome = original(
+            journal_root, candidate_head=candidate_head, covered_segments=covered_segments
+        )
+        edit_segment_body(
+            journal / "segments" / "0000000001.json", received_time_ns=RECEIVED_NS + 3
+        )
+        return outcome
+
+    monkeypatch.setattr(journal_module, "_verified_chain", verify_then_tamper)
+    with pytest.raises(BinanceCostJournalSpecError, match="changed under the measurement pass"):
+        finalize_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "receipt.json",
+            reserve_bytes=0,
+        )
+    assert not (tmp_path / "receipt.json").exists()
+
+
+def test_finalisation_refuses_a_gap_inside_the_head_s_range(tmp_path: Path) -> None:
+    """A head that counts more segments than exist names the one that is missing."""
+    journal = journal_with_rounds(tmp_path, rounds=3, fetcher=LadderVenue())
+    (journal / "segments" / "0000000002.json").unlink()
+    with pytest.raises(BinanceCostJournalSpecError, match=r"SEGMENT_MISSING:0000000002\.json"):
+        finalize_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "receipt.json",
+            reserve_bytes=0,
+        )
+    assert not (tmp_path / "receipt.json").exists()

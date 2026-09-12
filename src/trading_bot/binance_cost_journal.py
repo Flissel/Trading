@@ -499,12 +499,19 @@ class FinalizationReceipt(_Frozen):
     never measured, carries the sample's statistics and the tier medians, and
     states in ``declaration_rule`` the one use a carry declaration may make of
     it. Anything else on top of these numbers is not a reading of this receipt.
+
+    ``segment_count`` is exactly the number of segments the statistics cover -
+    the ones the chain head bound - and ``segments_beyond_head`` how many
+    numbered segments sat past that head when the reading was taken, which a
+    run appending concurrently leaves behind. A non-zero value is not a fault:
+    it says this receipt reads part of a journal that has since grown.
     """
 
     version: Literal["binance-cost-journal-receipt/1.0.0"]
     spec_hash: str
     chain_head_hash: str
     segment_count: int
+    segments_beyond_head: int
     spot_fee_bps_per_side: Decimal
     perpetual_fee_bps_per_side: Decimal
     fee_evidence_id: str
@@ -536,6 +543,8 @@ class FinalizationReceipt(_Frozen):
     def validate_content(self) -> Self:
         if self.segment_count <= 0:
             raise ValueError("a receipt summarises at least one segment")
+        if self.segments_beyond_head < 0:
+            raise ValueError("the count of segments past the head cannot be negative")
         if not self.instruments or not self.tiers:
             raise ValueError("a receipt lists the sample and every declared tier")
         identifiers = [item.instrument_id for item in self.instruments]
@@ -948,13 +957,19 @@ def verify_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
 
 
 def _verified_chain(
-    journal_root: Path, *, candidate_head: ChainHead | None
+    journal_root: Path, *, candidate_head: ChainHead | None, covered_segments: int | None = None
 ) -> tuple[bool, tuple[str, ...]]:
     """Verify the chain against ``candidate_head``, or against the head on disk.
 
     A candidate lets an adoption be judged before it is written: the whole
     chain is checked as it *would* stand with that head, so nothing is
     published over a journal that fails for another reason (fix round 2).
+
+    ``covered_segments`` bounds the walk to the first N numbered segments, which
+    is what a finalisation needs: a concurrent ``run_journal`` may be appending
+    past the head, and those segments are neither verified nor judged against
+    the head here - the receipt counts them and leaves them out (fix round 3).
+    A sequence missing inside the bound is reported, not tolerated.
     """
     try:
         _, spec_hash = load_journal_spec(journal_root)
@@ -972,6 +987,12 @@ def _verified_chain(
         for path in sorted(directory.iterdir())
         if not _SEGMENT_NAME.match(path.name) and not _SEGMENT_TEMPORARY_NAME.match(path.name)
     ]
+    if covered_segments is not None:
+        reasons.extend(
+            f"SEGMENT_MISSING:{sequence:010d}.json"
+            for sequence in range(len(paths), covered_segments)
+        )
+        paths = paths[:covered_segments]
     previous_hash = ZERO_HASH
     for expected_sequence, path in enumerate(paths):
         try:
@@ -980,15 +1001,16 @@ def _verified_chain(
         except (BinanceCostJournalError, ValidationError):
             reasons.append(f"SEGMENT_UNREADABLE:{path.name}")
             return False, tuple(reasons)
-        material = {key: value for key, value in document.items() if key != "content_hash"}
-        if segment.content_hash != content_sha256(material):
-            reasons.append(f"SEGMENT_HASH_MISMATCH:{path.name}")
-        if segment.sequence != expected_sequence:
-            reasons.append(f"SEGMENT_SEQUENCE_MISMATCH:{path.name}")
-        if segment.spec_hash != spec_hash:
-            reasons.append(f"SEGMENT_SPEC_MISMATCH:{path.name}")
-        if segment.previous_segment_hash != previous_hash:
-            reasons.append(f"SEGMENT_LINK_MISMATCH:{path.name}")
+        reasons.extend(
+            _segment_reasons(
+                document,
+                segment,
+                name=path.name,
+                expected_sequence=expected_sequence,
+                spec_hash=spec_hash,
+                previous_hash=previous_hash,
+            )
+        )
         previous_hash = segment.content_hash
     reasons.extend(
         _chain_head_reasons(
@@ -1015,6 +1037,14 @@ def finalize_journal(
     over the eligible ones (spec 4). A journal that never sampled the
     eligibility notional is refused - eligibility is declared at 5 000 USDT and
     cannot be read off anything else.
+
+    The chain head is read first and everything after it is bounded by it: the
+    verification walk and the measurement pass both cover exactly the segments
+    ``0 .. head.segment_count - 1``, which is what ``segment_count`` reports and
+    what ``chain_head_hash`` binds. A ``run_journal`` appending while the
+    receipt is taken is not an error - its segments sit past the head, are left
+    out of every number, and are counted in ``segments_beyond_head`` so the
+    reading says how much of the journal it did not look at.
     """
     root = _authorize(workspace_root, journal_root, reserve_bytes)
     output = _authorize(workspace_root, output_path, reserve_bytes)
@@ -1026,13 +1056,16 @@ def finalize_journal(
         raise BinanceCostJournalSpecError(
             f"this journal never sampled the {ELIGIBILITY_NOTIONAL} USDT eligibility notional"
         )
-    valid, reasons = verify_journal(root)
-    if not valid:
-        raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
     head = _read_chain_head(root)
     if head is None:
         raise BinanceCostJournalSpecError("this journal holds no segment to finalise")
-    measured = _measured_observations(root)
+    valid, reasons = _verified_chain(
+        root, candidate_head=None, covered_segments=head.segment_count
+    )
+    if not valid:
+        raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
+    measured = _measured_observations(root, head=head, spec_hash=spec_hash)
+    beyond_head = _segments_beyond_head(root, head)
     instruments = tuple(
         _instrument_statistics(
             instrument, measured.get(instrument.instrument_id, ()), keys=keys
@@ -1050,6 +1083,7 @@ def finalize_journal(
         # The head's own hash binds the spec, the count and the final segment.
         "chain_head_hash": head.content_hash,
         "segment_count": head.segment_count,
+        "segments_beyond_head": beyond_head,
         "spot_fee_bps_per_side": str(spec.spot_fee_bps_per_side),
         "perpetual_fee_bps_per_side": str(spec.perpetual_fee_bps_per_side),
         "fee_evidence_id": spec.fee_evidence_id,
@@ -1355,6 +1389,33 @@ def _validated_chain_head(document: Mapping[str, object]) -> ChainHead | None:
     return head
 
 
+def _segment_reasons(
+    document: Mapping[str, object],
+    segment: JournalSegment,
+    *,
+    name: str,
+    expected_sequence: int,
+    spec_hash: str,
+    previous_hash: str,
+) -> list[str]:
+    """Everything one segment can be wrong about, given where it sits in the chain.
+
+    The single place the four per-segment checks live, so the verification walk
+    and the finalisation's measurement pass cannot drift apart (fix round 3).
+    """
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    reasons: list[str] = []
+    if segment.content_hash != content_sha256(material):
+        reasons.append(f"SEGMENT_HASH_MISMATCH:{name}")
+    if segment.sequence != expected_sequence:
+        reasons.append(f"SEGMENT_SEQUENCE_MISMATCH:{name}")
+    if segment.spec_hash != spec_hash:
+        reasons.append(f"SEGMENT_SPEC_MISMATCH:{name}")
+    if segment.previous_segment_hash != previous_hash:
+        reasons.append(f"SEGMENT_LINK_MISMATCH:{name}")
+    return reasons
+
+
 def _chain_head_reasons(
     journal_root: Path,
     *,
@@ -1391,25 +1452,57 @@ def _chain_head_reasons(
     return reasons
 
 
-def _measured_observations(journal_root: Path) -> dict[str, list[InstrumentObservation]]:
-    """Every ``ok`` observation of a verified journal, per instrument, in round order.
+def _measured_observations(
+    journal_root: Path, *, head: ChainHead, spec_hash: str
+) -> dict[str, list[InstrumentObservation]]:
+    """Every ``ok`` observation of the chain ``head`` covers, per instrument, in round order.
 
-    The segments are read again rather than kept from the verification pass, so
-    the numbers are computed from the bytes that verified and from nothing else.
+    The segments are read again rather than kept from the verification pass, and
+    each one is re-checked as it is read - its own hash, its spec, its sequence
+    and its link - so the numbers are computed from bytes that verified in this
+    pass and from nothing else. The segments are addressed by name over
+    ``0 .. head.segment_count - 1`` rather than globbed, so a ``run_journal``
+    appending concurrently cannot slip a round into the statistics behind the
+    receipt's ``segment_count`` (fix round 3). Any mismatch refuses.
     """
     directory = journal_root / SEGMENT_DIRECTORY_NAME
-    paths = sorted(path for path in directory.glob("*.json") if _SEGMENT_NAME.match(path.name))
     measured: dict[str, list[InstrumentObservation]] = {}
-    for path in paths:
-        document = _read_object(path, label="a journal segment")
+    previous_hash = ZERO_HASH
+    for sequence in range(head.segment_count):
+        name = f"{sequence:010d}.json"
+        document = _read_object(directory / name, label="a journal segment")
         try:
             segment = JournalSegment.model_validate(document)
         except ValidationError as error:
             raise BinanceCostJournalSpecError(f"a journal segment is invalid: {error}") from error
+        reasons = _segment_reasons(
+            document,
+            segment,
+            name=name,
+            expected_sequence=sequence,
+            spec_hash=spec_hash,
+            previous_hash=previous_hash,
+        )
+        if reasons:
+            raise BinanceCostJournalSpecError(
+                "a journal segment changed under the measurement pass: " + ",".join(reasons)
+            )
+        previous_hash = segment.content_hash
         for observation in segment.observations:
             if observation.ok:
                 measured.setdefault(observation.instrument_id, []).append(observation)
+    if previous_hash != head.final_segment_hash:
+        raise BinanceCostJournalSpecError(
+            "the measured segments do not end in the chain head's final segment"
+        )
     return measured
+
+
+def _segments_beyond_head(journal_root: Path, head: ChainHead) -> int:
+    """Numbered segments sitting past the head - a run still appending, left out."""
+    directory = journal_root / SEGMENT_DIRECTORY_NAME
+    paths = [path for path in directory.glob("*.json") if _SEGMENT_NAME.match(path.name)]
+    return max(len(paths) - head.segment_count, 0)
 
 
 def _instrument_statistics(

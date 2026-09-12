@@ -1,6 +1,7 @@
 """Command-line entry point for bounded local research runs."""
 
 import argparse
+import json
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -439,7 +440,10 @@ def _binance_cost_journal_finalize(parsed: argparse.Namespace) -> int:
         )
     except Exception as error:  # the supervisor reads the code, not the traceback
         return _journal_failure(f"{type(error).__name__}: {error}", _journal_exit_code(error))
+    # The hash a carry declaration cites, read back off the published bytes.
+    document = json.loads(receipt.read_text(encoding="utf-8"))
     print(f"binance cost journal finalised: {receipt}")
+    print(f"receipt content hash: {document['content_hash']}")
     return 0
 
 
