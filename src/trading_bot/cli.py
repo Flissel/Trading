@@ -12,8 +12,11 @@ from trading_bot.backtest import BacktestCase, BacktestRunner, write_report
 from trading_bot.binance_cost_journal import (
     TARGET_ROUNDS,
     BinanceCostJournalSpecError,
+    JournalStatus,
     create_journal,
     finalize_journal,
+    iso_utc_time,
+    journal_status,
     load_journal_spec,
     public_binance_json_fetcher,
     run_journal,
@@ -28,7 +31,7 @@ from trading_bot.panel_decision import build_panel_decision
 from trading_bot.panel_fold_run import run_panel_fold
 from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
-from trading_bot.storage import StoragePolicy, StoragePolicyError
+from trading_bot.storage import StoragePolicy, StoragePolicyError, StorageReserveError
 from trading_bot.strategy import CostScenario
 from trading_bot.walk_forward_run import derive_walk_forward_config, run_capture_walk_forward
 
@@ -138,6 +141,7 @@ def main(arguments: list[str] | None = None) -> int:
     journal_create.add_argument("--spot-capture", type=Path, required=True)
     journal_create.add_argument("--family-spec", type=Path, required=True)
     journal_create.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    journal_create.add_argument("--allow-short-sample", action="store_true")
     journal_run = commands.add_parser("binance-cost-journal-run")
     journal_run.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_run.add_argument("--journal", type=Path, required=True)
@@ -148,6 +152,10 @@ def main(arguments: list[str] | None = None) -> int:
     journal_finalize.add_argument("--journal", type=Path, required=True)
     journal_finalize.add_argument("--output", type=Path, required=True)
     journal_finalize.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    journal_status_command = commands.add_parser("binance-cost-journal-status")
+    journal_status_command.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    journal_status_command.add_argument("--journal", type=Path, required=True)
+    journal_status_command.add_argument("--last", type=int, default=60)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -372,6 +380,8 @@ def main(arguments: list[str] | None = None) -> int:
         return _binance_cost_journal_run(parsed)
     if parsed.command == "binance-cost-journal-finalize":
         return _binance_cost_journal_finalize(parsed)
+    if parsed.command == "binance-cost-journal-status":
+        return _binance_cost_journal_status(parsed)
     raise AssertionError("unreachable command")
 
 
@@ -393,6 +403,7 @@ def _binance_cost_journal_create(parsed: argparse.Namespace) -> int:
             perp_capture_root=perpetual,
             spot_capture_root=spot,
             family_spec_path=family_spec,
+            allow_short_sample=parsed.allow_short_sample,
         )
         spec, _ = load_journal_spec(journal)
     except Exception as error:  # the supervisor reads the code, not the traceback
@@ -447,15 +458,50 @@ def _binance_cost_journal_finalize(parsed: argparse.Namespace) -> int:
     return 0
 
 
+def _binance_cost_journal_status(parsed: argparse.Namespace) -> int:
+    """Report a running journal's tip; 0 when its last segments verify, 1 when not."""
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    if not journal.is_relative_to(workspace):
+        return _journal_failure("binance cost journal paths must stay inside workspace", 2)
+    try:
+        status = journal_status(journal, last=parsed.last)
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _journal_exit_code(error))
+    _print_journal_status(status, last=parsed.last)
+    return 0 if status.verified else 1
+
+
+def _print_journal_status(status: JournalStatus, *, last: int) -> None:
+    print(f"segment_count: {status.segment_count}")
+    print(f"last_sequence: {status.last_sequence}")
+    stamp = status.last_received_time_ns
+    print(f"last_received_time: {'-' if stamp is None else iso_utc_time(stamp)}")
+    print(f"window_segments: {status.window_segments} (last {last})")
+    period = status.mean_period_seconds
+    print(f"mean_period_seconds: {'-' if period is None else period}")
+    for instrument in status.instruments:
+        ok_rate = "-" if instrument.ok_rate is None else str(instrument.ok_rate)
+        degraded = instrument.premium_index_reason_rate
+        print(
+            f"{instrument.instrument_id}: ok {ok_rate} "
+            f"premium_index_reason {'-' if degraded is None else degraded}"
+        )
+    print(f"verify: {'ok' if status.verified else ','.join(status.reasons)}")
+
+
 def _journal_exit_code(error: Exception) -> int:
     """2 for what a restart cannot fix, 1 for what it may.
 
     A spec mismatch and a refused storage authorisation (an excluded drive, a
-    path outside the workspace, a reserve the job would cross) are both
+    path outside the workspace, a temporary directory on another volume) are
     conditions the same command will keep hitting, so the supervisor stops on
-    them; a transport failure or a round in which every instrument failed is
-    worth another attempt.
+    them; a transport failure, a round in which every instrument failed, and a
+    reserve the job would cross right now are worth another attempt - the disk
+    the reserve guards is the one thing here that changes on its own.
     """
+    if isinstance(error, StorageReserveError):
+        return 1
     return 2 if isinstance(error, BinanceCostJournalSpecError | StoragePolicyError) else 1
 
 

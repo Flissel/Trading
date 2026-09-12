@@ -1,8 +1,10 @@
 import json
 import os
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from decimal import Decimal
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
@@ -17,19 +19,23 @@ from trading_bot.binance_cost_journal import (
     ALLOWED_HOSTS,
     DECLARATION_RULE,
     DEPTH_LIMIT,
+    ELIGIBILITY_NOTIONAL,
     FEE_EVIDENCE_ID,
     JOURNAL_VERSION,
     MINIMUM_OBSERVATIONS,
     MINIMUM_SPAN_NS,
     NOTIONALS,
     PERPETUAL_FEE_BPS_PER_SIDE,
+    SAMPLE_INSTRUMENT_COUNT,
     SAMPLE_INTERVAL_SECONDS,
     SPOT_FEE_BPS_PER_SIDE,
     TARGET_ROUNDS,
+    TIER_MINIMUM_CONTRIBUTORS,
     ZERO_HASH,
     BinanceCostJournalError,
     BinanceCostJournalSpec,
     BinanceCostJournalSpecError,
+    BinanceCostJournalTransportError,
     ChainHead,
     FinalizationReceipt,
     InstrumentObservation,
@@ -41,15 +47,22 @@ from trading_bot.binance_cost_journal import (
     depth_observation,
     derive_sample,
     finalize_journal,
+    iso_utc_time,
+    journal_status,
     public_binance_json_fetcher,
     run_journal,
     verify_journal,
     walk_notional,
 )
 from trading_bot.canonical import canonical_json, content_sha256
-from trading_bot.cli import main
+from trading_bot.cli import _journal_exit_code, main
+from trading_bot.storage import StoragePolicyError, StorageReserveError
 
 RECEIVED_NS = 1_757_000_123_456_789
+# `FakeClock` advances a millisecond a call and a two-instrument round spends
+# three of them - the round's own stamp, one an instrument - so the period the
+# run loop waits afterwards is that much short of the declared interval (W6).
+ROUND_PERIOD_REMAINDER = SAMPLE_INTERVAL_SECONDS - 0.003
 SPOT_DEPTH_URL = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500"
 PERP_DEPTH_URL = "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=500"
 PREMIUM_URL = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
@@ -141,6 +154,8 @@ def observation_document() -> dict[str, object]:
         "spread_bps": "5000",
         "slippage_bps_per_side": {"500": "3750", "5000": "10000", "50000": None},
         "displayed_notional_thinner_side": "8450",
+        "bid_levels": 3,
+        "ask_levels": 3,
         "funding_rate": None,
         "basis_bps": None,
     }
@@ -711,6 +726,19 @@ def observations_of(document: dict[str, object]) -> list[dict[str, object]]:
     return value
 
 
+def spot_stamps(journal_root: Path) -> list[int]:
+    """The spot leg's `received_time_ns` in every segment of a journal, in round order."""
+    stamps: list[int] = []
+    for document in segment_documents(journal_root):
+        observation = next(
+            item for item in observations_of(document) if item["instrument_id"] == "spot:BTCUSDT"
+        )
+        stamp = observation["received_time_ns"]
+        assert isinstance(stamp, int)
+        stamps.append(stamp)
+    return stamps
+
+
 class FakeVenue:
     """A fetcher over the synthetic book; `dark` and `broken` are URL fragments.
 
@@ -788,6 +816,7 @@ def test_create_journal_writes_an_immutable_spec_and_an_empty_segment_directory(
     path = create_journal(
         workspace_root=root, journal_root=journal, reserve_bytes=0, run_id="binance-carry-v1",
         perp_capture_root=perpetual, spot_capture_root=spot, family_spec_path=family_spec,
+        allow_short_sample=True,
     )
     assert path == journal / "journal-spec.json"
     document = read_document(path)
@@ -814,7 +843,7 @@ def test_create_journal_writes_an_immutable_spec_and_an_empty_segment_directory(
         create_journal(
             workspace_root=root, journal_root=journal, reserve_bytes=0,
             run_id="binance-carry-v1", perp_capture_root=perpetual, spot_capture_root=spot,
-            family_spec_path=family_spec,
+            family_spec_path=family_spec, allow_short_sample=True,
         )
 
 
@@ -829,8 +858,9 @@ def test_run_journal_writes_linked_segments_and_a_chain_head(tmp_path: Path) -> 
     assert (head.segment_count, head.last_sequence, head.spec_hash) == (3, 2, spec_hash)
     # One spot depth, one perpetual depth and one premium index per round.
     assert len(venue.urls) == 9
-    # The interval is waited between rounds, never before the first or after the last.
-    assert sleeper.calls == [SAMPLE_INTERVAL_SECONDS, SAMPLE_INTERVAL_SECONDS]
+    # The period is waited between rounds, never before the first or after the last,
+    # and each round spends part of it (W6).
+    assert sleeper.calls == pytest.approx([ROUND_PERIOD_REMAINDER] * 2)
     assert [path.name for path in sorted((journal / "segments").glob("*.json"))] == [
         "0000000000.json", "0000000001.json", "0000000002.json",
     ]
@@ -1018,7 +1048,7 @@ def test_the_cli_creates_runs_and_stops_a_journal(
         "binance-cost-journal-create", "--workspace-root", str(root),
         "--journal", str(journal), "--run-id", "binance-carry-v1",
         "--perp-capture", str(perpetual), "--spot-capture", str(spot),
-        "--family-spec", str(family_spec), "--reserve-bytes", "0",
+        "--family-spec", str(family_spec), "--reserve-bytes", "0", "--allow-short-sample",
     ]
     run_arguments = [
         "binance-cost-journal-run", "--workspace-root", str(root),
@@ -1102,10 +1132,18 @@ def rewrite_segment(path: Path, **overrides: object) -> None:
 class FakeResponse:
     """The little of `http.client.HTTPResponse` the public fetcher touches."""
 
-    def __init__(self, *, url: str, status: int = 200, body: bytes = b'{"lastUpdateId": 1}'):
+    def __init__(
+        self,
+        *,
+        url: str,
+        status: int = 200,
+        body: bytes = b'{"lastUpdateId": 1}',
+        headers: Mapping[str, str] | None = None,
+    ):
         self.url = url
         self.status = status
         self.body = body
+        self.headers = dict(headers or {})
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -1144,8 +1182,9 @@ def test_run_journal_adopts_the_segment_a_kill_left_beyond_the_head(tmp_path: Pa
     documents = segment_documents(journal)
     assert documents[3]["previous_segment_hash"] == orphan_hash
     assert verify_journal(journal) == (True, ())
-    # A resumed run waits the interval before its first round.
+    # A resumed run waits the whole interval before its first round.
     assert sleeper.calls == [SAMPLE_INTERVAL_SECONDS]
+    assert verify_journal(journal) == (True, ())
 
 
 def test_run_journal_adopts_a_first_segment_whose_head_was_never_written(
@@ -1233,7 +1272,7 @@ def test_a_resumed_run_waits_the_interval_before_its_first_round(tmp_path: Path)
     )
     # Nothing on disk, nothing to wait for; a journal with segments waits first.
     assert first.calls == []
-    assert second.calls == [SAMPLE_INTERVAL_SECONDS, SAMPLE_INTERVAL_SECONDS]
+    assert second.calls == pytest.approx([SAMPLE_INTERVAL_SECONDS, ROUND_PERIOD_REMAINDER])
 
 
 def test_a_premium_index_failure_does_not_cost_the_perpetual_its_round(tmp_path: Path) -> None:
@@ -1326,16 +1365,21 @@ def test_the_public_fetcher_refuses_a_redirect_that_leaves_the_allow_list(
     assert public_binance_json_fetcher(url) == {"lastUpdateId": 1}
 
 
-def test_the_cli_stops_when_storage_refuses(
+def test_the_cli_retries_a_crossed_reserve_and_stops_on_every_other_refusal(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """A reserve is about the disk right now; every other refusal is about the request."""
     journal = tmp_path / "journal"
     write_journal_directory(journal)
     assert main([
         "binance-cost-journal-run", "--workspace-root", str(tmp_path),
         "--journal", str(journal), "--rounds", "1", "--reserve-bytes", str(10**18),
-    ]) == 2
-    assert "StoragePolicyError" in capsys.readouterr().err
+    ]) == 1
+    assert "StorageReserveError" in capsys.readouterr().err
+    assert _journal_exit_code(StorageReserveError("job would cross the reserve")) == 1
+    assert _journal_exit_code(StoragePolicyError("target uses excluded drive: E:")) == 2
+    assert _journal_exit_code(BinanceCostJournalSpecError("bound to a different spec")) == 2
+    assert _journal_exit_code(BinanceCostJournalError("every instrument failed")) == 1
 
 
 def test_a_publish_that_dies_before_its_replace_leaves_a_pid_named_temporary(
@@ -1397,6 +1441,9 @@ SPEC_PATH = (
 )
 NOTIONAL_KEYS = ("500", "5000", "50000")
 FLOORS_NOT_MET = ("COST_OBSERVATION_FLOOR_NOT_MET", "COST_CAPTURE_SPAN_FLOOR_NOT_MET")
+EMPTY_TIER_NOTIONAL: dict[str, object] = {
+    "p50_of_p50": None, "p50_of_p90": None, "contributing_count": 0, "absent_count": 0,
+}
 
 
 class LadderVenue:
@@ -1566,14 +1613,7 @@ def test_the_span_is_measured_between_the_eligibility_notional_s_observations(
     journal = journal_with_rounds(tmp_path, rounds=8, fetcher=LadderVenue(thin_rounds={1: "30"}))
     receipt, _ = finalized_receipt(tmp_path, journal)
     spot = statistics_of(receipt, "spot:BTCUSDT")
-    stamps = [
-        next(
-            item
-            for item in observations_of(document)
-            if item["instrument_id"] == "spot:BTCUSDT"
-        )["received_time_ns"]
-        for document in segment_documents(journal)
-    ]
+    stamps = spot_stamps(journal)
     assert spot.observation_count == 8
     assert spot.slippage["5000"]["count"] == 7
     assert (spot.first_time_ns, spot.last_time_ns) == (stamps[1], stamps[7])
@@ -1609,41 +1649,39 @@ def test_a_journal_short_of_the_floors_leaves_every_tier_empty(tmp_path: Path) -
     ]
     for tier in receipt.tiers:
         assert tier.instrument_count == 0
-        assert tier.slippage == {
-            key: {"p50_of_p50": None, "p50_of_p90": None} for key in NOTIONAL_KEYS
-        }
+        assert tier.slippage == {key: EMPTY_TIER_NOTIONAL for key in NOTIONAL_KEYS}
 
 
 def test_tier_statistics_take_the_median_over_eligible_instruments_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Three tier-one spot legs at 400/800/1200 bps and an ineligible tier-two leg.
+    """Four tier-one spot legs at 400/800/1200/1600 bps and an ineligible tier-two leg.
 
     The tier-two perpetual's book holds 3 000 USDT, so it never fills the
     eligibility notional: it keeps its own statistics at 500 USDT and feeds no
-    tier median.
+    tier median. Four eligible members is exactly the contribution floor, so
+    the tier one spot medians are reported (W9).
     """
     lower_the_eligibility_floors(monkeypatch)
-    instruments = [
-        leg_document("AAAUSDT", market="spot", tier=1),
-        leg_document("BBBUSDT", market="spot", tier=1),
-        leg_document("CCCUSDT", market="spot", tier=1),
-        leg_document("DDDUSDT", market="um", tier=2),
-    ]
-    venue = LadderVenue(multipliers={"BBBUSDT": 2, "CCCUSDT": 3}, depth={"DDDUSDT": "30"})
+    symbols = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "EEEUSDT")
+    instruments = [leg_document(symbol, market="spot", tier=1) for symbol in symbols]
+    instruments.append(leg_document("DDDUSDT", market="um", tier=2))
+    venue = LadderVenue(
+        multipliers={"BBBUSDT": 2, "CCCUSDT": 3, "EEEUSDT": 4}, depth={"DDDUSDT": "30"}
+    )
     journal = journal_with_rounds(tmp_path, rounds=8, fetcher=venue, instruments=instruments)
     receipt, _ = finalized_receipt(tmp_path, journal)
 
-    assert [item.eligible for item in receipt.instruments] == [True, True, True, False]
+    assert [item.eligible for item in receipt.instruments] == [True] * 4 + [False]
     assert [
-        statistics_of(receipt, f"spot:{symbol}").slippage["5000"]["p50"]
-        for symbol in ("AAAUSDT", "BBBUSDT", "CCCUSDT")
-    ] == [Decimal("400"), Decimal("800"), Decimal("1200")]
+        statistics_of(receipt, f"spot:{symbol}").slippage["5000"]["p50"] for symbol in symbols
+    ] == [Decimal("400"), Decimal("800"), Decimal("1200"), Decimal("1600")]
     tier_one_spot = tier_of(receipt, tier=1, market="spot")
-    assert tier_one_spot.instrument_count == 3
-    # Medians of (400, 800, 1200) and of (800, 1600, 2400) under the same rule.
+    assert tier_one_spot.instrument_count == 4
+    # Medians of (400, 800, 1200, 1600) and of (800, 1600, 2400, 3200), same rule.
     assert tier_one_spot.slippage["5000"] == {
         "p50_of_p50": Decimal("800"), "p50_of_p90": Decimal("1600"),
+        "contributing_count": 4, "absent_count": 0,
     }
     ineligible = statistics_of(receipt, "perp:DDDUSDT")
     assert ineligible.reason_codes == FLOORS_NOT_MET
@@ -1653,7 +1691,7 @@ def test_tier_statistics_take_the_median_over_eligible_instruments_only(
     }
     for absent in (tier_of(receipt, tier=1, market="um"), tier_of(receipt, tier=2, market="um")):
         assert absent.instrument_count == 0
-        assert absent.slippage["5000"] == {"p50_of_p50": None, "p50_of_p90": None}
+        assert absent.slippage["5000"] == EMPTY_TIER_NOTIONAL
 
 
 def test_the_receipt_binds_the_chain_the_fees_and_its_own_hash(tmp_path: Path) -> None:
@@ -1756,7 +1794,7 @@ def test_the_cli_creates_runs_and_finalises_a_journal(
         "binance-cost-journal-create", "--workspace-root", str(root),
         "--journal", str(journal), "--run-id", "binance-carry-v1",
         "--perp-capture", str(perpetual), "--spot-capture", str(spot),
-        "--family-spec", str(family_spec), "--reserve-bytes", "0",
+        "--family-spec", str(family_spec), "--reserve-bytes", "0", "--allow-short-sample",
     ]) == 0
     with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=FakeVenue()):
         assert main([
@@ -1907,3 +1945,703 @@ def test_finalisation_refuses_a_gap_inside_the_head_s_range(tmp_path: Path) -> N
             reserve_bytes=0,
         )
     assert not (tmp_path / "receipt.json").exists()
+
+
+# --- Final fix wave: durability, single instance, cadence, backoff ------------------
+
+
+class ScriptClock:
+    """A clock reading a written-down script, repeating its last stamp when spent.
+
+    The run loop stamps a round with its first call and reads the clock once
+    more after publishing it, so a one-instrument round spends exactly three
+    calls: the round's stamp, the instrument's, and the one that measures how
+    long the round took.
+    """
+
+    def __init__(self, stamps: tuple[int, ...]) -> None:
+        self.stamps = stamps
+        self.index = 0
+
+    def __call__(self) -> int:
+        stamp = self.stamps[min(self.index, len(self.stamps) - 1)]
+        self.index += 1
+        return stamp
+
+
+class ThrottledVenue:
+    """A fetcher whose named URL fragment answers with a venue status code."""
+
+    def __init__(self, *, throttled: str, status: int, retry_after: int | None) -> None:
+        self.throttled = throttled
+        self.status = status
+        self.retry_after = retry_after
+
+    def __call__(self, url: str) -> Mapping[str, object]:
+        if self.throttled in url:
+            raise BinanceCostJournalTransportError(self.status, self.retry_after)
+        if "premiumIndex" in url:
+            symbol = parse_qs(urlsplit(url).query)["symbol"][0]
+            return {**premium_document(), "symbol": symbol}
+        return depth_document()
+
+
+def test_a_publish_flushes_its_bytes_before_the_rename(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rename must not publish a name whose bytes are still only in a cache (W1)."""
+    synced: list[int] = []
+    monkeypatch.setattr(os, "fsync", lambda descriptor: synced.append(descriptor))
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    # One segment and one chain head, each fsynced while its descriptor was open.
+    assert len(synced) == 2
+    assert verify_journal(journal) == (True, ())
+
+
+def test_an_unparseable_trailing_segment_is_discarded_and_its_sequence_resampled(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A crash caught mid-write leaves no measurement, so it is not corruption (W1)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    (journal / "segments" / "0000000002.json").write_bytes(b"{")
+    assert verify_journal(journal)[0] is False
+
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=FakeSleep(),
+    )
+
+    assert (head.segment_count, head.last_sequence) == (3, 2)
+    assert "SEGMENT_TORN_DISCARDED:0000000002.json" in capsys.readouterr().err
+    documents = segment_documents(journal)
+    assert len(documents) == 3
+    assert documents[2]["previous_segment_hash"] == documents[1]["content_hash"]
+    assert verify_journal(journal) == (True, ())
+
+
+def test_an_unparseable_first_segment_is_discarded_before_any_head_exists(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    (journal / "segments" / "0000000000.json").write_bytes(b"{")
+
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+
+    assert (head.segment_count, head.last_sequence) == (1, 0)
+    assert segment_documents(journal)[0]["previous_segment_hash"] == ZERO_HASH
+    assert verify_journal(journal) == (True, ())
+
+
+def test_a_trailing_segment_that_parses_but_does_not_link_is_still_refused(
+    tmp_path: Path,
+) -> None:
+    """Only an unparseable trailing file is a crash; a readable one is judged (W1)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    rewind_chain_head(journal, segments=1)
+    rewrite_segment(journal / "segments" / "0000000001.json", previous_segment_hash="a" * 64)
+    with pytest.raises(BinanceCostJournalSpecError):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+    assert len(segment_documents(journal)) == 2
+
+
+def test_a_torn_chain_head_is_rebuilt_from_the_segments(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The head carries nothing the segments do not, so it can be recomputed (W1)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    published = read_document(journal / "chain-head.json")
+    (journal / "chain-head.json").write_bytes(b'{"version": "binance-cos')
+
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=FakeSleep(),
+    )
+
+    reported = capsys.readouterr().err
+    assert "CHAIN_HEAD_TORN:chain-head.json" in reported
+    assert "CHAIN_HEAD_REBUILT:3" in reported
+    # The rebuild put the head back where it was before the run grew it by one.
+    assert (head.segment_count, head.last_sequence) == (4, 3)
+    assert verify_journal(journal) == (True, ())
+    assert segment_documents(journal)[3]["previous_segment_hash"] == (
+        published["final_segment_hash"]
+    )
+
+
+def test_a_missing_chain_head_over_three_segments_is_rebuilt(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    published = read_document(journal / "chain-head.json")
+    (journal / "chain-head.json").unlink()
+    # Three segments past no head at all is more than `_orphan_segment` adopts.
+    assert verify_journal(journal) == (False, ("CHAIN_HEAD_MISSING",))
+
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=FakeSleep(),
+    )
+
+    assert (head.segment_count, head.last_sequence) == (4, 3)
+    assert segment_documents(journal)[3]["previous_segment_hash"] == (
+        published["final_segment_hash"]
+    )
+    assert verify_journal(journal) == (True, ())
+
+
+def test_a_missing_chain_head_over_a_broken_middle_segment_refuses(tmp_path: Path) -> None:
+    """A chain that does not verify from zero is corruption, not a crash (W1)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    (journal / "chain-head.json").unlink()
+    edit_segment_body(journal / "segments" / "0000000001.json", received_time_ns=RECEIVED_NS + 7)
+
+    with pytest.raises(BinanceCostJournalSpecError, match="cannot be rebuilt"):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+
+    assert not (journal / "chain-head.json").exists()
+    assert len(segment_documents(journal)) == 3
+
+
+def test_a_chain_head_that_parses_but_fails_its_hash_is_not_rebuilt(tmp_path: Path) -> None:
+    """A head that was changed, not torn, is tampering and stays fatal (W1)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    path = journal / "chain-head.json"
+    path.write_bytes(canonical_json({**read_document(path), "last_sequence": 7}))
+    with pytest.raises(BinanceCostJournalSpecError, match="recorded hash"):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+
+
+def test_a_second_writer_is_refused_while_the_lock_is_held(tmp_path: Path) -> None:
+    """One journal is written by one process, whatever the supervisor started (W2)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    descriptor = os.open(journal / "run.lock", os.O_RDWR | os.O_CREAT)
+    journal_module._lock_exclusive(descriptor)
+    try:
+        with pytest.raises(BinanceCostJournalSpecError, match="another process"):
+            run_journal(
+                workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+                fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+            )
+        assert list((journal / "segments").iterdir()) == []
+    finally:
+        journal_module._release_journal_lock(descriptor)
+
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    assert head.segment_count == 1
+
+
+def test_create_journal_refuses_a_sample_short_of_the_declared_legs(
+    captures: Captures, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Twelve pairs derive 20 of the 32 declared legs: a decision, not a default (W3)."""
+    root, perpetual, spot, family_spec = captures
+    journal = root / "journal"
+    assert SAMPLE_INSTRUMENT_COUNT == 32
+    with pytest.raises(BinanceCostJournalSpecError, match="20 of the 32"):
+        create_journal(
+            workspace_root=root, journal_root=journal, reserve_bytes=0,
+            run_id="binance-carry-v1", perp_capture_root=perpetual, spot_capture_root=spot,
+            family_spec_path=family_spec,
+        )
+    assert not (journal / "journal-spec.json").exists()
+    arguments = [
+        "binance-cost-journal-create", "--workspace-root", str(root),
+        "--journal", str(journal), "--run-id", "binance-carry-v1",
+        "--perp-capture", str(perpetual), "--spot-capture", str(spot),
+        "--family-spec", str(family_spec), "--reserve-bytes", "0",
+    ]
+    assert main(arguments) == 2
+    assert "20 of the 32" in capsys.readouterr().err
+    assert main([*arguments, "--allow-short-sample"]) == 0
+    reported = capsys.readouterr().out
+    assert "20 instruments" in reported
+    assert "2020-07-24" in reported
+
+
+def test_the_declared_interval_is_a_period_not_a_gap(tmp_path: Path) -> None:
+    """A round that took 40 s of the 61 s period leaves 21 s; one that took 70 s, none."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal, instruments=[instrument_document()])
+    second = RECEIVED_NS + 100 * 10**9
+    third = second + 200 * 10**9
+    clock = ScriptClock((
+        RECEIVED_NS, RECEIVED_NS, RECEIVED_NS + 40 * 10**9,
+        second, second, second + 70 * 10**9,
+        third, third, third,
+    ))
+    sleeper = FakeSleep()
+
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=clock, sleep=sleeper,
+    )
+
+    assert sleeper.calls == pytest.approx([21.0, 0.0])
+    assert verify_journal(journal) == (True, ())
+
+
+def test_a_throttled_round_waits_the_retry_after_on_top_of_the_period(tmp_path: Path) -> None:
+    """429 and 418 are the venue naming its own cadence, and the run obeys it (W7)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    venue = ThrottledVenue(throttled="https://api.binance.com", status=429, retry_after=12)
+    sleeper = FakeSleep()
+
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=venue, clock=FakeClock(), sleep=sleeper,
+    )
+
+    assert sleeper.calls == pytest.approx([ROUND_PERIOD_REMAINDER, 12.0])
+    spot_observation, perpetual_observation = observations_of(segment_documents(journal)[0])
+    assert spot_observation["ok"] is False
+    assert "BinanceCostJournalTransportError: public request returned 429" in str(
+        spot_observation["reason"]
+    )
+    # The throttled instrument costs its own round, never the other's.
+    assert perpetual_observation["ok"] is True
+
+
+@pytest.mark.parametrize(
+    ("status", "retry_after", "expected"),
+    [(429, None, 60.0), (418, 1_000, 300.0), (429, 5, 5.0), (503, 30, None)],
+)
+def test_the_backoff_is_defaulted_and_capped(
+    tmp_path: Path, status: int, retry_after: int | None, expected: float | None
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    sleeper = FakeSleep()
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=ThrottledVenue(
+            throttled="https://api.binance.com", status=status, retry_after=retry_after
+        ),
+        clock=FakeClock(), sleep=sleeper,
+    )
+    # A status that is not a throttle buys no wait at all: only the period.
+    assert sleeper.calls == pytest.approx(
+        [ROUND_PERIOD_REMAINDER] if expected is None else [ROUND_PERIOD_REMAINDER, expected]
+    )
+
+
+def test_the_public_fetcher_carries_the_status_and_the_retry_after(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500"
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        urlopen_returning(FakeResponse(url=url, status=429, headers={"Retry-After": "17"})),
+    )
+    with pytest.raises(BinanceCostJournalTransportError) as refused:
+        public_binance_json_fetcher(url)
+    assert (refused.value.status, refused.value.retry_after) == (429, 17)
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        urlopen_returning(FakeResponse(url=url, status=418, headers={"Retry-After": "soon"})),
+    )
+    with pytest.raises(BinanceCostJournalTransportError) as unparseable:
+        public_binance_json_fetcher(url)
+    # An HTTP-date `Retry-After` is not parsed: absent, and the run waits its own minute.
+    assert (unparseable.value.status, unparseable.value.retry_after) == (418, None)
+
+
+def test_the_public_fetcher_reads_the_status_urllib_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """urllib raises 4xx and 5xx rather than returning them, so the code is on the error."""
+    url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500"
+    headers = Message()
+    headers["Retry-After"] = "23"
+
+    def raise_http_error(request: object, timeout: int = 0) -> object:
+        raise urllib.error.HTTPError(url, 429, "Too Many Requests", headers, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", raise_http_error)
+    with pytest.raises(BinanceCostJournalTransportError) as refused:
+        public_binance_json_fetcher(url)
+    assert (refused.value.status, refused.value.retry_after) == (429, 23)
+
+
+def test_an_observation_counts_the_levels_it_walked(tmp_path: Path) -> None:
+    """`null` slippage says the depth could not fill it; this says how deep it was (W8)."""
+    observation = depth_observation(
+        depth_document(),
+        instrument=SPOT,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=None,
+    )
+    assert (observation.bid_levels, observation.ask_levels) == (3, 3)
+    failed = depth_observation(
+        {"lastUpdateId": 1, "bids": [], "asks": []},
+        instrument=SPOT,
+        received_time_ns=RECEIVED_NS,
+        notionals=NOTIONALS,
+        premium_index=None,
+    )
+    assert (failed.bid_levels, failed.ask_levels) == (None, None)
+    with pytest.raises(ValidationError):
+        # A measured observation that counted no level is not a measurement.
+        InstrumentObservation.model_validate({**observation_document(), "bid_levels": None})
+    with pytest.raises(ValidationError):
+        InstrumentObservation.model_validate({**observation_document(), "ask_levels": 0})
+
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(dark=("https://api.binance.com",)),
+        clock=FakeClock(), sleep=FakeSleep(),
+    )
+    spot_observation, perpetual_observation = observations_of(segment_documents(journal)[0])
+    assert (spot_observation["bid_levels"], spot_observation["ask_levels"]) == (None, None)
+    assert (perpetual_observation["bid_levels"], perpetual_observation["ask_levels"]) == (3, 3)
+
+
+# --- Final fix wave: the receipt's floors, its span and the status subcommand -------
+
+
+def tier_ladder_instruments(*, deep: int, total: int = 8) -> list[dict[str, object]]:
+    """``total`` tier-one spot legs of which ``deep`` display 50 000 USDT.
+
+    Every leg fills the 5 000 USDT eligibility notional, so all of them are
+    eligible; only the deep ones carry a number at 50 000.
+    """
+    return [
+        leg_document(f"T{index:02d}USDT", market="spot", tier=1) for index in range(total)
+    ]
+
+
+def tier_ladder_depth(*, deep: int, total: int = 8) -> dict[str, str]:
+    """A level quantity a symbol: 1 000 fills every notional, 100 stops at 5 000."""
+    return {
+        f"T{index:02d}USDT": "1000" if index < deep else "100" for index in range(total)
+    }
+
+
+def tier_ladder_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, deep: int
+) -> FinalizationReceipt:
+    lower_the_eligibility_floors(monkeypatch)
+    journal = journal_with_rounds(
+        tmp_path,
+        rounds=8,
+        fetcher=LadderVenue(depth=tier_ladder_depth(deep=deep)),
+        instruments=tier_ladder_instruments(deep=deep),
+    )
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    return receipt
+
+
+def test_a_tier_median_needs_four_contributing_members(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Eight eligible members, three of them deep enough for 50 000 (W9)."""
+    receipt = tier_ladder_receipt(tmp_path, monkeypatch, deep=3)
+    assert all(item.eligible for item in receipt.instruments)
+    tier = tier_of(receipt, tier=1, market="spot")
+    assert tier.instrument_count == 8
+    # Three of eight filled 50 000: the counts are reported, the medians are not.
+    assert tier.slippage["50000"] == {
+        "p50_of_p50": None, "p50_of_p90": None,
+        "contributing_count": 3, "absent_count": 5,
+    }
+    # Every member filled 5 000, so that notional carries its medians.
+    assert tier.slippage["5000"]["contributing_count"] == 8
+    assert tier.slippage["5000"]["absent_count"] == 0
+    assert tier.slippage["5000"]["p50_of_p50"] == Decimal("400")
+    assert tier.slippage["5000"]["p50_of_p90"] == Decimal("800")
+
+
+def test_the_fourth_contributing_member_unlocks_the_tier_median(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert TIER_MINIMUM_CONTRIBUTORS == 4
+    receipt = tier_ladder_receipt(tmp_path, monkeypatch, deep=4)
+    tier = tier_of(receipt, tier=1, market="spot")
+    assert tier.slippage["50000"] == {
+        "p50_of_p50": Decimal("400"), "p50_of_p90": Decimal("800"),
+        "contributing_count": 4, "absent_count": 4,
+    }
+
+
+def test_a_tier_median_below_the_floor_cannot_be_published(tmp_path: Path) -> None:
+    """The model refuses the number, not only the function that would compute it."""
+    journal = journal_with_rounds(tmp_path, rounds=2, fetcher=LadderVenue())
+    _, output = finalized_receipt(tmp_path, journal)
+    document = read_document(output)
+    tiers = document["tiers"]
+    assert isinstance(tiers, list)
+    forged = {
+        **tiers[0],
+        "instrument_count": 3,
+        "slippage": {
+            key: {
+                "p50_of_p50": "400.000000", "p50_of_p90": "800.000000",
+                "contributing_count": 3, "absent_count": 0,
+            }
+            for key in NOTIONAL_KEYS
+        },
+    }
+    with pytest.raises(ValidationError, match="contributing members"):
+        TierStatistics.model_validate(forged)
+
+
+def test_the_receipt_states_the_floors_the_cadence_and_the_notionals(tmp_path: Path) -> None:
+    """A reader recomputes every decision from the receipt alone (W10)."""
+    journal = journal_with_rounds(tmp_path, rounds=2, fetcher=LadderVenue())
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    assert receipt.eligibility == {
+        "minimum_observations": MINIMUM_OBSERVATIONS,
+        "minimum_span_ns": MINIMUM_SPAN_NS,
+        "eligibility_notional": ELIGIBILITY_NOTIONAL,
+        "tier_minimum_contributors": TIER_MINIMUM_CONTRIBUTORS,
+    }
+    assert receipt.target_rounds == TARGET_ROUNDS
+    assert receipt.notionals == NOTIONALS
+    assert receipt.sample_interval_seconds == SAMPLE_INTERVAL_SECONDS
+    # The published floors are integers and the notional is the statistics' key.
+    document = read_document(tmp_path / "receipt.json")
+    assert document["eligibility"] == {
+        "minimum_observations": 10_000,
+        "minimum_span_ns": 604_800_000_000_000,
+        "eligibility_notional": "5000",
+        "tier_minimum_contributors": 4,
+    }
+    assert document["notionals"] == ["500", "5000", "50000"]
+    with pytest.raises(ValidationError):
+        FinalizationReceipt.model_validate({**document, "eligibility": {"minimum_span_ns": 1}})
+    with pytest.raises(ValidationError):
+        # A floor the receipt names must be one of the notionals it read.
+        FinalizationReceipt.model_validate(
+            {**document, "eligibility": {**document["eligibility"], "eligibility_notional": "7"}}
+        )
+
+
+def test_the_span_survives_a_clock_that_stepped_backwards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A host that rewound its clock narrows the window; it does not void the receipt."""
+    lower_the_eligibility_floors(monkeypatch)
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=8,
+        fetcher=LadderVenue(), clock=FakeClock(step=-1_000_000), sleep=FakeSleep(),
+    )
+    receipt, _ = finalized_receipt(tmp_path, journal)
+
+    spot = statistics_of(receipt, "spot:BTCUSDT")
+    stamps = spot_stamps(journal)
+    assert stamps == sorted(stamps, reverse=True)
+    assert spot.span_observation_count == 8
+    assert (spot.first_time_ns, spot.last_time_ns) == (min(stamps), max(stamps))
+    assert spot.eligible is True
+
+
+def test_the_span_observation_count_names_what_the_floors_were_read_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lower_the_eligibility_floors(monkeypatch)
+    journal = journal_with_rounds(tmp_path, rounds=8, fetcher=LadderVenue(thin_rounds={1: "30"}))
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    spot = statistics_of(receipt, "spot:BTCUSDT")
+    # Round one filled 500 only, so the eligibility window holds seven of eight.
+    assert (spot.observation_count, spot.span_observation_count) == (8, 7)
+    assert spot.slippage["5000"]["count"] == 7
+    with pytest.raises(ValidationError):
+        InstrumentStatistics.model_validate(
+            {**spot.model_dump(mode="json"), "span_observation_count": 9}
+        )
+
+
+def test_a_receipt_that_does_not_validate_is_a_refusal_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit 2 for the supervisor, never a pydantic error out of a library call (W10)."""
+    journal = journal_with_rounds(tmp_path, rounds=2, fetcher=LadderVenue())
+    monkeypatch.setattr("trading_bot.binance_cost_journal.RECEIPT_VERSION", "receipt/9.9.9")
+    with pytest.raises(BinanceCostJournalSpecError, match="receipt is invalid"):
+        finalize_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "receipt.json",
+            reserve_bytes=0,
+        )
+    assert not (tmp_path / "receipt.json").exists()
+
+
+def test_journal_status_reports_the_tip_the_cadence_and_the_rates(tmp_path: Path) -> None:
+    """The window is read, not the chain: the answer costs the same on day eight (W4)."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=4,
+        fetcher=FakeVenue(dark=("premiumIndex",)), clock=FakeClock(step=61_000_000_000),
+        sleep=FakeSleep(),
+    )
+
+    status = journal_status(journal, last=60)
+
+    assert (status.segment_count, status.last_sequence, status.window_segments) == (4, 3, 4)
+    assert status.last_received_time_ns == segment_documents(journal)[3]["received_time_ns"]
+    # The fake clock steps 61 s a call and a two-instrument round spends four.
+    assert status.mean_period_seconds == Decimal("244.000")
+    assert [item.instrument_id for item in status.instruments] == [
+        "spot:BTCUSDT", "perp:BTCUSDT",
+    ]
+    spot, perpetual = status.instruments
+    assert (spot.observation_count, spot.ok_rate) == (4, Decimal("1.0000"))
+    assert spot.premium_index_reason_rate == Decimal("0.0000")
+    # Every perpetual round measured its book and lost its premium index.
+    assert (perpetual.ok_rate, perpetual.premium_index_reason_rate) == (
+        Decimal("1.0000"), Decimal("1.0000"),
+    )
+    assert (status.verified, status.reasons) == (True, ())
+
+
+def test_journal_status_reads_only_the_window_it_was_asked_for(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=5,
+        fetcher=FakeVenue(dark=("https://api.binance.com",)), clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    # A segment before the window is broken: the bounded read does not see it,
+    # and `verify_journal` still does.
+    edit_segment_body(journal / "segments" / "0000000000.json", received_time_ns=RECEIVED_NS + 5)
+
+    status = journal_status(journal, last=2)
+
+    assert (status.segment_count, status.window_segments) == (5, 2)
+    assert status.verified is True
+    spot, _ = status.instruments
+    assert (spot.observation_count, spot.ok_rate) == (2, Decimal("0.0000"))
+    assert verify_journal(journal)[0] is False
+    assert journal_status(journal, last=60).verified is False
+
+
+def test_journal_status_names_what_is_wrong_inside_its_window(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    path = journal / "segments" / "0000000002.json"
+    edit_segment_body(path, received_time_ns=RECEIVED_NS + 5)
+
+    body_changed = journal_status(journal, last=2)
+
+    assert body_changed.verified is False
+    assert body_changed.reasons == ("SEGMENT_HASH_MISMATCH:0000000002.json",)
+    # A tamper that recomputes the segment's own hash still breaks the head's link.
+    rewrite_segment(path, received_time_ns=RECEIVED_NS + 6)
+
+    rehashed = journal_status(journal, last=2)
+
+    assert rehashed.verified is False
+    assert rehashed.reasons == ("CHAIN_HEAD_LINK_MISMATCH",)
+
+
+def test_journal_status_refuses_an_empty_or_unreadable_journal(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    with pytest.raises(BinanceCostJournalSpecError, match="no segment"):
+        journal_status(journal, last=60)
+    with pytest.raises(BinanceCostJournalSpecError, match="at least one segment"):
+        journal_status(journal, last=0)
+
+
+def test_the_cli_reports_a_journal_s_status(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(step=61_000_000_000), sleep=FakeSleep(),
+    )
+    arguments = [
+        "binance-cost-journal-status", "--workspace-root", str(tmp_path),
+        "--journal", str(journal), "--last", "2",
+    ]
+
+    assert main(arguments) == 0
+
+    reported = capsys.readouterr().out
+    assert "segment_count: 3" in reported
+    assert "last_sequence: 2" in reported
+    assert "window_segments: 2 (last 2)" in reported
+    assert "mean_period_seconds: 244.000" in reported
+    assert "spot:BTCUSDT: ok 1.0000 premium_index_reason 0.0000" in reported
+    assert "verify: ok" in reported
+    # The stamp is printed as an ISO UTC time, not a nanosecond count.
+    last = segment_documents(journal)[2]["received_time_ns"]
+    assert isinstance(last, int)
+    assert str(last) not in reported
+    assert f"last_received_time: {iso_utc_time(last)}" in reported
+
+    # A broken window is exit 1 - something to look at, not something to stop for.
+    edit_segment_body(journal / "segments" / "0000000002.json", received_time_ns=RECEIVED_NS + 5)
+    assert main(arguments) == 1
+    assert "verify: SEGMENT_HASH_MISMATCH:0000000002.json" in capsys.readouterr().out
+    # A journal outside the workspace is the supervisor's stop code, as everywhere.
+    assert main([
+        "binance-cost-journal-status", "--workspace-root", str(tmp_path),
+        "--journal", str(tmp_path.parent / "outside-journal"),
+    ]) == 2

@@ -8,6 +8,18 @@ class StoragePolicyError(ValueError):
     """Raised when a storage operation is not authorized."""
 
 
+class StorageReserveError(StoragePolicyError):
+    """Raised when only the free-space reserve stands in the job's way.
+
+    Every other refusal - an excluded drive, a target outside the workspace, a
+    temporary directory on another volume - is a fact about the request that
+    running it again cannot change. A crossed reserve is a fact about the disk
+    at this moment: deleting something, or a job elsewhere finishing, makes the
+    same request authorizable. Callers that map failures onto exit codes stop
+    on the first kind and retry the second.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class StoragePolicy:
     """Authorize bounded writes to approved local storage."""
@@ -47,6 +59,6 @@ class StoragePolicy:
                 raise StoragePolicyError("temporary directory must use the authorized target drive")
 
         if free_bytes - worst_case_required_bytes < self.reserve_bytes:
-            raise StoragePolicyError("job would cross the configured storage reserve")
+            raise StorageReserveError("job would cross the configured storage reserve")
 
         return target
