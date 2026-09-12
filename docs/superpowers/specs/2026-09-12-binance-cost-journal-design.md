@@ -62,7 +62,9 @@ allow-listed; any other host is refused.
 
 ## 4. Cadence, eligibility, chain
 
-- Sample interval 61 seconds between rounds (as the OKX journal); target 10 000 rounds.
+- Sample interval 61 seconds between rounds (as the OKX journal), also before the first
+  round of a resumed run; target 11 000 rounds, so the 10 000-observation floor survives
+  occasional failed rounds.
 - One segment per round holding every instrument's observation; segments are numbered,
   carry `previous_segment_hash`, `spec_hash`, `received_time_ns` and `content_hash`; a
   chain head records the last sequence and final hash. Same shapes and verification as
@@ -70,6 +72,11 @@ allow-listed; any other host is refused.
 - A request failure (transport, non-200, malformed) for one instrument records that
   instrument's observation as `null` with a reason string; the round is still written.
   A failure of every instrument in a round aborts the process (the supervisor restarts).
+  A perpetual whose depth succeeded but whose premium-index request failed keeps its depth
+  observation, with `funding_rate` and `basis_bps` null and a `premium_index_reason`.
+- A segment written just before the process died, whose chain head was not yet rewritten,
+  is adopted on resume when it is the next sequence, hash-valid and linked to the head;
+  any other inconsistency refuses to resume.
 - Resumable: on start the chain head is read and verified; the next sequence continues.
   The journal directory is bound to its spec hash; a different spec refuses to resume.
 - Eligibility, per instrument: ≥ 10 000 non-null observations at the 5 000 USDT notional
