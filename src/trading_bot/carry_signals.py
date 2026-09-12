@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from random import Random
 
-from trading_bot.carry_config import CarrySelectionRules
+from trading_bot.carry_config import CarryCostTable, CarrySelectionRules
 from trading_bot.carry_universe import PairUniverseSnapshot
 from trading_bot.panel_reader import FundingEvent
 
@@ -37,6 +37,9 @@ class Cohort:
     # ``len(entries)`` today (a pair stripped out after a forced close).
     # ``None`` means "formed with exactly len(entries)", the common case.
     formed_size: int | None = None
+    # How many pairs that were otherwise rankable at formation were kept out
+    # by the cost hurdle (spec 3.4). Zero for a member without a hurdle.
+    hurdle_rejections: int = 0
 
 
 def trailing_funding(
@@ -69,28 +72,109 @@ def _decile_size(count: int, selection: CarrySelectionRules) -> int:
     return max(selection.minimum_selected, count // selection.decile_denominator)
 
 
+def round_trip_cost_bps(cost_table: CarryCostTable, tier: int) -> Decimal:
+    """The cost of entering and leaving one unit of pair capital, in bps.
+
+    Both legs are crossed on the way in and on the way out, so the two fees
+    are paid once each per unit of pair capital and the tier's slippage twice
+    -- 25 bps on tier one and 35 on tier two under the v1 base table.
+    """
+    slippage = (
+        cost_table.slippage_bps_per_side_tier_one
+        if tier == 1
+        else cost_table.slippage_bps_per_side_tier_two
+    )
+    return cost_table.spot_fee_bps_per_side + cost_table.perpetual_fee_bps_per_side + 2 * slippage
+
+
+def hurdle_minimum_trailing(
+    *,
+    cost_table: CarryCostTable,
+    tier: int,
+    multiple: Decimal,
+    lookback_weeks: int,
+    hold_weeks: int,
+) -> Decimal:
+    """The smallest trailing `L`-week funding a pair may carry and still enter.
+
+    Spec 3.3 states the hurdle as `F_L * (H / L) / 2 >= k * c_rt(tier)`: the
+    trailing sum is scaled from the lookback to the hold, halved because only
+    half of a pair's capital sits on the funding leg, and compared against a
+    multiple of the round trip. Solved for `F_L` that is
+    `2 * k * c_rt * L / H`, per unit of perpetual notional and as a fraction
+    rather than bps, which is the unit funding rates come in.
+    """
+    return (
+        Decimal(2)
+        * multiple
+        * round_trip_cost_bps(cost_table, tier)
+        / Decimal(10_000)
+        * Decimal(lookback_weeks)
+        / Decimal(hold_weeks)
+    )
+
+
 def select_member_cohort(
     snapshot: PairUniverseSnapshot,
     *,
     trailing: dict[str, Decimal | None],
     selection: CarrySelectionRules,
+    hurdle: dict[str, Decimal] | None = None,
 ) -> Cohort:
-    """Top decile of the eligible pairs by trailing funding, positive funding required."""
+    """Top decile of the eligible pairs by trailing funding, positive funding required.
+
+    `hurdle` maps a pair id to the minimum trailing funding it must carry to
+    be ranked at all (spec 3.3). A pair with no entry is not hurdle-checked.
+    The decile width is unchanged by the hurdle: it is still computed from
+    every eligible pair, so hurdling pairs out thins the cohort rather than
+    concentrating the same capital into whichever few pairs qualified.
+    """
     paying = [
         (value, pair.pair_id)
         for pair in snapshot.pairs
         for value in (trailing.get(pair.pair_id),)
         if value is not None and value > 0
     ]
+    rejections = 0
+    if hurdle is not None:
+        qualified = []
+        for value, pair_id in paying:
+            minimum = hurdle.get(pair_id)
+            if minimum is not None and value < minimum:
+                rejections += 1
+                continue
+            qualified.append((value, pair_id))
+        paying = qualified
     if len(paying) < selection.minimum_selected:
-        return Cohort(snapshot.decision_close_ns, (), (NO_CARRY_COHORT,))
+        return Cohort(
+            snapshot.decision_close_ns, (), (NO_CARRY_COHORT,), hurdle_rejections=rejections
+        )
     paying.sort(key=lambda item: (-item[0], item[1]))
     size = min(len(paying), _decile_size(len(snapshot.pairs), selection))
     return Cohort(
         snapshot.decision_close_ns,
         _entries(snapshot, [pid for _, pid in paying[:size]]),
         (),
+        hurdle_rejections=rejections,
     )
+
+
+def exit_rule_pairs(
+    cohorts: list[Cohort], *, trailing_one_week: dict[str, Decimal | None]
+) -> set[str]:
+    """Pair ids held in any cohort whose trailing one-week funding is None or `<= 0`.
+
+    Spec 3.3's exit rule. A pair the caller did not measure is treated the
+    same as one that had no settlement in the week: it paid nothing, so it is
+    not held for another week.
+    """
+    return {
+        entry.pair_id
+        for cohort in cohorts
+        for entry in cohort.entries
+        for value in (trailing_one_week.get(entry.pair_id),)
+        if value is None or value <= 0
+    }
 
 
 def select_control_cohort(

@@ -1,19 +1,31 @@
 import json
+from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.carry_fixtures import perp_fetch, small_carry_config, spot_fetch
+import pytest
+
+from tests.carry_fixtures import perp_fetch, small_carry_config, small_carry_v2_config, spot_fetch
 from tests.test_panel_fold_run import MONTHS, SYMBOLS
 from trading_bot.cli import main
 
 EXTRAS = {
     "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
-    "forced_spot_legs", "forced_perpetual_legs",
+    "forced_spot_legs", "forced_perpetual_legs", "exit_rule_removals", "hurdle_rejections",
 }
 
 
-def test_spot_capture_manifest_carry_folds_and_decision_compose(tmp_path: Path) -> None:
-    config_path = small_carry_config(tmp_path)
+@pytest.mark.parametrize(
+    "config_builder,expected_member_count",
+    [(small_carry_config, 3), (small_carry_v2_config, 4)],
+    ids=["v1", "v2"],
+)
+def test_spot_capture_manifest_carry_folds_and_decision_compose(
+    tmp_path: Path,
+    config_builder: Callable[[Path], Path],
+    expected_member_count: int,
+) -> None:
+    config_path = config_builder(tmp_path)
     capture_arguments = [
         "--workspace-root", str(tmp_path), "--reserve-bytes", "0",
         "--symbols", ",".join(SYMBOLS), "--months", ",".join(MONTHS),
@@ -61,7 +73,7 @@ def test_spot_capture_manifest_carry_folds_and_decision_compose(tmp_path: Path) 
     assert decision["status"] == "development_only"
     assert decision["decision_status"] in {"eligible_member_available", "no_eligible_member"}
     assert decision["fold_count"] == len(reports)
-    assert len(decision["members"]) == 3
+    assert len(decision["members"]) == expected_member_count
     assert decision["hedge_capture_root_hash"] == manifest["hedge_capture_root_hash"]
     assert decision["hedge_dataset_root_hash"] == manifest["hedge_dataset_root_hash"]
     assert all(set(member["extras_mean"]) == EXTRAS for member in decision["members"])

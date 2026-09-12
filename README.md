@@ -243,6 +243,14 @@ uv run trading-research carry-fold --capture <perp> --hedge-capture <spot> --man
 uv run trading-research panel-decision --fold-report artifacts/carry/funding-carry-<datum>-fold0-v1.json --family-spec configs/funding-carry-panel-v1.json --output artifacts/carry/funding-carry-<datum>-decision-v1.json --registry artifacts/carry/metadata-funding-carry-v1.sqlite3
 ```
 
+Zweite Version der Familie (P1.29): `configs/funding-carry-panel-v2.json` hält Kohorten
+26 Wochen, schließt ein gehaltenes Paar, sobald dessen nachlaufendes Ein-Wochen-Funding
+nicht mehr positiv ist, und lässt ein Paar bei Aufnahme nur zu, wenn sein Funding das
+Doppelte der Round-Trip-Kosten deckt (Hurdle-Multiple 2). Manifest, Folds und
+Entscheidung heißen `artifacts/carry/carry-v2-walk-forward-<datum>-usdt-pairs-1d-w1-v1.json`,
+`artifacts/carry/funding-carry-v2-<datum>-fold<i>-v1.json` und
+`artifacts/carry/funding-carry-v2-<datum>-decision-v1.json`.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.
