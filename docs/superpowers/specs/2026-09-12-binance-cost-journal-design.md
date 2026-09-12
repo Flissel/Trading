@@ -30,10 +30,12 @@ For each sampled instrument and each round:
   sell (bids); record the **worse of the two sides**. If the displayed book cannot fill
   the notional within the fetched depth, the value is recorded as `null` and counted as
   `insufficient_depth` — that is an observation about executability, not a gap.
-- `displayed_notional_bps`: total displayed notional within the fetched depth on the
-  thinner side, in USDT (for the record; no gate).
-- For perpetuals additionally: `funding_rate` and `mark_price`/`index_price` from
-  `premiumIndex` (the basis at the sample instant, in bps: `(mark − index) / index × 10 000`).
+- `displayed_notional_thinner_side`: total displayed notional within the fetched depth on
+  the thinner side, in USDT (for the record; no gate).
+- For perpetuals additionally: `funding_rate` (as received) and `basis_bps` derived from
+  `premiumIndex` (`(mark − index) / index × 10 000` at the sample instant).
+- Measured bps values are quantised to 1e-6 bps and the displayed notional to 0.01 USDT at
+  observation time; this is the journal's declared measurement precision.
 
 Fees are not measured: the receipt carries the declared taker fees (spot 10 bps, USD-M
 5 bps, standard tier, no BNB discount, verified 2026-09-11) with an evidence id.
