@@ -1,6 +1,7 @@
 import json
+import os
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -166,7 +167,8 @@ def test_frozen_constants_match_the_declaration() -> None:
     assert list(NOTIONALS) == [Decimal("500"), Decimal("5000"), Decimal("50000")]
     assert DEPTH_LIMIT == 500
     assert SAMPLE_INTERVAL_SECONDS == 61
-    assert TARGET_ROUNDS == 10_000
+    # 11 000 rounds at 61 s is 7.8 days: margin over the 10 000-observation floor.
+    assert TARGET_ROUNDS == 11_000
     assert MINIMUM_OBSERVATIONS == 10_000
     assert MINIMUM_SPAN_NS == 604_800_000_000_000
     assert sorted(ALLOWED_HOSTS) == ["api.binance.com", "fapi.binance.com"]
@@ -363,7 +365,7 @@ def test_payloads_that_are_not_objects_become_failed_observations(payload: objec
 
 
 @pytest.mark.parametrize("premium_index", [["a", "b"], "premium", 7, 1.5])
-def test_premium_indexes_that_are_not_objects_become_failed_observations(
+def test_premium_indexes_that_are_not_objects_are_recorded_not_raised(
     premium_index: object,
 ) -> None:
     observation = depth_observation(
@@ -374,9 +376,9 @@ def test_premium_indexes_that_are_not_objects_become_failed_observations(
         premium_index=premium_index,
     )
 
-    assert observation.ok is False
-    assert observation.reason is not None
-    assert "premiumIndex" in observation.reason
+    assert observation.ok is True
+    assert observation.premium_index_reason is not None
+    assert "premiumIndex" in observation.premium_index_reason
 
 
 def test_measurements_are_quantised_to_the_declared_precision() -> None:
@@ -466,24 +468,38 @@ def test_a_book_beyond_the_recorded_precision_is_not_a_measurement() -> None:
     assert observation.reason == "measurement exceeds the recorded precision"
 
 
-def test_premium_index_failures_are_observations_not_exceptions() -> None:
+def test_a_premium_index_failure_leaves_the_measured_book_standing() -> None:
+    """The book was measured; only the funding fields are missing."""
     foreign = premium_document()
     foreign["symbol"] = "ETHUSDT"
+    negative = premium_document()
+    negative["indexPrice"] = "0"
+    cases = {
+        "missing premium index": None,
+        "premium index symbol mismatch": foreign,
+        "premium index prices must be positive": negative,
+        "premiumIndex must be an object with string keys": ["a", "b"],
+    }
+    for reason, premium_index in cases.items():
+        observation = depth_observation(
+            depth_document(),
+            instrument=PERP,
+            received_time_ns=RECEIVED_NS,
+            notionals=NOTIONALS,
+            premium_index=premium_index,
+        )
+        assert observation.ok is True, reason
+        assert observation.reason is None
+        assert observation.premium_index_reason == reason
+        assert observation.funding_rate is None
+        assert observation.basis_bps is None
+        # The measurement itself is untouched.
+        assert observation.spread_bps == Decimal("5000")
+        assert observation.slippage_bps_per_side["500"] == Decimal("3750")
 
-    missing = depth_observation(
-        depth_document(),
-        instrument=PERP,
-        received_time_ns=RECEIVED_NS,
-        notionals=NOTIONALS,
-        premium_index=None,
-    )
-    mismatched = depth_observation(
-        depth_document(),
-        instrument=PERP,
-        received_time_ns=RECEIVED_NS,
-        notionals=NOTIONALS,
-        premium_index=foreign,
-    )
+
+def test_a_spot_leg_handed_a_premium_index_is_still_refused() -> None:
+    """Not a venue failure but a caller pairing the wrong payload with a leg."""
     unexpected = depth_observation(
         depth_document(),
         instrument=SPOT,
@@ -492,12 +508,29 @@ def test_premium_index_failures_are_observations_not_exceptions() -> None:
         premium_index=premium_document(),
     )
 
-    assert missing.ok is False
-    assert missing.reason == "missing premium index"
-    assert mismatched.ok is False
-    assert mismatched.reason == "premium index symbol mismatch"
     assert unexpected.ok is False
     assert unexpected.reason == "unexpected premium index"
+    assert unexpected.premium_index_reason is None
+
+
+def test_a_measured_observation_binds_its_premium_index_reason() -> None:
+    document = observation_document()
+    with pytest.raises(ValidationError):
+        # A recorded funding rate contradicts a missing premium index.
+        InstrumentObservation.model_validate({
+            **document, "premium_index_reason": "missing premium index",
+            "funding_rate": "0.0001",
+        })
+    with pytest.raises(ValidationError):
+        # A failed observation carries one reason, not two.
+        InstrumentObservation.model_validate({
+            **document, "ok": False, "reason": "empty book", "spread_bps": None,
+            "displayed_notional_thinner_side": None,
+            "slippage_bps_per_side": {"500": None, "5000": None, "50000": None},
+            "premium_index_reason": "missing premium index",
+        })
+    with pytest.raises(ValidationError):
+        InstrumentObservation.model_validate({**document, "premium_index_reason": ""})
 
 
 def test_depth_observation_refuses_an_unusable_notional_set() -> None:
@@ -970,7 +1003,9 @@ def test_the_public_fetcher_refuses_a_foreign_host_before_any_request(
             public_binance_json_fetcher(url)
 
 
-def test_the_cli_creates_runs_and_stops_a_journal(captures: Captures) -> None:
+def test_the_cli_creates_runs_and_stops_a_journal(
+    captures: Captures, capsys: pytest.CaptureFixture[str]
+) -> None:
     root, perpetual, spot, family_spec = captures
     journal = root / "journal"
     create_arguments = [
@@ -984,16 +1019,22 @@ def test_the_cli_creates_runs_and_stops_a_journal(captures: Captures) -> None:
         "--journal", str(journal), "--rounds", "1", "--reserve-bytes", "0",
     ]
     assert main(create_arguments) == 0
+    reported = capsys.readouterr().out
+    assert "20 instruments" in reported
+    assert "2020-07-24" in reported
+    # A round in which every instrument fails is retryable: exit 1, no segment.
+    # It runs before the first good round so no run here resumes into the real
+    # 61 s interval the CLI passes through.
+    dark = FakeVenue(dark=("binance.com",))
+    with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=dark):
+        assert main(run_arguments) == 1
+    assert list((journal / "segments").iterdir()) == []
     with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=FakeVenue()):
         assert main(run_arguments) == 0
     assert (journal / "segments" / "0000000000.json").exists()
     assert verify_journal(journal) == (True, ())
     # An existing journal is immutable: the supervisor's stop code, not a retry.
     assert main(create_arguments) == 2
-    # A round in which every instrument fails is retryable instead.
-    dark = FakeVenue(dark=("binance.com",))
-    with patch("trading_bot.cli.public_binance_json_fetcher", side_effect=dark):
-        assert main(run_arguments) == 1
 
 
 def test_the_cli_stops_on_a_missing_or_foreign_journal(tmp_path: Path) -> None:
@@ -1018,3 +1059,314 @@ def test_the_cli_stops_on_a_missing_or_foreign_journal(tmp_path: Path) -> None:
         "--journal", str(journal), "--rounds", "1", "--reserve-bytes", "0",
     ]
     assert main(present) == 2
+
+
+# --- Fix round 1: adoption, cadence on resume, premium-index degradation ------------
+
+
+def rewind_chain_head(journal_root: Path, *, segments: int) -> None:
+    """Put the chain head back where a kill between the two publishes left it.
+
+    `segments` is how many segments the head had counted when the process died:
+    one fewer than the segment files on disk, and zero when the kill landed on
+    the very first round, which leaves no head at all.
+    """
+    path = journal_root / "chain-head.json"
+    documents = segment_documents(journal_root)[:segments]
+    if not documents:
+        path.unlink()
+        return
+    material: dict[str, object] = {
+        "version": JOURNAL_VERSION,
+        "spec_hash": documents[-1]["spec_hash"],
+        "segment_count": len(documents),
+        "last_sequence": len(documents) - 1,
+        "final_segment_hash": documents[-1]["content_hash"],
+    }
+    path.write_bytes(canonical_json({**material, "content_hash": content_sha256(material)}))
+
+
+def rewrite_segment(path: Path, **overrides: object) -> None:
+    """Rewrite a segment with its own hash recomputed, the way a writer would."""
+    document = {**read_document(path), **overrides}
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    path.write_bytes(canonical_json({**material, "content_hash": content_sha256(material)}))
+
+
+class FakeResponse:
+    """The little of `http.client.HTTPResponse` the public fetcher touches."""
+
+    def __init__(self, *, url: str, status: int = 200, body: bytes = b'{"lastUpdateId": 1}'):
+        self.url = url
+        self.status = status
+        self.body = body
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *arguments: object) -> None:
+        return None
+
+    def read(self, amount: int) -> bytes:
+        return self.body[:amount]
+
+
+def urlopen_returning(response: FakeResponse) -> Callable[..., FakeResponse]:
+    def fake_urlopen(request: object, timeout: int = 0) -> FakeResponse:
+        return response
+
+    return fake_urlopen
+
+
+def test_run_journal_adopts_the_segment_a_kill_left_beyond_the_head(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    orphan_hash = str(segment_documents(journal)[2]["content_hash"])
+    rewind_chain_head(journal, segments=2)
+    assert verify_journal(journal)[0] is False
+    sleeper = FakeSleep()
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=sleeper,
+    )
+    # The trailing segment was adopted, then one more round was appended.
+    assert (head.segment_count, head.last_sequence) == (4, 3)
+    documents = segment_documents(journal)
+    assert documents[3]["previous_segment_hash"] == orphan_hash
+    assert verify_journal(journal) == (True, ())
+    # A resumed run waits the interval before its first round.
+    assert sleeper.calls == [SAMPLE_INTERVAL_SECONDS]
+
+
+def test_run_journal_adopts_a_first_segment_whose_head_was_never_written(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    rewind_chain_head(journal, segments=0)
+    assert not (journal / "chain-head.json").exists()
+    assert verify_journal(journal) == (False, ("CHAIN_HEAD_MISSING",))
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=FakeSleep(),
+    )
+    assert (head.segment_count, head.last_sequence) == (2, 1)
+    assert verify_journal(journal) == (True, ())
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"previous_segment_hash": "a" * 64},  # not the head it follows
+        {"spec_hash": "f" * 64},  # not this journal's spec
+    ],
+)
+def test_a_trailing_segment_that_is_not_the_head_s_successor_is_refused(
+    tmp_path: Path, overrides: dict[str, object]
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    rewind_chain_head(journal, segments=1)
+    rewrite_segment(journal / "segments" / "0000000001.json", **overrides)
+    head_before = read_document(journal / "chain-head.json")
+    with pytest.raises(BinanceCostJournalSpecError):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+    assert len(segment_documents(journal)) == 2
+    # Refused, not half-repaired: a journal this run would not touch keeps its head.
+    assert read_document(journal / "chain-head.json") == head_before
+
+
+def test_a_trailing_segment_whose_hash_does_not_recompute_is_refused(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    rewind_chain_head(journal, segments=1)
+    path = journal / "segments" / "0000000001.json"
+    document = read_document(path)
+    observations_of(document)[0]["spread_bps"] = "1"  # the recorded hash is now stale
+    path.write_bytes(canonical_json(document))
+    head_before = read_document(journal / "chain-head.json")
+    with pytest.raises(BinanceCostJournalSpecError):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+    assert read_document(journal / "chain-head.json") == head_before
+
+
+def test_a_resumed_run_waits_the_interval_before_its_first_round(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    first = FakeSleep()
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=first,
+    )
+    second = FakeSleep()
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=2,
+        fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=second,
+    )
+    # Nothing on disk, nothing to wait for; a journal with segments waits first.
+    assert first.calls == []
+    assert second.calls == [SAMPLE_INTERVAL_SECONDS, SAMPLE_INTERVAL_SECONDS]
+
+
+def test_a_premium_index_failure_does_not_cost_the_perpetual_its_round(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(dark=("premiumIndex",)), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    assert head.segment_count == 1
+    spot_observation, perpetual_observation = observations_of(segment_documents(journal)[0])
+    assert spot_observation["ok"] is True
+    assert spot_observation["premium_index_reason"] is None
+    assert perpetual_observation["ok"] is True
+    assert perpetual_observation["reason"] is None
+    # The transport's own reason, not the parser's "missing premium index".
+    assert "ConnectionError" in str(perpetual_observation["premium_index_reason"])
+    assert perpetual_observation["funding_rate"] is None
+    assert perpetual_observation["basis_bps"] is None
+    # The book itself was measured.
+    assert perpetual_observation["spread_bps"] == "5000.000000"
+
+
+def test_a_depth_failure_still_costs_the_instrument_its_round(tmp_path: Path) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(dark=("fapi.binance.com/fapi/v1/depth",)),
+        clock=FakeClock(), sleep=FakeSleep(),
+    )
+    perpetual_observation = observations_of(segment_documents(journal)[0])[1]
+    assert perpetual_observation["ok"] is False
+    assert "ConnectionError" in str(perpetual_observation["reason"])
+    assert perpetual_observation["premium_index_reason"] is None
+
+
+def test_verify_journal_tolerates_a_temporary_file_and_reports_anything_else(
+    tmp_path: Path,
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    segments = journal / "segments"
+    # Nothing is left behind by a publish that finished.
+    assert [path.name for path in segments.iterdir()] == ["0000000000.json"]
+    (segments / "0000000001.json.4242.tmp").write_bytes(b"half a segment")
+    assert verify_journal(journal) == (True, ())
+    (segments / "0000000001.tmp").write_bytes(b"not one of ours")
+    (segments / "notes.txt").write_bytes(b"nor this")
+    valid, reasons = verify_journal(journal)
+    assert valid is False
+    assert set(reasons) == {
+        "SEGMENT_UNEXPECTED_FILE:0000000001.tmp",
+        "SEGMENT_UNEXPECTED_FILE:notes.txt",
+    }
+
+
+def test_the_public_fetcher_refuses_a_redirect_that_leaves_the_allow_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    url = "https://api.binance.com/api/v3/depth?symbol=BTCUSDT&limit=500"
+    monkeypatch.setattr(
+        urllib.request, "urlopen", urlopen_returning(FakeResponse(url="https://evil.example.com/"))
+    )
+    with pytest.raises(BinanceCostJournalError, match="redirect"):
+        public_binance_json_fetcher(url)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", urlopen_returning(FakeResponse(url=url, status=500))
+    )
+    with pytest.raises(BinanceCostJournalError, match="500"):
+        public_binance_json_fetcher(url)
+    monkeypatch.setattr(
+        urllib.request, "urlopen", urlopen_returning(FakeResponse(url=url, body=b"[1, 2]"))
+    )
+    with pytest.raises(BinanceCostJournalError, match="object"):
+        public_binance_json_fetcher(url)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen_returning(FakeResponse(url=url)))
+    assert public_binance_json_fetcher(url) == {"lastUpdateId": 1}
+
+
+def test_the_cli_stops_when_storage_refuses(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    assert main([
+        "binance-cost-journal-run", "--workspace-root", str(tmp_path),
+        "--journal", str(journal), "--rounds", "1", "--reserve-bytes", str(10**18),
+    ]) == 2
+    assert "StoragePolicyError" in capsys.readouterr().err
+
+
+def test_a_publish_that_dies_before_its_replace_leaves_a_pid_named_temporary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+
+    def explode(self: Path, target: object) -> None:
+        raise OSError("the process died between the write and the replace")
+
+    monkeypatch.setattr(Path, "replace", explode)
+    with pytest.raises(OSError, match="died"):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+    monkeypatch.undo()
+    # Named for the process that wrote it, so a second writer cannot half-write
+    # the same temporary, and tolerated by the verifier.
+    assert [path.name for path in (journal / "segments").iterdir()] == [
+        f"0000000000.json.{os.getpid()}.tmp"
+    ]
+    assert verify_journal(journal) == (True, ())
+    head = run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    assert head.segment_count == 1
+
+
+def test_more_than_one_trailing_segment_is_corruption_not_a_kill(tmp_path: Path) -> None:
+    """A kill can strand one segment; two mean something else edited the journal."""
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    rewind_chain_head(journal, segments=1)
+    head_before = read_document(journal / "chain-head.json")
+    with pytest.raises(BinanceCostJournalSpecError):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+        )
+    assert read_document(journal / "chain-head.json") == head_before
+    assert len(segment_documents(journal)) == 3

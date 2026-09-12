@@ -60,14 +60,19 @@ allow-listed; any other host is refused.
 
 ## 4. Cadence, eligibility, chain
 
-- Sample interval 61 seconds between rounds (as the OKX journal); target 10 000 rounds.
+- Sample interval 61 seconds between rounds (as the OKX journal); target 11 000 rounds
+  (7.8 days at that interval: margin over the 10 000-observation eligibility floor below,
+  which pays for the rounds an outage or a restart costs).
 - One segment per round holding every instrument's observation; segments are numbered,
   carry `previous_segment_hash`, `spec_hash`, `received_time_ns` and `content_hash`; a
   chain head records the last sequence and final hash. Same shapes and verification as
   the OKX journal's V1, versioned `binance-cost-journal/1.0.0`.
-- A request failure (transport, non-200, malformed) for one instrument records that
+- A depth request failure (transport, non-200, malformed) for one instrument records that
   instrument's observation as `null` with a reason string; the round is still written.
   A failure of every instrument in a round aborts the process (the supervisor restarts).
+  A perpetual's *premium index* is a second request beside its depth: when only that one
+  fails the book was still measured, so the observation stands with no funding rate and no
+  basis and the defect in `premium_index_reason` (Task 2 fix round 1 ruling).
 - Resumable: on start the chain head is read and verified; the next sequence continues.
   The journal directory is bound to its spec hash; a different spec refuses to resume.
 - Eligibility, per instrument: ≥ 10 000 non-null observations at the 5 000 USDT notional

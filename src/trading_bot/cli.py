@@ -3,6 +3,7 @@
 import argparse
 import shutil
 import sys
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from trading_bot.binance_cost_journal import (
     TARGET_ROUNDS,
     BinanceCostJournalSpecError,
     create_journal,
+    load_journal_spec,
     public_binance_json_fetcher,
     run_journal,
 )
@@ -24,7 +26,7 @@ from trading_bot.panel_decision import build_panel_decision
 from trading_bot.panel_fold_run import run_panel_fold
 from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
-from trading_bot.storage import StoragePolicy
+from trading_bot.storage import StoragePolicy, StoragePolicyError
 from trading_bot.strategy import CostScenario
 from trading_bot.walk_forward_run import derive_walk_forward_config, run_capture_walk_forward
 
@@ -383,10 +385,16 @@ def _binance_cost_journal_create(parsed: argparse.Namespace) -> int:
             spot_capture_root=spot,
             family_spec_path=family_spec,
         )
-    except BinanceCostJournalSpecError as error:
-        return _journal_failure(f"{type(error).__name__}: {error}", 2)
+        spec, _ = load_journal_spec(journal)
     except Exception as error:  # the supervisor reads the code, not the traceback
-        return _journal_failure(f"{type(error).__name__}: {error}", 1)
+        return _journal_failure(f"{type(error).__name__}: {error}", _journal_exit_code(error))
+    decision = datetime.fromtimestamp(
+        spec.sample_decision_close_ns // 1_000_000_000, tz=UTC
+    ).strftime("%Y-%m-%d")
+    print(
+        f"binance cost journal created: {len(spec.instruments)} instruments "
+        f"sampled at the {decision} decision"
+    )
     return 0
 
 
@@ -403,19 +411,25 @@ def _binance_cost_journal_run(parsed: argparse.Namespace) -> int:
             rounds=parsed.rounds,
             fetcher=public_binance_json_fetcher,
         )
-    except BinanceCostJournalSpecError as error:
-        return _journal_failure(f"{type(error).__name__}: {error}", 2)
     except Exception as error:  # the supervisor reads the code, not the traceback
-        return _journal_failure(f"{type(error).__name__}: {error}", 1)
+        return _journal_failure(f"{type(error).__name__}: {error}", _journal_exit_code(error))
     return 0
 
 
-def _journal_failure(message: str, code: int) -> int:
-    """Report a failure on stderr and hand the supervisor its exit code.
+def _journal_exit_code(error: Exception) -> int:
+    """2 for what a restart cannot fix, 1 for what it may.
 
-    Code 2 is a usage or spec mismatch the supervisor must stop on; code 1 is
-    everything else, which a restart may well survive.
+    A spec mismatch and a refused storage authorisation (an excluded drive, a
+    path outside the workspace, a reserve the job would cross) are both
+    conditions the same command will keep hitting, so the supervisor stops on
+    them; a transport failure or a round in which every instrument failed is
+    worth another attempt.
     """
+    return 2 if isinstance(error, BinanceCostJournalSpecError | StoragePolicyError) else 1
+
+
+def _journal_failure(message: str, code: int) -> int:
+    """Report a failure on stderr and hand the supervisor its exit code."""
     print(message, file=sys.stderr)
     return code
 

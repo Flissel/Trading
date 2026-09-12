@@ -11,6 +11,7 @@ is allowed to reach Binance.
 
 import http.client
 import json
+import os
 import re
 import shutil
 import time
@@ -44,7 +45,10 @@ JOURNAL_VERSION = "binance-cost-journal/1.0.0"
 NOTIONALS: tuple[Decimal, ...] = (Decimal("500"), Decimal("5000"), Decimal("50000"))
 DEPTH_LIMIT = 500
 SAMPLE_INTERVAL_SECONDS = 61
-TARGET_ROUNDS = 10_000
+# 11 000 rounds at 61 s is 7.8 days: the eligibility floor below wants 10 000
+# non-null observations over at least 7 days, and the margin pays for the rounds
+# a venue outage or a restart costs.
+TARGET_ROUNDS = 11_000
 MINIMUM_OBSERVATIONS = 10_000
 MINIMUM_SPAN_NS = 7 * 86_400_000_000_000
 ALLOWED_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
@@ -74,6 +78,10 @@ _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 _SYMBOL = re.compile(r"\A[A-Z0-9]{4,24}\Z")
 _IDENTIFIER = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9.:_-]{0,79}\Z")
 _SEGMENT_NAME = re.compile(r"\A[0-9]{10}\.json\Z")
+# `<sequence>.json.<pid>.tmp` (and the bare `.tmp` an older build wrote):
+# a publish that died before its replace(), which the next attempt at that
+# sequence overwrites.
+_SEGMENT_TEMPORARY_NAME = re.compile(r"\A[0-9]{10}\.json(\.[0-9]+)?\.tmp\Z")
 _WORST_CASE_REQUIRED_BYTES = 500_000_000
 _FETCH_TIMEOUT_SECONDS = 20
 # A 500-level depth payload is ~30 kB; the cap only bounds a hostile response.
@@ -232,6 +240,9 @@ class InstrumentObservation(_Frozen):
     displayed_notional_thinner_side: Decimal | None
     funding_rate: Decimal | None
     basis_bps: Decimal | None
+    # A perpetual whose premium index failed while its book was measured: the
+    # observation still counts, its two funding fields are simply absent.
+    premium_index_reason: str | None = None
 
     @model_validator(mode="after")
     def validate_consistency(self) -> Self:
@@ -241,10 +252,14 @@ class InstrumentObservation(_Frozen):
             raise ValueError("received_time_ns must be a positive nanosecond stamp")
         if not self.slippage_bps_per_side:
             raise ValueError("an observation carries one entry per sampled notional")
+        if self.premium_index_reason == "":
+            raise ValueError("a premium index reason is either absent or set")
         if self.ok:
             return self._validate_measured()
         if not self.reason:
             raise ValueError("a failed observation carries a reason")
+        if self.premium_index_reason is not None:
+            raise ValueError("a failed observation carries one reason")
         if any(
             value is not None
             for value in (
@@ -267,6 +282,10 @@ class InstrumentObservation(_Frozen):
             raise ValueError("spread and displayed notional are positive")
         if any(value is not None and value < 0 for value in self.slippage_bps_per_side.values()):
             raise ValueError("slippage cannot be negative on an uncrossed book")
+        if self.premium_index_reason is not None and (
+            self.funding_rate is not None or self.basis_bps is not None
+        ):
+            raise ValueError("an unusable premium index leaves no funding rate and no basis")
         return self
 
 
@@ -380,10 +399,12 @@ def depth_observation(
     object carries ``lastUpdateId`` and the ``bids``/``asks`` level arrays, the
     premium index object ``markPrice``, ``indexPrice`` and ``lastFundingRate``,
     and the latter belongs to perpetual legs only (``None`` where a leg has none).
-    Any defect - a value that is not an object at all, a malformed, empty or
-    crossed book, a missing or foreign premium index, a book below the recorded
-    precision - becomes ``ok=False`` with a reason instead of an exception; the
-    notional keys are always present.
+    Any defect in the book - a value that is not an object at all, a malformed,
+    empty or crossed book, a book below the recorded precision - becomes
+    ``ok=False`` with a reason instead of an exception; the notional keys are
+    always present. A missing or unusable premium index does *not* void the
+    measured book: the observation stays ``ok`` with no funding rate, no basis
+    and the defect in ``premium_index_reason``.
 
     Every measured value is recorded at the journal's declared precision:
     1e-6 bps for the spread, the slippage and the basis, 0.01 quote units for the
@@ -392,7 +413,9 @@ def depth_observation(
     keys = _notional_keys(notionals)
     try:
         bids, asks = _validated_book(payload)
-        funding_rate, basis_bps = _premium_values(premium_index, instrument=instrument)
+        funding_rate, basis_bps, premium_index_reason = _premium_values(
+            premium_index, instrument=instrument
+        )
         best_bid = bids[0][0]
         best_ask = asks[0][0]
         mid = (best_bid + best_ask) / Decimal(2)
@@ -429,6 +452,7 @@ def depth_observation(
         displayed_notional_thinner_side=displayed,
         funding_rate=funding_rate,
         basis_bps=basis_bps,
+        premium_index_reason=premium_index_reason,
     )
 
 
@@ -496,24 +520,37 @@ def _validated_side(
 
 def _premium_values(
     premium_index: object, *, instrument: JournalInstrument
-) -> tuple[Decimal | None, Decimal | None]:
+) -> tuple[Decimal | None, Decimal | None, str | None]:
+    """Return ``(funding_rate, basis_bps, premium_index_reason)``.
+
+    A perpetual's premium index is a second request beside its depth: when it
+    is missing or unusable the book was still measured, so the defect is
+    recorded as the third member and the observation stays ``ok``. Only a spot
+    leg handed a premium index raises - that is the caller pairing an
+    instrument with the wrong payload, not the venue failing.
+    """
     if instrument.premium_index_url is None:
         if premium_index is not None:
             raise DepthPayloadError("unexpected premium index")
-        return None, None
+        return None, None, None
     if premium_index is None:
-        raise DepthPayloadError("missing premium index")
-    document = _mapping(premium_index, field_name="premiumIndex")
-    symbol = _string(document.get("symbol"), field_name="premiumIndex.symbol")
-    if symbol != instrument.symbol:
-        raise DepthPayloadError("premium index symbol mismatch")
-    mark_price = _decimal_string(document.get("markPrice"), field_name="markPrice")
-    index_price = _decimal_string(document.get("indexPrice"), field_name="indexPrice")
-    funding_rate = _decimal_string(document.get("lastFundingRate"), field_name="lastFundingRate")
-    if mark_price <= 0 or index_price <= 0:
-        raise DepthPayloadError("premium index prices must be positive")
-    basis_bps = (mark_price - index_price) / index_price * _BPS
-    return funding_rate, _quantised(basis_bps, _BPS_QUANTUM)
+        return None, None, "missing premium index"
+    try:
+        document = _mapping(premium_index, field_name="premiumIndex")
+        symbol = _string(document.get("symbol"), field_name="premiumIndex.symbol")
+        if symbol != instrument.symbol:
+            raise DepthPayloadError("premium index symbol mismatch")
+        mark_price = _decimal_string(document.get("markPrice"), field_name="markPrice")
+        index_price = _decimal_string(document.get("indexPrice"), field_name="indexPrice")
+        funding_rate = _decimal_string(
+            document.get("lastFundingRate"), field_name="lastFundingRate"
+        )
+        if mark_price <= 0 or index_price <= 0:
+            raise DepthPayloadError("premium index prices must be positive")
+        basis_bps = _quantised((mark_price - index_price) / index_price * _BPS, _BPS_QUANTUM)
+    except DepthPayloadError as error:
+        return None, None, str(error)
+    return funding_rate, basis_bps, None
 
 
 def _displayed_notional(levels: Sequence[tuple[Decimal, Decimal]]) -> Decimal:
@@ -660,25 +697,46 @@ def run_journal(
 
     The whole chain is verified before anything is appended and the chain head
     must name this journal's spec, so a tampered chain or a foreign spec stops
-    the run instead of extending it. One instrument's failure - a fetcher
-    exception or an unusable payload - becomes that observation's reason and
-    the round is still written; a round in which every instrument fails aborts
-    before writing, which is what the supervisor restarts. Sampling stops early
-    once the declared ``target_rounds`` is on disk.
+    the run instead of extending it. The one verification failure that is
+    repaired rather than refused is a segment the previous process published
+    before it was killed, whose chain head never followed: that segment is
+    durable and self-verifying, so the head is rebuilt over it (see
+    ``_orphan_segment``) and the run continues from the next sequence.
+
+    One instrument's failure - a fetcher exception or an unusable payload -
+    becomes that observation's reason and the round is still written; a round
+    in which every instrument fails aborts before writing, which is what the
+    supervisor restarts. Sampling stops early once the declared
+    ``target_rounds`` is on disk.
+
+    The declared interval is waited between rounds *and* before the first round
+    of a journal that already holds segments, so a restart cannot sample faster
+    than the cadence the spec declares.
     """
     if rounds <= 0:
         raise BinanceCostJournalSpecError("a run appends at least one round")
     root = _authorize(workspace_root, journal_root, reserve_bytes)
     spec, spec_hash = load_journal_spec(root)
-    valid, reasons = verify_journal(root)
-    if not valid:
-        raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
     head = _read_chain_head(root)
     if head is not None and head.spec_hash != spec_hash:
         raise BinanceCostJournalSpecError("this journal is bound to a different spec")
+    resumed = head is not None
+    valid, reasons = verify_journal(root)
+    if not valid:
+        orphan = _orphan_segment(root, head, spec_hash=spec_hash)
+        if orphan is None:
+            raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
+        head = _publish_chain_head(root, segment=orphan, spec_hash=spec_hash)
+        resumed = True
+        valid, reasons = verify_journal(root)
+        if not valid:
+            raise BinanceCostJournalSpecError(
+                "journal verification failed after adopting the trailing segment: "
+                + ",".join(reasons)
+            )
     written = 0
     while written < rounds and (head is None or head.segment_count < spec.target_rounds):
-        if written:
+        if written or resumed:
             sleep(spec.sample_interval_seconds)
         segment = _sample_round(
             spec=spec, spec_hash=spec_hash, head=head, fetcher=fetcher, clock=clock
@@ -705,13 +763,13 @@ def verify_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
     if not directory.is_dir():
         return False, ("SEGMENT_DIRECTORY_MISSING",)
     paths = sorted(path for path in directory.glob("*.json") if _SEGMENT_NAME.match(path.name))
-    # A `.tmp` left by a write that died mid-flight carries nothing and is
-    # replaced by the next attempt at that sequence; anything else under
-    # `segments/` is not this journal's and is reported.
+    # A `<sequence>.json.<pid>.tmp` left by a write that died mid-flight carries
+    # nothing and is replaced by the next attempt at that sequence; anything
+    # else under `segments/` is not this journal's and is reported.
     reasons: list[str] = [
         f"SEGMENT_UNEXPECTED_FILE:{path.name}"
         for path in sorted(directory.iterdir())
-        if not _SEGMENT_NAME.match(path.name) and path.suffix != ".tmp"
+        if not _SEGMENT_NAME.match(path.name) and not _SEGMENT_TEMPORARY_NAME.match(path.name)
     ]
     previous_hash = ZERO_HASH
     for expected_sequence, path in enumerate(paths):
@@ -746,7 +804,8 @@ def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
     """GET one public Binance JSON object over HTTPS with a 20 s timeout.
 
     The host is checked against ``ALLOWED_HOSTS`` before any socket is opened,
-    so a URL this journal did not build never reaches the network. A non-200
+    so a URL this journal did not build never reaches the network, and again on
+    the URL the response came from, so a redirect cannot walk off the list. A non-200
     response, a body that is not a JSON object and any transport failure are
     refused as ``BinanceCostJournalError``, which the run loop records as that
     instrument's reason for the round.
@@ -763,8 +822,11 @@ def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
             if response.status != 200:
                 raise BinanceCostJournalError(f"public request returned {response.status}")
             raw = response.read(_MAX_RESPONSE_BYTES + 1)
+            final_url = str(response.url)
     except (OSError, http.client.HTTPException) as error:
         raise BinanceCostJournalError(f"public request failed: {error}") from error
+    if urlsplit(final_url).netloc not in ALLOWED_HOSTS:
+        raise BinanceCostJournalError("a redirect left Binance's public hosts")
     if len(raw) > _MAX_RESPONSE_BYTES:
         raise BinanceCostJournalError("public response exceeds the byte limit")
     try:
@@ -872,26 +934,52 @@ def _observe(
     fetcher: Fetcher,
     clock: Callable[[], int],
 ) -> InstrumentObservation:
+    """Sample one instrument, turning every failure into its own record.
+
+    The depth request decides whether there is an observation at all. A
+    perpetual's premium index is a second request beside it: when that one
+    fails the book was still measured, so the transport reason is carried in
+    ``premium_index_reason`` and the observation stays ``ok``.
+    """
+    keys = _notional_keys(notionals)
     try:
         payload: object = fetcher(instrument.depth_url)
-        premium_index: object = (
-            None
-            if instrument.premium_index_url is None
-            else fetcher(instrument.premium_index_url)
-        )
     except Exception as error:  # one instrument's failure is an observation, not an abort
         return _failed_observation(
             instrument_id=instrument.instrument_id,
             received_time_ns=clock(),
-            keys=_notional_keys(notionals),
+            keys=keys,
             reason=_failure_reason(error),
         )
-    return depth_observation(
-        payload,
-        instrument=instrument,
-        received_time_ns=clock(),
-        notionals=notionals,
-        premium_index=premium_index,
+    premium_index: object = None
+    premium_failure: str | None = None
+    if instrument.premium_index_url is not None:
+        try:
+            premium_index = fetcher(instrument.premium_index_url)
+        except Exception as error:
+            premium_failure = _failure_reason(error)
+    received_time_ns = clock()
+    try:
+        observation = depth_observation(
+            payload,
+            instrument=instrument,
+            received_time_ns=received_time_ns,
+            notionals=notionals,
+            premium_index=premium_index,
+        )
+    except Exception as error:  # depth_observation's contract, held to even if it breaks
+        return _failed_observation(
+            instrument_id=instrument.instrument_id,
+            received_time_ns=received_time_ns,
+            keys=keys,
+            reason=_failure_reason(error),
+        )
+    if premium_failure is None or not observation.ok:
+        return observation
+    # The premium index never arrived, so `depth_observation` recorded "missing
+    # premium index"; the transport's own reason says more.
+    return InstrumentObservation.model_validate(
+        {**observation.model_dump(mode="json"), "premium_index_reason": premium_failure}
     )
 
 
@@ -903,6 +991,10 @@ def _failure_reason(error: Exception) -> str:
 def _publish_segment(root: Path, *, segment: JournalSegment, spec_hash: str) -> ChainHead:
     document: dict[str, object] = segment.model_dump(mode="json")
     _publish(root / SEGMENT_DIRECTORY_NAME / f"{segment.sequence:010d}.json", document)
+    return _publish_chain_head(root, segment=segment, spec_hash=spec_hash)
+
+
+def _publish_chain_head(root: Path, *, segment: JournalSegment, spec_hash: str) -> ChainHead:
     head = _build_chain_head(
         spec_hash=spec_hash,
         segment_count=segment.sequence + 1,
@@ -912,6 +1004,47 @@ def _publish_segment(root: Path, *, segment: JournalSegment, spec_hash: str) -> 
     head_document: dict[str, object] = head.model_dump(mode="json")
     _publish(root / CHAIN_HEAD_NAME, head_document)
     return head
+
+
+def _orphan_segment(
+    journal_root: Path, head: ChainHead | None, *, spec_hash: str
+) -> JournalSegment | None:
+    """The segment a killed process left beyond the chain head, or ``None``.
+
+    A process killed between a segment's ``replace()`` and its chain head's -
+    or one whose head publish failed outright - leaves segment n on disk with a
+    head naming n-1, and no head at all when n is 0. The segment is durable and
+    carries its own hash, so the head can be rebuilt over it instead of the
+    journal dying on the next start. Adoption is deliberately narrow: exactly
+    one segment file more than the head counts, and that file must be the next
+    sequence, must validate, must recompute to its recorded ``content_hash``,
+    must name this journal's spec and must link to the head it follows. Every
+    other verification failure is corruption and stays refused.
+    """
+    directory = journal_root / SEGMENT_DIRECTORY_NAME
+    if not directory.is_dir():
+        return None
+    paths = sorted(path for path in directory.glob("*.json") if _SEGMENT_NAME.match(path.name))
+    counted = 0 if head is None else head.segment_count
+    if len(paths) != counted + 1:
+        return None
+    expected_sequence = 0 if head is None else head.last_sequence + 1
+    path = paths[-1]
+    if path.name != f"{expected_sequence:010d}.json":
+        return None
+    try:
+        document = _read_object(path, label="a journal segment")
+        segment = JournalSegment.model_validate(document)
+    except (BinanceCostJournalError, ValidationError):
+        return None
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    if segment.content_hash != content_sha256(material):
+        return None
+    if segment.sequence != expected_sequence or segment.spec_hash != spec_hash:
+        return None
+    if segment.previous_segment_hash != (ZERO_HASH if head is None else head.final_segment_hash):
+        return None
+    return segment
 
 
 def _build_chain_head(
@@ -998,8 +1131,13 @@ def _read_object(path: Path, *, label: str) -> dict[str, object]:
 
 
 def _publish(path: Path, document: dict[str, object]) -> None:
-    """Write one immutable JSON artifact through a temporary file."""
+    """Write one immutable JSON artifact through a temporary file.
+
+    The temporary carries the writing process's pid, so a second process - one
+    the supervisor should never have started - cannot half-write the artifact
+    this one is publishing.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     temporary.write_bytes(canonical_json(document))
     temporary.replace(path)
