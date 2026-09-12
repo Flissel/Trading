@@ -413,7 +413,7 @@ def _validated_side(
     for price, quantity in levels:
         if price <= 0 or quantity <= 0:
             raise DepthPayloadError(f"{field_name} levels must be positive")
-        if previous is not None and (price > previous) != ascending:
+        if previous is not None and not (price > previous if ascending else price < previous):
             raise DepthPayloadError(f"{field_name} must be sorted best first")
         previous = price
     return levels

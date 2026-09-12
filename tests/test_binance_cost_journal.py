@@ -294,6 +294,18 @@ def test_failed_observation_keeps_every_notional_key_and_drops_metrics() -> None
             {"lastUpdateId": 1, "bids": [["75", "4"], ["80", "4"]], "asks": [["125", "4"]]},
             "sorted",
         ),
+        (
+            {"lastUpdateId": 1, "bids": [["75", "4"], ["75", "4"]], "asks": [["125", "4"]]},
+            "sorted",
+        ),
+        (
+            {"lastUpdateId": 1, "bids": [["75", "4"]], "asks": [["125", "4"], ["125", "4"]]},
+            "sorted",
+        ),
+        (
+            {"lastUpdateId": 1, "bids": [["75", "4"]], "asks": [["125", "4"], ["120", "4"]]},
+            "sorted",
+        ),
     ],
 )
 def test_malformed_depth_payloads_become_failed_observations(
