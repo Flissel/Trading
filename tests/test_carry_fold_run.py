@@ -113,6 +113,36 @@ def _episodes(
     return [_object_dict(item) for item in _object_list(scenario_record["episodes"])]
 
 
+V1_FOLD0_EXPECTED_PATH = Path(__file__).parent / "fixtures" / "carry_v1_fold0_expected.json"
+
+
+def test_v1_fold0_economics_are_reproducible(workspace: Workspace) -> None:
+    """P1.28 reproducibility: the v1 declaration's fold-0 numbers are frozen.
+
+    `carry_fold_run.py` is inside `_CARRY_MODULES`, so any edit to the runner
+    moves `code_hash` and with it `report_hash`; the report hash therefore
+    cannot pin reproducibility across a runner change. The economics can:
+    these values were captured from the v1 fixture at e2939b8, before the v2
+    rules were written, and every later runner change must leave them exactly
+    where they were, digit for digit.
+    """
+    document = _run(workspace)
+    expected: dict[str, object] = json.loads(
+        V1_FOLD0_EXPECTED_PATH.read_text(encoding="utf-8")
+    )
+    assert sorted(expected) == sorted(MEMBER_NAMES + CONTROL_NAMES)
+    for name in expected:
+        for scenario in ("base", "adverse"):
+            want = _object_dict(_object_dict(expected[name])[scenario])
+            record = _object_dict(_candidate(document, name)[scenario])
+            assert record["total_net_return"] == want["total_net_return"], (name, scenario)
+            wanted = [_object_dict(item) for item in _object_list(want["episodes"])]
+            for episode, expected_episode in zip(
+                _episodes(document, name, scenario), wanted, strict=True
+            ):
+                assert {key: episode[key] for key in expected_episode} == expected_episode
+
+
 def test_carry_fold_report_has_the_panel_schema_plus_extras(workspace: Workspace) -> None:
     document = _run(workspace)
     manifest = json.loads((workspace[0] / "manifest.json").read_text(encoding="utf-8"))
