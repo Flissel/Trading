@@ -254,6 +254,24 @@ Round-Trip-Kosten deckt). Manifest, Folds, Entscheidung und Registry heißen
 `artifacts/carry/funding-carry-v2-<datum>-decision-v1.json` und
 `artifacts/carry/metadata-funding-carry-v2.sqlite3`. Ergebnis: `P1_29_DECISION_2026-09-12.md`.
 
+### Binance-Kostenjournal (P1.30)
+
+Misst auf Binance-Orderbüchern (Spot und USD-M), was ein Taker beim Überqueren beider Beine
+bei 500 / 5 000 / 50 000 USDT zahlt — alle 61 s, hash-verkettet, resumefähig, für eine bei
+Erstellung eingefrorene Stichprobe von Carry-Paaren. Die Finalisierungsquittung ist die
+einzige zulässige Quelle *gemessener* Slippage-Tiers für `funding_carry_panel_v3`.
+
+```powershell
+uv run trading-research binance-cost-journal-create --journal data/cost-journals/binance-carry-v1 --run-id binance-carry-public-cost-v1 --perp-capture <perp> --spot-capture <spot> --family-spec configs/funding-carry-panel-v1.json
+uv run trading-research binance-cost-journal-run --journal data/cost-journals/binance-carry-v1
+uv run trading-research binance-cost-journal-status --journal data/cost-journals/binance-carry-v1 --last 60
+uv run trading-research binance-cost-journal-finalize --journal data/cost-journals/binance-carry-v1 --output artifacts/cost/binance-carry-v1-receipt.json
+```
+
+`run` hält eine exklusive Sperre und wird von einem Supervisor neu gestartet (Exit 1);
+Exit 2 bedeutet gestoppt. `status` ist nur lesend und der einzige sichere Blick auf ein
+laufendes Journal.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.

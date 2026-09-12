@@ -381,6 +381,25 @@ Acceptance:
   rejected ones, with turnover and deflated Sharpe;
 - the final holdout stays closed.
 
+### P1.30 Funding carry v3 on measured execution costs
+
+Declare `funding_carry_panel_v3` only from the Binance cost journal's finalisation receipt
+(`docs/superpowers/specs/2026-09-12-binance-cost-journal-design.md`, section 5 fixes the
+only admissible reading: base slippage tiers = `tier_p50_of_p50` of the worse leg at
+5,000 USDT, adverse = `tier_p50_of_p90` at 50,000 USDT, rounded up to whole basis points,
+receipt hash cited). The journal `data/cost-journals/binance-carry-v1` was created and
+launched on 2026-09-12 (15 pairs, 30 instruments, 11,000 rounds at 61 s).
+
+Acceptance:
+
+- the receipt verifies, every tier median the declaration uses has at least four
+  contributing instruments, and the eligibility floors it records are the declared ones;
+- the v3 declaration differs from v2 only in the two cost tables and cites the receipt;
+- the chain (manifest, nine folds, decision) runs unchanged and `P1_30_DECISION_<date>.md`
+  records the outcome; if the measured tiers still fail the adverse floor, the carry is
+  closed at this venue and scale;
+- the final holdout stays closed.
+
 ## Explicitly deferred
 
 - real-capital execution;
