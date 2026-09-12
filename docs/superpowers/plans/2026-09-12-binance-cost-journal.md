@@ -14,7 +14,7 @@
 
 - The v1 carry plan's Global Constraints bind (Decimal, integer ns, immutable artifacts via `.tmp` + `replace()`, `content_sha256` self-hashes, frozen models, no network in tests, `uv run` inside the worktree, `--basetemp=C:/Users/User/AppData/Local/Temp/pytest-carry`, ruff/mypy clean, commit trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`).
 - Baseline: `codex/phase1-foundation` at `bbb15a1` (370 tests at e2939b8; the v2 branch is separate).
-- Frozen numbers (spec 2–5): notionals `("500", "5000", "50000")` USDT; depth limit 500 on both markets; sample interval 61 s; target 10 000 rounds; eligibility ≥ 10 000 non-null observations at 5 000 USDT and ≥ 7 days span; sample = 16 pairs (ranks 1–8 and ranks 9, 12, 15, 19, 23, 27, 31, 35 of the pair universe at the latest supported decision); fees spot `10` / USD-M `5` bps per side with evidence id `BINANCE:fee-schedule:2026-09-11:standard-taker`; hosts `api.binance.com` and `fapi.binance.com` only; quantiles p50/p90/p99 with the OKX journal's `_quantile` rule (ceil(n·q)−1 index on the sorted values); receipt rule for a v3 declaration copied verbatim from spec 5.
+- Frozen numbers (spec 2–5): notionals `("500", "5000", "50000")` USDT; depth limit 500 on both markets; sample interval 61 s; target 11 000 rounds (Task 2 fix round 1 ruling; 7.8 days); eligibility ≥ 10 000 non-null observations at 5 000 USDT and ≥ 7 days span; sample = 16 pairs (ranks 1–8 and ranks 9, 12, 15, 19, 23, 27, 31, 35 of the pair universe at the latest supported decision); fees spot `10` / USD-M `5` bps per side with evidence id `BINANCE:fee-schedule:2026-09-11:standard-taker`; hosts `api.binance.com` and `fapi.binance.com` only; quantiles p50/p90/p99 with the OKX journal's `_quantile` rule (ceil(n·q)−1 index on the sorted values); receipt rule for a v3 declaration copied verbatim from spec 5.
 - Storage: journal root under the workspace; storage policy authorised with `worst_case_required_bytes = 500_000_000` and the CLI's `--reserve-bytes` (default 10 GB for this journal — C: is at ~20 GB free).
 
 ## File Structure
@@ -37,7 +37,7 @@
 NOTIONALS: tuple[Decimal, ...] = (Decimal("500"), Decimal("5000"), Decimal("50000"))
 DEPTH_LIMIT = 500
 SAMPLE_INTERVAL_SECONDS = 61
-TARGET_ROUNDS = 10_000
+TARGET_ROUNDS = 11_000   # 10_000 as planned; raised by the Task 2 fix round 1 ruling
 MINIMUM_OBSERVATIONS = 10_000
 MINIMUM_SPAN_NS = 7 * 86_400_000_000_000
 ALLOWED_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
