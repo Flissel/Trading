@@ -8,7 +8,7 @@ from trading_bot.cli import main
 
 EXTRAS = {
     "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
-    "forced_spot_legs", "forced_perpetual_legs",
+    "forced_spot_legs", "forced_perpetual_legs", "exit_rule_removals", "hurdle_rejections",
 }
 
 

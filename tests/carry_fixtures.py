@@ -198,10 +198,14 @@ def build_captures(
     return perp.capture_root, spot.capture_root
 
 
-def small_carry_config(tmp_path: Path) -> Path:
-    """The frozen carry declaration with the P1.27 test fold geometry and a
-    twelve-symbol pair list, so a seven-month fixture yields real folds."""
-    document = json.loads(Path("configs/funding-carry-panel-v1.json").read_text(encoding="utf-8"))
+def _reduced(declaration: Path) -> dict[str, object]:
+    """A shipped carry declaration cut down to the P1.27 test fold geometry and
+    a twelve-symbol pair list, so a seven-month fixture yields real folds.
+
+    Everything the two families share is reduced identically, so a v1 and a v2
+    run over the same capture differ only by what their declarations declare.
+    """
+    document = json.loads(declaration.read_text(encoding="utf-8"))
     document["pairs"] = [{"perpetual": s, "spot": s, "multiplier": 1} for s in SYMBOLS]
     document["excluded_pairs"] = []
     document["universe"].update(
@@ -227,7 +231,23 @@ def small_carry_config(tmp_path: Path) -> Path:
         "holdout_duration_ns": 28 * day_ns,
     }
     document["statistics"].update({"block_length": 2, "pooled_episode_floor": 4})
+    reduced: dict[str, object] = document
+    return reduced
+
+
+def small_carry_config(tmp_path: Path) -> Path:
+    """The frozen v1 carry declaration under the reduced fixture geometry."""
     path = tmp_path / "small-carry.json"
+    document = _reduced(Path("configs/funding-carry-panel-v1.json"))
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def small_carry_v2_config(tmp_path: Path) -> Path:
+    """The frozen v2 carry declaration -- hold 26, the exit rule and the cost
+    hurdle -- under exactly the reductions `small_carry_config` applies."""
+    path = tmp_path / "small-carry-v2.json"
+    document = _reduced(Path("configs/funding-carry-panel-v2.json"))
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 

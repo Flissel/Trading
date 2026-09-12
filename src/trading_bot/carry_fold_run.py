@@ -20,6 +20,8 @@ from trading_bot.carry_signals import (
     WEEK_NS,
     Cohort,
     assemble_book,
+    exit_rule_pairs,
+    hurdle_minimum_trailing,
     select_control_cohort,
     select_member_cohort,
     trailing_funding,
@@ -32,14 +34,6 @@ from trading_bot.panel_samples import verify_panel_manifest
 from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.registry import ExperimentRecord, MetadataRegistry
 
-# Spec section 8.1 defines the book at t as the union of the last H cohorts.
-# A fold that opened flat would instead ramp 1/H per week for H-1 weeks, and
-# because H differs between members that ramp is a member-dependent haircut on
-# the primary metric. Each fold therefore warms its cohort state over the
-# twelve Sundays preceding its first test decision -- twelve because the
-# longest declared hold is thirteen weeks, so twelve prior cohorts plus the
-# first test decision's own cohort fill the book exactly.
-WARM_UP_WEEKS = 12
 FOLD_WARMED_REASON_CODE = "FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS"
 
 _CARRY_MODULES = (
@@ -52,6 +46,32 @@ _CARRY_MODULES = (
 
 class CarryFoldError(RuntimeError):
     """Raised when a carry fold cannot be evaluated or published."""
+
+
+def control_reference(spec: CarryFamilySpec) -> CarryMember:
+    """The member whose lookback and hold the controls borrow (spec 3.3).
+
+    The shortest hold, ties broken by declaration order -- which is what
+    Python's `min` does on the declared tuple. Under v1 that resolves to
+    `carry_l1w_h4w`, the member the v1 runner named outright, so P1.28's
+    controls are unmoved by the rule becoming generic.
+    """
+    return min(spec.members, key=lambda member: member.hold_weeks)
+
+
+def warm_up_weeks_of(spec: CarryFamilySpec) -> int:
+    """How many Sundays before a fold's first decision are warmed.
+
+    Spec section 8.1 defines the book at t as the union of the last H
+    cohorts. A fold that opened flat would instead ramp 1/H per week for H-1
+    weeks, and because H differs between members that ramp is a
+    member-dependent haircut on the primary metric. So each fold warms its
+    cohort state over the `max(H) - 1` Sundays preceding its first test
+    decision: that many prior cohorts plus the first decision's own fill even
+    the longest-held member's book exactly. Twelve under v1 (longest hold
+    thirteen), twenty-five under v2 (longest hold twenty-six).
+    """
+    return max(member.hold_weeks for member in spec.members) - 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,6 +167,8 @@ def run_carry_fold(
         (n, s.name): [] for n in names for s in scenarios
     }
     held_nothing: dict[str, list[bool]] = {n: [] for n in names}
+    exit_removals: dict[str, list[int]] = {n: [] for n in names}
+    hurdle_rejections: dict[str, list[int]] = {n: [] for n in names}
     cohorts: dict[str, list[Cohort]] = {n: [] for n in names}
     carried: dict[tuple[str, str], tuple[tuple[str, Decimal], ...]] = {k: () for k in episodes}
     no_carry: dict[str, list[str]] = {n: [] for n in names}
@@ -154,16 +176,18 @@ def run_carry_fold(
     # Fold-persistent: a leg keeps its pair after it leaves the universe, so an
     # exit-only leg can still be attributed to its pair.
     pair_of_leg: dict[str, str] = {}
+    reference = control_reference(spec)
     hold_of: dict[str, int] = {
         **{m.name: m.hold_weeks for m in spec.members},
-        **{c.name: members["carry_l1w_h4w"].hold_weeks for c in spec.controls},
+        **{c.name: reference.hold_weeks for c in spec.controls},
     }
     lookback_of: dict[str, int] = {
         **{m.name: m.lookback_weeks for m in spec.members},
-        **{c.name: members["carry_l1w_h4w"].lookback_weeks for c in spec.controls},
+        **{c.name: reference.lookback_weeks for c in spec.controls},
     }
+    warm_up_weeks = warm_up_weeks_of(spec)
 
-    # Warm-up: form (only) the cohorts of the twelve Sundays before the fold's
+    # Warm-up: form (only) the cohorts of the Sundays before the fold's
     # first test decision, so the first test episode opens on a full book
     # instead of a 1/H stub. No episode is evaluated, nothing is carried and
     # nothing is reported for these weeks -- `carried` stays empty, so the
@@ -173,9 +197,11 @@ def run_carry_fold(
     # `select_pair_universe`/`trailing_funding` each read only data at or
     # before the Sunday they are asked about, so no future data enters here.
     # A warm-up Sunday whose universe is too small simply contributes no
-    # cohort; there is no state yet to reset.
+    # cohort; there is no state yet to reset. The exit rule does not run here:
+    # the warm-up only forms cohorts, and the first in-window decision applies
+    # the rule to the warmed ones, which reads only data at or before it.
     warm_up_closes = (
-        [decisions[0] - weeks * WEEK_NS for weeks in range(WARM_UP_WEEKS, 0, -1)]
+        [decisions[0] - weeks * WEEK_NS for weeks in range(warm_up_weeks, 0, -1)]
         if decisions
         else []
     )
@@ -191,7 +217,7 @@ def run_carry_fold(
             pair_of_leg.setdefault(f"spot:{pair.spot_contract_id}", pair.pair_id)
         for name in names:
             cohorts[name].append(_cohort_for(
-                name, warm_up, spec=spec, controls=controls,
+                name, warm_up, spec=spec, controls=controls, member=members.get(name),
                 funding_by_leg=funding_by_leg, lookback_weeks=lookback_of[name],
             ))
 
@@ -219,13 +245,38 @@ def run_carry_fold(
             pair_of_leg.setdefault(perp_key, pair.pair_id)
             pair_of_leg.setdefault(spot_key, pair.pair_id)
         for name in names:
+            member = members.get(name)
             cohort = _cohort_for(
-                name, snapshot, spec=spec, controls=controls,
+                name, snapshot, spec=spec, controls=controls, member=member,
                 funding_by_leg=funding_by_leg, lookback_weeks=lookback_of[name],
             )
             if "NO_CARRY_COHORT" in cohort.reason_codes:
                 no_carry[name].append(sample_id)
             cohorts[name].append(cohort)
+            hurdle_rejections[name].append(cohort.hurdle_rejections)
+            # Exit rule (spec 3.3), for the members that declare it: a held
+            # pair whose trailing one week paid nothing leaves every cohort
+            # holding it, before the book is assembled, so it is exited at
+            # this decision through ordinary turnover rather than held for
+            # another week. Its cohort share stays undeployed until the cohort
+            # ages out, exactly as after a forced close, and the pair may be
+            # selected again by a later cohort once it pays again. The freshly
+            # formed cohort is included: a pair that paid over the lookback
+            # but not in the last week is not entered either.
+            removed: set[str] = set()
+            if member is not None and member.exit_on_negative_funding:
+                trailing_one_week: dict[str, Decimal | None] = {
+                    entry.pair_id: trailing_funding(
+                        funding_by_leg.get(entry.perpetual_leg, ()),
+                        decision_close_ns=decision_close_ns, lookback_weeks=1,
+                    )
+                    for retained in cohorts[name]
+                    for entry in retained.entries
+                }
+                removed = exit_rule_pairs(cohorts[name], trailing_one_week=trailing_one_week)
+                if removed:
+                    cohorts[name] = _without_pairs(cohorts[name], removed)
+            exit_removals[name].append(len(removed))
             # A pair whose leg has no bar at this decision cannot be entered or
             # held. In-window that leg was already force-closed and its pair
             # stripped when it lost its exit bar; a pair that went dark during
@@ -284,8 +335,14 @@ def run_carry_fold(
             "role": "member" if name in members else "control",
             "episode_count": len(episodes[(name, "base")]),
             "no_carry_cohort_sample_ids": no_carry[name],
-            "base": _scenario_record(episodes[(name, "base")], held_nothing[name]),
-            "adverse": _scenario_record(episodes[(name, "adverse")], held_nothing[name]),
+            "base": _scenario_record(
+                episodes[(name, "base")], held_nothing[name],
+                exit_removals=exit_removals[name], hurdle_rejections=hurdle_rejections[name],
+            ),
+            "adverse": _scenario_record(
+                episodes[(name, "adverse")], held_nothing[name],
+                exit_removals=exit_removals[name], hurdle_rejections=hurdle_rejections[name],
+            ),
         }
         for name in names
     ]
@@ -313,7 +370,7 @@ def run_carry_fold(
         "block_length": spec.statistics.block_length,
         "bootstrap_repetitions": spec.statistics.bootstrap_repetitions,
         "skipped_sample_ids": skipped,
-        "warm_up_weeks": WARM_UP_WEEKS,
+        "warm_up_weeks": warm_up_weeks,
         "code_hash": _code_hash(),
         "candidates": candidates,
     }
@@ -337,6 +394,7 @@ def _without_pairs(cohorts: list[Cohort], pair_ids: set[str]) -> list[Cohort]:
             tuple(e for e in c.entries if e.pair_id not in pair_ids),
             c.reason_codes,
             formed_size=c.formed_size if c.formed_size is not None else len(c.entries),
+            hurdle_rejections=c.hurdle_rejections,
         )
         for c in cohorts
     ]
@@ -348,6 +406,7 @@ def _cohort_for(
     *,
     spec: CarryFamilySpec,
     controls: dict[str, CarryControl],
+    member: CarryMember | None,
     funding_by_leg: dict[str, tuple[FundingEvent, ...]],
     lookback_weeks: int,
 ) -> Cohort:
@@ -365,15 +424,39 @@ def _cohort_for(
         )
         for pair in snapshot.pairs
     }
-    if name in controls:
+    control = controls.get(name)
+    if control is not None:
         return select_control_cohort(
-            snapshot, kind=controls[name].kind, trailing=trailing,
+            snapshot, kind=control.kind, trailing=trailing,
             selection=spec.selection, random_seed=spec.statistics.random_seed,
         )
-    return select_member_cohort(snapshot, trailing=trailing, selection=spec.selection)
+    if member is None:
+        raise CarryFoldError(f"{name} is neither a declared member nor a declared control")
+    # The hurdle is priced off the BASE table (spec 3.3): it asks whether the
+    # carry is worth entering at all, which is a property of the declaration,
+    # not of the scenario the same cohort is later evaluated under.
+    hurdle: dict[str, Decimal] | None = None
+    if member.hurdle_multiple is not None:
+        hurdle = {
+            pair.pair_id: hurdle_minimum_trailing(
+                cost_table=spec.costs.base, tier=pair.tier,
+                multiple=member.hurdle_multiple,
+                lookback_weeks=lookback_weeks, hold_weeks=member.hold_weeks,
+            )
+            for pair in snapshot.pairs
+        }
+    return select_member_cohort(
+        snapshot, trailing=trailing, selection=spec.selection, hurdle=hurdle
+    )
 
 
-def _scenario_record(results: list[CarryEpisode], held_nothing: list[bool]) -> dict[str, object]:
+def _scenario_record(
+    results: list[CarryEpisode],
+    held_nothing: list[bool],
+    *,
+    exit_removals: list[int],
+    hurdle_rejections: list[int],
+) -> dict[str, object]:
     return {
         "total_net_return": sum((item.result.net_return for item in results), Decimal(0)),
         "episodes": [
@@ -399,9 +482,13 @@ def _scenario_record(results: list[CarryEpisode], held_nothing: list[bool]) -> d
                     "perpetual_trading_cost": item.perpetual_trading_cost,
                     "forced_spot_legs": Decimal(item.forced_spot_legs),
                     "forced_perpetual_legs": Decimal(item.forced_perpetual_legs),
+                    "exit_rule_removals": Decimal(exited),
+                    "hurdle_rejections": Decimal(rejected),
                 },
             }
-            for item, flag in zip(results, held_nothing, strict=True)
+            for item, flag, exited, rejected in zip(
+                results, held_nothing, exit_removals, hurdle_rejections, strict=True
+            )
         ],
     }
 

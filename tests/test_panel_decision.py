@@ -919,6 +919,8 @@ EXTRAS = {
     "perpetual_trading_cost": "0.0001",
     "forced_spot_legs": "0",
     "forced_perpetual_legs": "1",
+    "exit_rule_removals": "0",
+    "hurdle_rejections": "0",
 }
 
 
