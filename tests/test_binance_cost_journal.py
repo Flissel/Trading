@@ -1303,6 +1303,14 @@ def test_the_public_fetcher_refuses_a_redirect_that_leaves_the_allow_list(
     )
     with pytest.raises(BinanceCostJournalError, match="redirect"):
         public_binance_json_fetcher(url)
+    # An allow-listed host reached over plain HTTP is a redirect off HTTPS.
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        urlopen_returning(FakeResponse(url=url.replace("https://", "http://"))),
+    )
+    with pytest.raises(BinanceCostJournalError, match="redirect"):
+        public_binance_json_fetcher(url)
     monkeypatch.setattr(
         urllib.request, "urlopen", urlopen_returning(FakeResponse(url=url, status=500))
     )
@@ -1778,3 +1786,41 @@ def test_the_cli_refuses_a_receipt_outside_the_workspace(tmp_path: Path) -> None
         "--journal", str(journal), "--output", str(tmp_path.parent / "outside-receipt.json"),
         "--reserve-bytes", "0",
     ]) == 2
+
+
+# --- Fix round 2: an adoption is verified before it is written ----------------------
+
+
+def edit_segment_body(path: Path, **overrides: object) -> None:
+    """Change a segment's body and leave its recorded hash behind, the way tampering does."""
+    path.write_bytes(canonical_json({**read_document(path), **overrides}))
+
+
+def test_an_adoptable_orphan_does_not_rescue_a_chain_broken_elsewhere(tmp_path: Path) -> None:
+    """The rebuilt head is written only after the whole chain verifies against it.
+
+    Three rounds, the head rewound to two - which makes segment 2 adoptable -
+    and segment 0's body edited under its recorded hash: the run must refuse and
+    leave `chain-head.json` exactly as it found it.
+    """
+    journal = tmp_path / "journal"
+    write_journal_directory(journal)
+    run_journal(
+        workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=3,
+        fetcher=FakeVenue(), clock=FakeClock(), sleep=FakeSleep(),
+    )
+    rewind_chain_head(journal, segments=2)
+    edit_segment_body(journal / "segments" / "0000000000.json", received_time_ns=RECEIVED_NS + 7)
+    head_before = (journal / "chain-head.json").read_bytes()
+    with pytest.raises(BinanceCostJournalSpecError, match="after adopting"):
+        run_journal(
+            workspace_root=tmp_path, journal_root=journal, reserve_bytes=0, rounds=1,
+            fetcher=FakeVenue(), clock=FakeClock(start=RECEIVED_NS + 10**12), sleep=FakeSleep(),
+        )
+    assert (journal / "chain-head.json").read_bytes() == head_before
+    assert len(segment_documents(journal)) == 3
+    assert verify_journal(journal) == (
+        False,
+        ("SEGMENT_HASH_MISMATCH:0000000000.json", "CHAIN_HEAD_COUNT_MISMATCH",
+         "CHAIN_HEAD_SEQUENCE_MISMATCH", "CHAIN_HEAD_LINK_MISMATCH"),
+    )

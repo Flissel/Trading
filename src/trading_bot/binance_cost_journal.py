@@ -884,7 +884,9 @@ def run_journal(
     repaired rather than refused is a segment the previous process published
     before it was killed, whose chain head never followed: that segment is
     durable and self-verifying, so the head is rebuilt over it (see
-    ``_orphan_segment``) and the run continues from the next sequence.
+    ``_orphan_segment``) and the run continues from the next sequence. The
+    rebuilt head is written only once the whole chain has verified against it,
+    so a journal that is also broken somewhere else is left untouched.
 
     One instrument's failure - a fetcher exception or an unusable payload -
     becomes that observation's reason and the round is still written; a round
@@ -909,14 +911,18 @@ def run_journal(
         orphan = _orphan_segment(root, head, spec_hash=spec_hash)
         if orphan is None:
             raise BinanceCostJournalSpecError("journal verification failed: " + ",".join(reasons))
-        head = _publish_chain_head(root, segment=orphan, spec_hash=spec_hash)
-        resumed = True
-        valid, reasons = verify_journal(root)
-        if not valid:
+        # The adoption is judged before it is written: the whole chain must
+        # verify against the head the orphan would give it, or the journal is
+        # left exactly as it was found (fix round 2).
+        candidate = _chain_head_for(orphan, spec_hash=spec_hash)
+        adopted, adoption_reasons = _verified_chain(root, candidate_head=candidate)
+        if not adopted:
             raise BinanceCostJournalSpecError(
                 "journal verification failed after adopting the trailing segment: "
-                + ",".join(reasons)
+                + ",".join(adoption_reasons)
             )
+        head = _publish_head(root, candidate)
+        resumed = True
     written = 0
     while written < rounds and (head is None or head.segment_count < spec.target_rounds):
         if written or resumed:
@@ -937,6 +943,18 @@ def verify_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
     Never raises: an unreadable or malformed journal comes back as a reason
     code, the way ``verify_panel_capture`` reports a broken capture. An empty
     journal - a spec and no segment yet - is valid.
+    """
+    return _verified_chain(journal_root, candidate_head=None)
+
+
+def _verified_chain(
+    journal_root: Path, *, candidate_head: ChainHead | None
+) -> tuple[bool, tuple[str, ...]]:
+    """Verify the chain against ``candidate_head``, or against the head on disk.
+
+    A candidate lets an adoption be judged before it is written: the whole
+    chain is checked as it *would* stand with that head, so nothing is
+    published over a journal that fails for another reason (fix round 2).
     """
     try:
         _, spec_hash = load_journal_spec(journal_root)
@@ -975,6 +993,7 @@ def verify_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
     reasons.extend(
         _chain_head_reasons(
             journal_root,
+            candidate_head=candidate_head,
             spec_hash=spec_hash,
             segment_count=len(paths),
             final_segment_hash=previous_hash,
@@ -1048,11 +1067,12 @@ def finalize_journal(
 def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
     """GET one public Binance JSON object over HTTPS with a 20 s timeout.
 
-    The host is checked against ``ALLOWED_HOSTS`` before any socket is opened,
-    so a URL this journal did not build never reaches the network, and again on
-    the URL the response came from, so a redirect cannot walk off the list. A non-200
-    response, a body that is not a JSON object and any transport failure are
-    refused as ``BinanceCostJournalError``, which the run loop records as that
+    The scheme and the host are checked before any socket is opened, so a URL
+    this journal did not build never reaches the network, and both are checked
+    again on the URL the response came from, so a redirect can walk off neither
+    the allow list nor HTTPS. A non-200 response, a body that is not a JSON
+    object and any transport failure are refused as
+    ``BinanceCostJournalError``, which the run loop records as that
     instrument's reason for the round.
     """
     parts = urlsplit(url)
@@ -1070,8 +1090,9 @@ def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
             final_url = str(response.url)
     except (OSError, http.client.HTTPException) as error:
         raise BinanceCostJournalError(f"public request failed: {error}") from error
-    if urlsplit(final_url).netloc not in ALLOWED_HOSTS:
-        raise BinanceCostJournalError("a redirect left Binance's public hosts")
+    final_parts = urlsplit(final_url)
+    if final_parts.scheme != "https" or final_parts.netloc not in ALLOWED_HOSTS:
+        raise BinanceCostJournalError("a redirect left Binance's public HTTPS hosts")
     if len(raw) > _MAX_RESPONSE_BYTES:
         raise BinanceCostJournalError("public response exceeds the byte limit")
     try:
@@ -1240,12 +1261,20 @@ def _publish_segment(root: Path, *, segment: JournalSegment, spec_hash: str) -> 
 
 
 def _publish_chain_head(root: Path, *, segment: JournalSegment, spec_hash: str) -> ChainHead:
-    head = _build_chain_head(
+    return _publish_head(root, _chain_head_for(segment, spec_hash=spec_hash))
+
+
+def _chain_head_for(segment: JournalSegment, *, spec_hash: str) -> ChainHead:
+    """The head a chain ending in ``segment`` would carry."""
+    return _build_chain_head(
         spec_hash=spec_hash,
         segment_count=segment.sequence + 1,
         last_sequence=segment.sequence,
         final_segment_hash=segment.content_hash,
     )
+
+
+def _publish_head(root: Path, head: ChainHead) -> ChainHead:
     head_document: dict[str, object] = head.model_dump(mode="json")
     _publish(root / CHAIN_HEAD_NAME, head_document)
     return head
@@ -1327,20 +1356,29 @@ def _validated_chain_head(document: Mapping[str, object]) -> ChainHead | None:
 
 
 def _chain_head_reasons(
-    journal_root: Path, *, spec_hash: str, segment_count: int, final_segment_hash: str
+    journal_root: Path,
+    *,
+    candidate_head: ChainHead | None,
+    spec_hash: str,
+    segment_count: int,
+    final_segment_hash: str,
 ) -> list[str]:
-    path = journal_root / CHAIN_HEAD_NAME
-    if not path.exists():
-        return [] if segment_count == 0 else ["CHAIN_HEAD_MISSING"]
-    if segment_count == 0:
-        return ["CHAIN_HEAD_UNEXPECTED"]
-    try:
-        document = _read_object(path, label="the chain head")
-    except BinanceCostJournalError:
-        return ["CHAIN_HEAD_UNREADABLE"]
-    head = _validated_chain_head(document)
+    head = candidate_head
     if head is None:
-        return ["CHAIN_HEAD_UNREADABLE"]
+        path = journal_root / CHAIN_HEAD_NAME
+        if not path.exists():
+            return [] if segment_count == 0 else ["CHAIN_HEAD_MISSING"]
+        if segment_count == 0:
+            return ["CHAIN_HEAD_UNEXPECTED"]
+        try:
+            document = _read_object(path, label="the chain head")
+        except BinanceCostJournalError:
+            return ["CHAIN_HEAD_UNREADABLE"]
+        head = _validated_chain_head(document)
+        if head is None:
+            return ["CHAIN_HEAD_UNREADABLE"]
+    elif segment_count == 0:
+        return ["CHAIN_HEAD_UNEXPECTED"]
     reasons: list[str] = []
     if head.spec_hash != spec_hash:
         reasons.append("CHAIN_HEAD_SPEC_MISMATCH")
