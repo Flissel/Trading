@@ -356,6 +356,31 @@ Acceptance:
   that informed the design, and the contamination of the holdout's funding aggregate;
 - the final holdout stays closed.
 
+### P1.29 Funding carry v2 family
+
+Evaluate the pre-registered family `funding_carry_panel_v2` — the four members
+`carry_l4w_h26w`, `carry_l4w_h13w_exit`, `carry_l4w_h26w_exit` and
+`carry_l4w_h26w_exit_hurdle2` — a 26-week hold, an exit rule that drops a held pair once
+its trailing one-week funding turns non-positive, and a cost hurdle at entry with
+multiple 2, under
+`docs/superpowers/specs/2026-09-12-funding-carry-v2-family-design.md` and the evaluation
+protocol as of 2026-09-12.
+
+Acceptance:
+
+- both captures verify and pass the capture quality gate after repair;
+- the manifest binds both captures and reaches the 200-episode floor, otherwise the
+  family stops at `INSUFFICIENT_EVIDENCE`;
+- all four members and three controls are evaluated on every fold in one invocation per
+  fold, and the decision module's gates are the P1.27 gates unchanged;
+- the decision report carries the eight-key `extras_mean` per member —
+  `funding_collected`, `basis_pnl`, `spot_trading_cost`, `perpetual_trading_cost`,
+  `forced_spot_legs`, `forced_perpetual_legs`, `exit_rule_removals` and
+  `hurdle_rejections`;
+- the decision record `P1_29_DECISION_<date>.md` records every member, including the
+  rejected ones, with turnover and deflated Sharpe;
+- the final holdout stays closed.
+
 ## Explicitly deferred
 
 - real-capital execution;
