@@ -22,7 +22,12 @@ from trading_bot.binance_cost_journal import (
     run_journal,
 )
 from trading_bot.carry_fold_run import run_carry_fold
-from trading_bot.carry_measured_costs import MeasuredCostError, declare_measured_cost_family
+from trading_bot.carry_measured_costs import (
+    DEFAULT_BASE_DECLARATION,
+    MeasuredCostError,
+    declare_measured_cost_family,
+    verify_measured_declaration,
+)
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
@@ -139,6 +144,11 @@ def main(arguments: list[str] | None = None) -> int:
     carry_declare.add_argument("--receipt", type=Path, required=True)
     carry_declare.add_argument("--base-config", type=Path, required=True)
     carry_declare.add_argument("--output", type=Path, required=True)
+    carry_verify = commands.add_parser("carry-verify-measured")
+    carry_verify.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    carry_verify.add_argument("--receipt", type=Path, required=True)
+    carry_verify.add_argument("--spec", type=Path, required=True)
+    carry_verify.add_argument("--base-config", type=Path, default=None)
     journal_create = commands.add_parser("binance-cost-journal-create")
     journal_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_create.add_argument("--journal", type=Path, required=True)
@@ -382,6 +392,8 @@ def main(arguments: list[str] | None = None) -> int:
         return 0
     if parsed.command == "carry-declare-measured":
         return _carry_declare_measured(parsed)
+    if parsed.command == "carry-verify-measured":
+        return _carry_verify_measured(parsed)
     if parsed.command == "binance-cost-journal-create":
         return _binance_cost_journal_create(parsed)
     if parsed.command == "binance-cost-journal-run":
@@ -415,6 +427,33 @@ def _carry_declare_measured(parsed: argparse.Namespace) -> int:
     except Exception as error:  # the operator reads the code, not the traceback
         return _journal_failure(f"{type(error).__name__}: {error}", 1)
     print(f"measured carry declaration written: {written}")
+    print(f"family spec hash: {spec_hash}")
+    return 0
+
+
+def _carry_verify_measured(parsed: argparse.Namespace) -> int:
+    """Re-derive an existing measured declaration from its receipt.
+
+    2 is a declaration that does not stand up - a receipt that does not
+    recompute, a citation naming another receipt, a number that is not the
+    measurement, a field that is not the base declaration's, a path outside the
+    workspace - and 1 anything else.
+    """
+    workspace: Path = parsed.workspace_root.resolve()
+    receipt: Path = parsed.receipt.resolve()
+    spec: Path = parsed.spec.resolve()
+    base: Path = (parsed.base_config or DEFAULT_BASE_DECLARATION).resolve()
+    if any(not path.is_relative_to(workspace) for path in (receipt, spec, base)):
+        return _journal_failure("measured declaration paths must stay inside workspace", 2)
+    try:
+        spec_hash = verify_measured_declaration(
+            receipt_path=receipt, spec_path=spec, base_declaration_path=base
+        )
+    except MeasuredCostError as error:
+        return _journal_failure(f"{type(error).__name__}: {error}", 2)
+    except Exception as error:  # the operator reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", 1)
+    print(f"measured carry declaration verified: {spec}")
     print(f"family spec hash: {spec_hash}")
     return 0
 

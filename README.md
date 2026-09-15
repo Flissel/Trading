@@ -279,10 +279,15 @@ unverändert; die Quittung wird gegen ihren eigenen Hash geprüft und zitiert:
 
 ```powershell
 uv run trading-research carry-declare-measured --receipt artifacts/cost/binance-carry-v1-receipt.json --base-config configs/funding-carry-panel-v2.json --output configs/funding-carry-panel-v3.json
+uv run trading-research carry-verify-measured --receipt artifacts/cost/binance-carry-v1-receipt.json --spec configs/funding-carry-panel-v3.json
 ```
 
 Exit 2 heißt: so nicht erklärbar (Quittung ohne Median, falsche Basis-Erklärung,
-Ausgabe existiert bereits). Die Ausgabe ist unveränderlich wie die Quittung.
+Ausgabe existiert bereits). Die Ausgabe wird exklusiv angelegt (`open(..., "x")`) und ist
+unveränderlich wie die Quittung — bricht der Prozess mitten im Schreiben ab, bleibt eine
+unvollständige Datei liegen, die nicht parst: löschen und Befehl wiederholen.
+`carry-verify-measured` leitet jede Zahl der Erklärung neu aus Quittung und v2-Erklärung
+ab (Exit 2 bei jeder Abweichung) und druckt den Spec-Hash.
 
 ## Harte Grenzen
 

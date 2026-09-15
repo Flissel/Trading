@@ -14,9 +14,14 @@ tables and the evidence they came from - which is what makes the two
 comparable. The receipt is verified against its own hash first: a declaration
 cites a receipt by hash, so bytes that do not recompute to it are not that
 receipt.
+
+``verify_measured_declaration`` runs the same reading against an existing
+declaration instead of writing one, so a reviewer can re-derive every number in
+it from the receipt and the v2 declaration rather than take the file's word.
 """
 
 import json
+import os
 from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
@@ -24,10 +29,11 @@ from pydantic import ValidationError
 
 from trading_bot.binance_cost_journal import FinalizationReceipt
 from trading_bot.canonical import CanonicalizationError, content_sha256
-from trading_bot.carry_config import MEASURED_COST_FAMILY, CarryFamilySpec
+from trading_bot.carry_config import MEASURED_COST_FAMILY, CarryCostTable, CarryFamilySpec
 from trading_bot.panel_config import load_family_spec
 
 BASE_FAMILY_NAME = "funding_carry_panel_v2"
+DEFAULT_BASE_DECLARATION = Path("configs/funding-carry-panel-v2.json")
 # Spec 5's two notionals, as the receipt keys them.
 BASE_NOTIONAL = "5000"
 ADVERSE_NOTIONAL = "50000"
@@ -40,6 +46,10 @@ TIER_FIELDS: dict[int, str] = {
     1: "slippage_bps_per_side_tier_one",
     2: "slippage_bps_per_side_tier_two",
 }
+# The cost-table fields the receipt writes; every other one is the base's.
+MEASURED_FIELDS = frozenset(TIER_FIELDS.values())
+# The fields a measured declaration is allowed to differ from its base in.
+DECLARED_FIELDS = frozenset({"family_name", "hypothesis", "costs"})
 # The one sentence the measured family adds to the hypothesis it inherits.
 HYPOTHESIS_SENTENCE = (
     " Execution costs are the slippage tiers measured by the Binance cost journal "
@@ -81,24 +91,23 @@ def declare_measured_cost_family(
 ) -> tuple[Path, str]:
     """Write the measured carry declaration and return it with its spec hash.
 
-    The receipt is verified against its own content hash, the base declaration
-    must be ``funding_carry_panel_v2``, and an output that already exists is
-    refused rather than replaced: a declaration is as immutable as the receipt
-    it cites. The document is validated as a ``CarryFamilySpec`` before a byte
-    is written, so a refusal leaves nothing behind, and the returned hash is
-    read back off the published bytes.
+    The receipt is verified against its own content hash and the base
+    declaration must be ``funding_carry_panel_v2``. The document is validated as
+    a ``CarryFamilySpec`` before a byte is written, so a refusal leaves nothing
+    behind, and the returned hash is read back off the published bytes.
+
+    The output is created exclusively (``open(..., "x")``): an existing
+    declaration is refused rather than replaced, and two writers racing for the
+    same path cannot both believe they published it - a declaration is as
+    immutable as the receipt it cites. A process killed mid-write therefore
+    leaves a partial file at the output path, which will not parse as a
+    declaration; the operator deletes it and runs the command again.
     """
     receipt = _read_object(receipt_path, label="the finalisation receipt")
     _verify_receipt_hash(receipt)
     base_tiers, adverse_tiers = measured_slippage_tiers(receipt)
     declaration = _read_object(base_declaration_path, label="the base declaration")
-    if declaration.get("family_name") != BASE_FAMILY_NAME:
-        raise MeasuredCostError(
-            f"a measured declaration is derived from {BASE_FAMILY_NAME}, not "
-            f"{declaration.get('family_name')!r}"
-        )
-    if output_path.exists():
-        raise MeasuredCostError("this declaration already exists and is immutable")
+    _verify_base_family(declaration)
     document = _measured_document(
         declaration, receipt=receipt, base=base_tiers, adverse=adverse_tiers
     )
@@ -106,12 +115,39 @@ def declare_measured_cost_family(
         CarryFamilySpec.model_validate(document)
     except ValidationError as error:
         raise MeasuredCostError(f"the measured declaration is invalid: {error}") from error
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(document, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
-    )
+    _publish_exclusively(output_path, document)
     _, spec_hash = load_family_spec(output_path)
     return output_path, spec_hash
+
+
+def verify_measured_declaration(
+    *,
+    receipt_path: Path,
+    spec_path: Path,
+    base_declaration_path: Path = DEFAULT_BASE_DECLARATION,
+) -> str:
+    """Re-derive a measured declaration from its receipt; return its spec hash.
+
+    The declaration is not trusted to describe itself: the receipt is verified
+    against its own hash, the citation must name that receipt and its journal
+    spec, the four slippage values must be exactly what spec 5's reading of the
+    receipt produces today, and every other field - top level and inside both
+    cost tables - must still be the base declaration's, with the hypothesis its
+    sentence plus the one citation. Any mismatch refuses; nothing is written.
+    """
+    receipt = _read_object(receipt_path, label="the finalisation receipt")
+    _verify_receipt_hash(receipt)
+    base_tiers, adverse_tiers = measured_slippage_tiers(receipt)
+    document = _read_object(spec_path, label="the measured declaration")
+    spec = _validated_declaration(document)
+    base = _read_object(base_declaration_path, label="the base declaration")
+    _verify_base_family(base)
+    _verify_evidence(spec, receipt=receipt)
+    _verify_hypothesis(document, base=base, receipt=receipt)
+    _verify_carried_fields(document, base=base)
+    _verify_cost_tables(document, base=base)
+    _verify_measured_tiers(spec, base=base_tiers, adverse=adverse_tiers)
+    return _canonical_hash(document, label="the measured declaration")
 
 
 def _validated_receipt(receipt: dict[str, object]) -> FinalizationReceipt:
@@ -157,12 +193,125 @@ def _whole_bps(value: Decimal) -> Decimal:
 def _verify_receipt_hash(receipt: dict[str, object]) -> None:
     """A receipt is cited by hash, so its bytes must recompute to that hash."""
     material = {key: value for key, value in receipt.items() if key != "content_hash"}
-    try:
-        recomputed = content_sha256(material)
-    except CanonicalizationError as error:
-        raise MeasuredCostError(f"the receipt is not canonical: {error}") from error
-    if receipt.get("content_hash") != recomputed:
+    if receipt.get("content_hash") != _canonical_hash(material, label="the receipt"):
         raise MeasuredCostError("the receipt's content hash does not recompute")
+
+
+def _canonical_hash(document: dict[str, object], *, label: str) -> str:
+    try:
+        return content_sha256(document)
+    except CanonicalizationError as error:
+        raise MeasuredCostError(f"{label} is not canonical: {error}") from error
+
+
+def _verify_base_family(declaration: dict[str, object]) -> None:
+    if declaration.get("family_name") != BASE_FAMILY_NAME:
+        raise MeasuredCostError(
+            f"a measured declaration is derived from {BASE_FAMILY_NAME}, not "
+            f"{declaration.get('family_name')!r}"
+        )
+
+
+def _validated_declaration(document: dict[str, object]) -> CarryFamilySpec:
+    """The declaration's own model, which binds the rule it cites verbatim."""
+    try:
+        spec = CarryFamilySpec.model_validate(document)
+    except ValidationError as error:
+        raise MeasuredCostError(f"the declaration does not validate: {error}") from error
+    if spec.family_name != MEASURED_COST_FAMILY:
+        raise MeasuredCostError(f"this is not a {MEASURED_COST_FAMILY} declaration")
+    return spec
+
+
+def _verify_evidence(spec: CarryFamilySpec, *, receipt: dict[str, object]) -> None:
+    """The citation must name this receipt, its journal spec and the two notionals."""
+    evidence = spec.cost_evidence
+    if evidence is None:  # the model refuses this already; the guard keeps it local
+        raise MeasuredCostError("the declaration cites no cost evidence")
+    if evidence.receipt_hash != receipt.get("content_hash"):
+        raise MeasuredCostError("the declaration cites another receipt")
+    if evidence.journal_spec_hash != receipt.get("spec_hash"):
+        raise MeasuredCostError("the declaration cites another journal spec")
+    cited = (evidence.base_notional, evidence.adverse_notional)
+    if cited != (Decimal(BASE_NOTIONAL), Decimal(ADVERSE_NOTIONAL)):
+        raise MeasuredCostError("the declaration cites notionals the rule does not fix")
+
+
+def _verify_hypothesis(
+    document: dict[str, object], *, base: dict[str, object], receipt: dict[str, object]
+) -> None:
+    hypothesis = base.get("hypothesis")
+    if not isinstance(hypothesis, str):
+        raise MeasuredCostError("the base declaration carries no hypothesis")
+    sentence = HYPOTHESIS_SENTENCE.format(receipt_hash=str(receipt.get("content_hash")))
+    if document.get("hypothesis") != hypothesis + sentence:
+        raise MeasuredCostError("the hypothesis is not the base's plus its one citation")
+
+
+def _verify_carried_fields(document: dict[str, object], *, base: dict[str, object]) -> None:
+    """Everything the receipt does not speak to is still the base declaration's."""
+    if set(document) != set(base) | {"cost_evidence"}:
+        raise MeasuredCostError("the declaration's fields are not the base declaration's")
+    for key in base:
+        if key not in DECLARED_FIELDS and document[key] != base[key]:
+            raise MeasuredCostError(f"the declaration's {key} is not the base declaration's")
+
+
+def _verify_cost_tables(document: dict[str, object], *, base: dict[str, object]) -> None:
+    """Both cost tables differ from the base's in the two measured fields alone."""
+    costs = document.get("costs")
+    before = base.get("costs")
+    if not isinstance(costs, dict) or not isinstance(before, dict):
+        raise MeasuredCostError("a declaration carries a base and an adverse cost table")
+    for name in ("base", "adverse"):
+        table, original = costs.get(name), before.get(name)
+        if not isinstance(table, dict) or not isinstance(original, dict):
+            raise MeasuredCostError(f"a declaration carries a {name} cost table")
+        if set(table) != set(original):
+            raise MeasuredCostError(f"the {name} table's fields are not the base table's")
+        for key in original:
+            if key not in MEASURED_FIELDS and table[key] != original[key]:
+                raise MeasuredCostError(
+                    f"the {name} table's {key} is not the base declaration's"
+                )
+
+
+def _verify_measured_tiers(
+    spec: CarryFamilySpec, *, base: dict[int, Decimal], adverse: dict[int, Decimal]
+) -> None:
+    """The four slippage values are what spec 5's reading produces today."""
+    for name, table, measured in (
+        ("base", spec.costs.base, base),
+        ("adverse", spec.costs.adverse, adverse),
+    ):
+        declared = _declared_tiers(table)
+        for tier, value in measured.items():
+            if declared[tier] != value:
+                raise MeasuredCostError(
+                    f"the {name} table's {TIER_FIELDS[tier]} is {declared[tier]}, "
+                    f"not the measured {value}"
+                )
+
+
+def _declared_tiers(table: CarryCostTable) -> dict[int, Decimal]:
+    return {
+        1: table.slippage_bps_per_side_tier_one,
+        2: table.slippage_bps_per_side_tier_two,
+    }
+
+
+def _publish_exclusively(output_path: Path, document: dict[str, object]) -> None:
+    """Create the declaration, or refuse: the path is claimed by the first writer."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with output_path.open("x", encoding="utf-8") as handle:
+            handle.write(json.dumps(document, indent=2, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as error:
+        raise MeasuredCostError("this declaration already exists and is immutable") from error
+    except OSError as error:
+        raise MeasuredCostError(f"the declaration could not be written: {error}") from error
 
 
 def _measured_document(

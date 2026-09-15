@@ -38,6 +38,7 @@ from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.carry_config import CarryUniverseRules, load_carry_family_spec
 from trading_bot.carry_signals import WEEK_NS
 from trading_bot.carry_universe import select_pair_universe
+from trading_bot.cost_evidence_rule import DECLARATION_RULE as DECLARATION_RULE  # re-export
 from trading_bot.depth_adapters import (
     DepthPayloadError,
     _decimal_string,
@@ -65,15 +66,9 @@ MINIMUM_SPAN_NS = 7 * 86_400_000_000_000
 # Spec 4: both floors are read at the 5 000 USDT notional, over the observations
 # whose displayed book could fill it.
 ELIGIBILITY_NOTIONAL = "5000"
-# Spec 5, verbatim and unwrapped: the only admissible reading of a receipt,
-# declared before any number existed. A receipt carrying a different sentence is
-# refused by the model below.
-DECLARATION_RULE = (
-    "a v3 family sets `slippage_bps_per_side_tier_<t>` in its base table to "
-    "`tier_p50_of_p50` of the *worse leg* at 5 000 USDT and in its adverse table to "
-    "`tier_p50_of_p90` at 50 000 USDT, rounded **up** to the next whole basis point, and "
-    "cites the receipt hash. No other reading of the receipt is admissible for a declaration."
-)
+# Spec 5, verbatim and unwrapped, lives in `cost_evidence_rule` so the receipt
+# that publishes it and the declaration that cites it bind one string. A receipt
+# carrying a different sentence is refused by the model below.
 ALLOWED_HOSTS = frozenset({"api.binance.com", "fapi.binance.com"})
 ZERO_HASH = "0" * 64
 # Spec 2: fees are declared, never measured. The evidence id names the schedule

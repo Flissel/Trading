@@ -26,8 +26,10 @@ from trading_bot.carry_measured_costs import (
     MeasuredCostError,
     declare_measured_cost_family,
     measured_slippage_tiers,
+    verify_measured_declaration,
 )
 from trading_bot.cli import main
+from trading_bot.cost_evidence_rule import DECLARATION_RULE as LEAF_RULE
 from trading_bot.panel_config import load_family_spec
 
 CONFIG_V1 = Path("configs/funding-carry-panel-v1.json")
@@ -102,6 +104,33 @@ def declared_family(
         output_path=tmp_path / "funding-carry-panel-v3.json",
     )
     return receipt, output, spec_hash
+
+
+def write_json(path: Path, document: dict[str, object]) -> Path:
+    path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def edited_declaration(
+    output: Path, path: Path, **overrides: object
+) -> Path:
+    """The published declaration with top-level fields replaced, written elsewhere."""
+    return write_json(path, {**read_document(output), **overrides})
+
+
+def edited_evidence(output: Path, path: Path, **overrides: object) -> Path:
+    document = read_document(output)
+    evidence = document["cost_evidence"]
+    assert isinstance(evidence, dict)
+    return edited_declaration(output, path, cost_evidence={**evidence, **overrides})
+
+
+def edited_cost_table(output: Path, path: Path, *, name: str, **overrides: object) -> Path:
+    document = read_document(output)
+    costs = document["costs"]
+    assert isinstance(costs, dict)
+    tables = {**costs, name: {**costs[name], **overrides}}
+    return edited_declaration(output, path, costs=tables)
 
 
 def tier_row(document: dict[str, object], *, tier: int, market: str) -> dict[str, object]:
@@ -342,8 +371,18 @@ def test_a_v1_base_declaration_is_refused(
 def test_a_published_declaration_is_immutable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, output, _ = declared_family(tmp_path, monkeypatch)
+    """The output path is claimed exclusively; a second writer is refused, not merged."""
+    receipt, output, spec_hash = declared_family(tmp_path, monkeypatch)
     published = output.read_bytes()
+    # The published bytes round-trip: a whole document, flushed and fsynced.
+    assert read_document(output)["cost_evidence"] == {
+        "receipt_hash": receipt["content_hash"],
+        "journal_spec_hash": receipt["spec_hash"],
+        "base_notional": "5000",
+        "adverse_notional": "50000",
+        "rule": DECLARATION_RULE,
+    }
+    assert load_family_spec(output)[1] == spec_hash
     with pytest.raises(MeasuredCostError, match="already exists"):
         declare_measured_cost_family(
             receipt_path=tmp_path / "receipt.json",
@@ -386,6 +425,160 @@ def test_an_assumed_family_carrying_evidence_is_rejected(
         CarryFamilySpec.model_validate(document)
 
 
+def test_the_cited_rule_is_the_one_the_receipt_is_published_under() -> None:
+    """One string, in a leaf module both the journal and the declaration bind."""
+    assert LEAF_RULE == DECLARATION_RULE
+
+
+def test_a_declaration_citing_another_rule_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    document = read_document(output)
+    evidence = document["cost_evidence"]
+    assert isinstance(evidence, dict)
+    forged = {**document, "cost_evidence": {**evidence, "rule": "round down"}}
+    with pytest.raises(ValidationError, match="verbatim"):
+        CarryFamilySpec.model_validate(forged)
+
+
+def test_a_genuine_declaration_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, spec_hash = declared_family(tmp_path, monkeypatch)
+    verified = verify_measured_declaration(
+        receipt_path=tmp_path / "receipt.json",
+        spec_path=output,
+        base_declaration_path=CONFIG_V2,
+    )
+    assert verified == spec_hash
+
+
+def test_verification_refuses_an_edited_slippage_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cheaper tier than the receipt measured is not this receipt's declaration."""
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    edited = edited_cost_table(
+        output, tmp_path / "cheaper-v3.json", name="base",
+        slippage_bps_per_side_tier_one="799",
+    )
+    with pytest.raises(MeasuredCostError, match="slippage_bps_per_side_tier_one"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_an_edited_receipt_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    edited = edited_evidence(output, tmp_path / "other-receipt-v3.json", receipt_hash="0" * 64)
+    with pytest.raises(MeasuredCostError, match="cites another receipt"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_an_edited_journal_spec_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    edited = edited_evidence(
+        output, tmp_path / "other-journal-v3.json", journal_spec_hash="1" * 64
+    )
+    with pytest.raises(MeasuredCostError, match="another journal spec"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_a_cited_notional_the_rule_does_not_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    edited = edited_evidence(output, tmp_path / "other-notional-v3.json", base_notional="500")
+    with pytest.raises(MeasuredCostError, match="notionals the rule does not fix"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_a_wrong_rule_string(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    edited = edited_evidence(output, tmp_path / "wrong-rule-v3.json", rule="round down")
+    with pytest.raises(MeasuredCostError, match="does not validate"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_an_edited_member_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The book is v2's: a member the receipt never spoke to may not move."""
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    document = read_document(output)
+    members = document["members"]
+    assert isinstance(members, list)
+    moved = [{**members[0], "hold_weeks": 12}, *members[1:]]
+    edited = edited_declaration(output, tmp_path / "moved-member-v3.json", members=moved)
+    with pytest.raises(MeasuredCostError, match="members is not the base declaration's"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_an_edited_hypothesis_and_an_edited_fee(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    quieter = edited_declaration(
+        output, tmp_path / "quiet-v3.json", hypothesis="Costs were measured."
+    )
+    with pytest.raises(MeasuredCostError, match="one citation"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=quieter,
+            base_declaration_path=CONFIG_V2,
+        )
+    cheaper = edited_cost_table(
+        output, tmp_path / "cheap-fee-v3.json", name="adverse", spot_fee_bps_per_side="1"
+    )
+    with pytest.raises(MeasuredCostError, match="spot_fee_bps_per_side"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=cheaper,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_verification_refuses_an_assumed_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    measured_receipt(tmp_path, monkeypatch)
+    with pytest.raises(MeasuredCostError, match="funding_carry_panel_v3 declaration"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=CONFIG_V2,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
 def test_the_cli_declares_the_family_and_prints_the_path_and_hash(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -417,4 +610,36 @@ def test_the_cli_refuses_a_path_outside_the_workspace(
         "carry-declare-measured", "--workspace-root", str(tmp_path),
         "--receipt", str(tmp_path / "receipt.json"), "--base-config", str(CONFIG_V2.resolve()),
         "--output", str(tmp_path / "outside-v3.json"),
+    ]) == 2
+
+
+def test_the_cli_verifies_a_declaration_and_stops_on_an_edited_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _, output, spec_hash = declared_family(tmp_path, monkeypatch)
+    base = tmp_path / "funding-carry-panel-v2.json"
+    base.write_bytes(CONFIG_V2.read_bytes())
+    arguments = [
+        "carry-verify-measured", "--workspace-root", str(tmp_path),
+        "--receipt", str(tmp_path / "receipt.json"), "--spec", str(output),
+        "--base-config", str(base),
+    ]
+    assert main(arguments) == 0
+    printed = capsys.readouterr().out
+    assert str(output) in printed
+    assert f"family spec hash: {spec_hash}" in printed
+    edited = edited_cost_table(
+        output, tmp_path / "cheaper-v3.json", name="adverse",
+        slippage_bps_per_side_tier_two="1",
+    )
+    assert main([
+        "carry-verify-measured", "--workspace-root", str(tmp_path),
+        "--receipt", str(tmp_path / "receipt.json"), "--spec", str(edited),
+        "--base-config", str(base),
+    ]) == 2
+    # A spec outside the workspace never reaches the verification.
+    assert main([
+        "carry-verify-measured", "--workspace-root", str(tmp_path),
+        "--receipt", str(tmp_path / "receipt.json"), "--spec", str(CONFIG_V2.resolve()),
+        "--base-config", str(base),
     ]) == 2
