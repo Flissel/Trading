@@ -5,6 +5,14 @@ freezes twelve indicators over a contract's daily closes, each a vote in
 {-1, 0, +1}, and defines the trend score as their mean. A contract with fewer
 than twelve computable votes has no score and is not rankable.
 
+Every indicator window is a **calendar span ending at the decision**, not a
+count of whatever closes happen to be on hand (P1.27 protocol 16.1, the rule
+`panel_signals._annualised_volatility` and `panel_universe.select_universe`
+already apply to their own windows). A span with a hole in it does not reach
+further back to make up the count -- reaching back would let a multi-day move
+stand in for a one-day move, and the days that go missing are not missing at
+random -- so the indicator is simply absent, and with it, the score.
+
 The weight construction is P1.27's, with the trailing-return sign replaced by
 the score's thresholded sign: `panel_signals`' volatility, normalisation,
 water-filling and quintile helpers are imported rather than copied, so the two
@@ -29,6 +37,8 @@ from trading_bot.panel_signals import (
 from trading_bot.panel_universe import ContractHistory, UniverseSnapshot
 from trading_bot.trend_config import INDICATOR_NAMES, TrendFamilySpec
 
+DAY_NS = 86_400_000_000_000
+
 _SMA_WINDOWS = (20, 50, 100)
 _SMA_CROSS_WINDOWS = ((20, 50), (50, 100))
 _BREAKOUT_WINDOWS = (20, 50, 100)
@@ -36,6 +46,28 @@ _ROC_WINDOWS = (20, 60, 120)
 _MACD_FAST_WINDOW = 12
 _MACD_SLOW_WINDOW = 26
 _DECLARED_INDICATORS = frozenset(INDICATOR_NAMES)
+
+# The longest calendar span any of the twelve indicators needs (121 days: a
+# 120-day rate of change reads the lagged day too). Because the score requires
+# all twelve votes, this is also the span the score itself rests on.
+_SCORE_SPAN_DAYS = max(
+    max(_SMA_WINDOWS),
+    max(slow for _, slow in _SMA_CROSS_WINDOWS),
+    max(_BREAKOUT_WINDOWS),
+    max(window + 1 for window in _ROC_WINDOWS),
+)
+
+# `macd_12_26` is the one indicator whose value depends on the whole series
+# rather than on a fixed window, so its span has to be chosen rather than read
+# off its name. Two things bound it. An EMA recursion must not step across a
+# calendar hole -- the same objection spec 8.1 raises against a volatility
+# window with a hole -- which argues for requiring completeness. And a hole far
+# enough back cannot change the vote anyway: the slow EMA retains
+# (1 - 2/27)**121 = 9.0e-5 of anything older than the score's span. So
+# completeness is required exactly over that span (which subsumes the 26 closes
+# the slow EMA needs at all), and outside it the EMAs are seeded and run over
+# whatever the contract observed, as spec 3 asks.
+_MACD_SPAN_DAYS = _SCORE_SPAN_DAYS
 
 
 def closes_before(history: ContractHistory, decision_close_ns: int) -> tuple[Decimal, ...]:
@@ -80,42 +112,70 @@ def ema(closes: tuple[Decimal, ...], window: int) -> Decimal:
     return value
 
 
-def indicator_votes(closes: tuple[Decimal, ...]) -> dict[str, int]:
+def complete_span(
+    history: ContractHistory, decision_close_ns: int, days: int
+) -> tuple[Decimal, ...]:
+    """The closes of the `days`-day calendar span ending at the decision.
+
+    Ascending by close time, and empty unless the span is complete: a close at
+    the decision and at every one of the `days - 1` days before it, spaced
+    exactly one day apart, with no hole.
+    """
+    span = _contiguous_span(history, decision_close_ns, days)
+    return span if len(span) == days else ()
+
+
+def indicator_votes(history: ContractHistory, decision_close_ns: int) -> dict[str, int]:
     """Every computable indicator's vote in {-1, 0, +1}, in declaration order.
 
-    An indicator whose window exceeds the series is absent from the result
-    rather than zero: absence means "not computable" and drives the
+    An indicator whose calendar span is incomplete -- it reaches past the start
+    of the contract's history, or over a missing day -- is absent from the
+    result rather than zero: absence means "not computable" and drives the
     twelve-vote requirement, while zero is a genuine abstention (an exact tie).
     """
-    if not closes:
+    # One walk back from the decision covers every indicator: a span of n days
+    # is complete exactly when this contiguous run reaches n days, and its
+    # closes are then the run's last n.
+    run = _contiguous_span(history, decision_close_ns, _SCORE_SPAN_DAYS)
+    if not run:
         return {}
     votes: dict[str, int] = {}
-    latest = closes[-1]
+    latest = run[-1]
     for window in _SMA_WINDOWS:
-        if len(closes) >= window:
-            votes[f"ma_{window}"] = _sign(latest - sma(closes, window))
+        if len(run) >= window:
+            votes[f"ma_{window}"] = _sign(latest - sma(run, window))
     for fast, slow in _SMA_CROSS_WINDOWS:
-        if len(closes) >= slow:
-            votes[f"ma_cross_{fast}_{slow}"] = _sign(sma(closes, fast) - sma(closes, slow))
+        # The crossover needs the longer of its two spans; the shorter one is
+        # inside it and so complete whenever it is.
+        if len(run) >= slow:
+            votes[f"ma_cross_{fast}_{slow}"] = _sign(sma(run, fast) - sma(run, slow))
     for window in _BREAKOUT_WINDOWS:
-        if len(closes) >= window:
-            recent = closes[-window:]
+        if len(run) >= window:
+            recent = run[-window:]
             at_high = latest == max(recent)
             at_low = latest == min(recent)
             # A window that is constant puts the close at both its high and its
             # low; spec 3's breakout is directional, so the tie is a 0.
             votes[f"breakout_{window}"] = 0 if at_high == at_low else (1 if at_high else -1)
     for window in _ROC_WINDOWS:
-        if len(closes) > window:
+        # The span is the n + 1 days from the lagged close through the
+        # decision. Only its two ends are read, but the days between them are
+        # still required: a contract whose n-day window is full of holes has
+        # not traded that span, and letting it rank on two surviving closes is
+        # the "count of observations" reading 16.1 rejects.
+        if len(run) > window:
             # `sign(P_t / P_{t-n} - 1)` equals `sign(P_t - P_{t-n})` for the
             # positive closes a price series carries, and the difference stays
             # exact where the quotient would be rounded to the context's 28
             # digits -- which matters because spec 3 resolves an exact zero to
             # an abstention, and a quotient rounding to exactly 1 would forge
             # one.
-            votes[f"roc_{window}"] = _sign(latest - closes[-(window + 1)])
-    if len(closes) >= _MACD_SLOW_WINDOW:
-        votes["macd_12_26"] = _sign(ema(closes, _MACD_FAST_WINDOW) - ema(closes, _MACD_SLOW_WINDOW))
+            votes[f"roc_{window}"] = _sign(latest - run[-(window + 1)])
+    if len(run) >= _MACD_SPAN_DAYS:
+        # Both EMAs run over the contract's whole observed series, seeded with
+        # its first close (spec 3) -- not over the span checked above.
+        series = closes_before(history, decision_close_ns)
+        votes["macd_12_26"] = _sign(ema(series, _MACD_FAST_WINDOW) - ema(series, _MACD_SLOW_WINDOW))
     # The window constants above and `INDICATOR_NAMES` are two spellings of the
     # same frozen list; if they ever drift apart, say so rather than quietly
     # returning a vote the score would then never count.
@@ -125,9 +185,9 @@ def indicator_votes(closes: tuple[Decimal, ...]) -> dict[str, int]:
     return {name: votes[name] for name in INDICATOR_NAMES if name in votes}
 
 
-def trend_score(closes: tuple[Decimal, ...]) -> Decimal | None:
+def trend_score(history: ContractHistory, decision_close_ns: int) -> Decimal | None:
     """The mean of the twelve votes, or None when any indicator is absent."""
-    votes = indicator_votes(closes)
+    votes = indicator_votes(history, decision_close_ns)
     if len(votes) < len(INDICATOR_NAMES):
         return None
     total = sum((Decimal(vote) for vote in votes.values()), Decimal(0))
@@ -142,7 +202,7 @@ def trend_scores(
     """Scores at one decision, keyed by contract id, skipping contracts without one."""
     scores: dict[str, Decimal] = {}
     for contract_id in contract_ids:
-        score = trend_score(closes_before(histories[contract_id], decision_close_ns))
+        score = trend_score(histories[contract_id], decision_close_ns)
         if score is not None:
             scores[contract_id] = score
     return scores
@@ -242,6 +302,26 @@ def _time_series_weights(
     cap = rules.time_series_cap_numerator / Decimal(len(raw))
     weights = _water_fill(_normalise(raw), cap)
     return tuple(sorted(weights.items(), key=lambda item: item[0]))
+
+
+def _contiguous_span(
+    history: ContractHistory, decision_close_ns: int, limit: int
+) -> tuple[Decimal, ...]:
+    """The closes of the longest hole-free daily span ending at the decision.
+
+    Ascending by close time, at most `limit` long, and empty when there is no
+    close at the decision itself. A span of `days` days ending at the decision
+    is complete exactly when this run is at least `days` long, so one walk back
+    settles every indicator's calendar-completeness at once.
+    """
+    values: list[Decimal] = []
+    for offset in range(limit):
+        close = history.closes.get(decision_close_ns - offset * DAY_NS)
+        if close is None:
+            break
+        values.append(close)
+    values.reverse()
+    return tuple(values)
 
 
 def _sign(value: Decimal) -> int:

@@ -5,7 +5,13 @@ import pytest
 
 from trading_bot.panel_config import load_panel_family_spec
 from trading_bot.panel_reader import PanelBar
-from trading_bot.panel_signals import _cross_sectional_weights, build_weight_vectors
+from trading_bot.panel_signals import (
+    _cross_sectional_weights,
+    build_weight_vectors,
+)
+from trading_bot.panel_signals import (
+    _time_series_weights as panel_time_series_weights,
+)
 from trading_bot.panel_universe import (
     ContractHistory,
     UniverseSnapshot,
@@ -14,8 +20,12 @@ from trading_bot.panel_universe import (
 )
 from trading_bot.trend_config import INDICATOR_NAMES, load_trend_family_spec
 from trading_bot.trend_signals import (
+    _time_series_weights as trend_time_series_weights,
+)
+from trading_bot.trend_signals import (
     build_trend_weight_vectors,
     closes_before,
+    complete_span,
     ema,
     indicator_votes,
     sma,
@@ -35,9 +45,10 @@ ELIGIBLE_COUNT = SPEC.universe.minimum_contracts
 
 
 # --------------------------------------------------------------------------
-# Close-series fixtures. Every series is `DAYS` long, one bar per day, so the
-# 91-bar history rule, the complete 30-day liquidity window and the complete
-# 30-day volatility window are all satisfied at `DECISION` (day 129's close).
+# Close-series fixtures. Every series is daily and ends exactly at `DECISION`,
+# so a series of `n` closes fills the n-day calendar span ending at the
+# decision: the 91-bar history rule, the complete 30-day liquidity window and
+# the complete 30-day volatility window all hold for the 130-day series.
 # --------------------------------------------------------------------------
 
 
@@ -56,30 +67,77 @@ def rise_then_flat_closes(turn: int) -> tuple[Decimal, ...]:
     return tuple(Decimal(100 + min(day, turn)) for day in range(DAYS))
 
 
+def decline_then_rally_closes() -> tuple[Decimal, ...]:
+    """400 falling by 3 a day to 40 on day 120, then rallying by 6 a day to 94.
+
+    A long decline with a short sharp rally on the end: the fixture the
+    whole-series MACD is pinned with below.
+    """
+    return tuple(
+        Decimal(400) - Decimal(3) * day if day <= 120 else Decimal(40) + Decimal(6) * (day - 120)
+        for day in range(DAYS)
+    )
+
+
 def step_closes(scale: int) -> tuple[Decimal, ...]:
     """`100 * 2 ** (scale * (day // 6))`: a staircase that steps once every six days.
 
     Non-decreasing for a positive `scale` and non-increasing for a negative one,
     never constant, and every value is an exact Decimal (a power of two times
     100, at most 2**84 * 100, which is 28 significant digits). Every daily log
-    return is `scale * (day_stepped) * ln 2`, so the realised volatility of
-    `step_closes(4)` is exactly four times that of `step_closes(1)` and
-    `step_closes(-1)`'s equals `step_closes(1)`'s -- the property the
-    inverse-volatility weights below are hand-computed from.
+    return is `scale * ln 2` on a step day and 0 otherwise, so the realised
+    volatility of `step_closes(4)` is exactly four times that of
+    `step_closes(1)` and `step_closes(-1)`'s equals `step_closes(1)`'s -- the
+    property the inverse-volatility weights below are hand-computed from.
     """
     return tuple(Decimal(100) * Decimal(2) ** (scale * (day // 6)) for day in range(DAYS))
 
 
+def close_times_for(count: int) -> tuple[int, ...]:
+    """`count` consecutive daily close times, the last of them `DECISION`."""
+    return tuple(DECISION - (count - 1 - index) * DAY_NS for index in range(count))
+
+
+def history_for(
+    symbol: str, closes: tuple[Decimal, ...], *, holes: tuple[int, ...] = ()
+) -> ContractHistory:
+    """One contract's daily history ending at `DECISION`.
+
+    `holes` names day offsets counted back from the decision (0 is the decision
+    day itself); those closes are deleted, which is how a calendar hole is
+    punched into an otherwise contiguous series.
+    """
+    dropped = {DECISION - offset * DAY_NS for offset in holes}
+    kept = {
+        close_time: close
+        for close_time, close in zip(close_times_for(len(closes)), closes, strict=True)
+        if close_time not in dropped
+    }
+    return ContractHistory(
+        contract_id=f"{symbol}:0",
+        instrument_id=symbol,
+        closes=kept,
+        quote_volumes={},
+        close_times=tuple(sorted(kept)),
+    )
+
+
+def votes_for(closes: tuple[Decimal, ...], *, holes: tuple[int, ...] = ()) -> dict[str, int]:
+    return indicator_votes(history_for("VOTEUSDT", closes, holes=holes), DECISION)
+
+
+def score_for(closes: tuple[Decimal, ...], *, holes: tuple[int, ...] = ()) -> Decimal | None:
+    return trend_score(history_for("VOTEUSDT", closes, holes=holes), DECISION)
+
+
 def bars_for(symbol: str, closes: tuple[Decimal, ...]) -> list[PanelBar]:
     rows: list[PanelBar] = []
-    for index, close in enumerate(closes):
-        open_time_ns = index * DAY_NS
-        close_time_ns = open_time_ns + DAY_NS - 1_000_000
+    for close_time_ns, close in zip(close_times_for(len(closes)), closes, strict=True):
         rows.append(
             PanelBar(
                 contract_id=f"{symbol}:0",
                 instrument_id=symbol,
-                open_time_ns=open_time_ns,
+                open_time_ns=close_time_ns - DAY_NS + 1_000_000,
                 close_time_ns=close_time_ns,
                 available_time_ns=close_time_ns + 1,
                 close=close,
@@ -179,9 +237,8 @@ def test_a_monotone_rise_votes_long_on_every_indicator() -> None:
       toward the recent end as alpha grows, so on a non-decreasing,
       non-constant series the faster EMA_12 is strictly above EMA_26.
     """
-    votes = indicator_votes(rising_closes())
-    assert votes == dict.fromkeys(INDICATOR_NAMES, 1)
-    assert trend_score(rising_closes()) == Decimal(1)
+    assert votes_for(rising_closes()) == dict.fromkeys(INDICATOR_NAMES, 1)
+    assert score_for(rising_closes()) == Decimal(1)
 
 
 def test_a_flat_series_abstains_on_every_indicator() -> None:
@@ -189,9 +246,8 @@ def test_a_flat_series_abstains_on_every_indicator() -> None:
     P_t, so all nine difference-based votes are an exact zero, and each
     breakout window's high and low are both P_t -- the tie the spec resolves
     to 0 rather than to +1."""
-    votes = indicator_votes(flat_closes())
-    assert votes == dict.fromkeys(INDICATOR_NAMES, 0)
-    assert trend_score(flat_closes()) == Decimal(0)
+    assert votes_for(flat_closes()) == dict.fromkeys(INDICATOR_NAMES, 0)
+    assert score_for(flat_closes()) == Decimal(0)
 
 
 def test_a_twenty_day_flat_tail_ties_the_twenty_day_breakout() -> None:
@@ -217,7 +273,7 @@ def test_a_twenty_day_flat_tail_ties_the_twenty_day_breakout() -> None:
     """
     closes = rise_then_flat_closes(109)
     assert closes[-1] == Decimal(209)
-    assert indicator_votes(closes) == {
+    assert votes_for(closes) == {
         "ma_20": 0,
         "ma_50": 1,
         "ma_100": 1,
@@ -231,7 +287,7 @@ def test_a_twenty_day_flat_tail_ties_the_twenty_day_breakout() -> None:
         "macd_12_26": 1,
         "roc_120": 1,
     }
-    assert trend_score(closes) == Decimal("0.75")
+    assert score_for(closes) == Decimal("0.75")
 
 
 def test_a_sixty_day_flat_tail_scores_five_twelfths() -> None:
@@ -252,7 +308,7 @@ def test_a_sixty_day_flat_tail_scores_five_twelfths() -> None:
     """
     closes = rise_then_flat_closes(69)
     assert closes[-1] == Decimal(169)
-    assert indicator_votes(closes) == {
+    assert votes_for(closes) == {
         "ma_20": 0,
         "ma_50": 0,
         "ma_100": 1,
@@ -266,9 +322,9 @@ def test_a_sixty_day_flat_tail_scores_five_twelfths() -> None:
         "macd_12_26": 1,
         "roc_120": 1,
     }
-    score = trend_score(closes)
+    score = score_for(closes)
     assert score == Decimal(5) / Decimal(12)
-    assert Decimal("0.2") <= score < Decimal("0.5")
+    assert score is not None and Decimal("0.2") <= score < Decimal("0.5")
 
 
 def test_a_staircase_fall_votes_short_on_every_indicator() -> None:
@@ -276,12 +332,46 @@ def test_a_staircase_fall_votes_short_on_every_indicator() -> None:
     monotone rise: every SMA and every lagged close sits strictly above P_t,
     P_t is each window's low and never its high, and the faster EMA is strictly
     below the slower one."""
-    closes = step_closes(-1)
-    assert indicator_votes(closes) == dict.fromkeys(INDICATOR_NAMES, -1)
-    assert trend_score(closes) == Decimal(-1)
+    assert votes_for(step_closes(-1)) == dict.fromkeys(INDICATOR_NAMES, -1)
+    assert score_for(step_closes(-1)) == Decimal(-1)
 
 
-MINIMUM_WINDOW = {
+def test_the_macd_runs_over_the_whole_series_not_the_last_twenty_six_closes() -> None:
+    """A long decline with a short sharp rally, where the two readings disagree.
+
+    `decline_then_rally_closes()` falls 400 -> 40 by 3 a day through day 120 and
+    then rallies by 6 a day to 94. The last 26 closes run 88, 85, ... 40, then
+    46 ... 94, so a MACD computed over only that window is seeded at 88, and a
+    26-day EMA sheds just (1 - 2/27)**25 = 15% of its seed in 25 steps: it lands
+    at 69.80, *below* the fast EMA's 71.75, and would vote +1.
+
+    Run over the whole series -- what spec 3 asks for, "seeded with the first
+    close of the contract's history" -- the slow EMA still carries the 400 ->
+    88 decline above that window and sits at 75.28, above the fast EMA's 72.01
+    (the fast EMA barely moves between the two readings: its own seed decays by
+    (1 - 2/13)**25, under 2%). So the whole-series vote is -1.
+
+    The sign, not the value, is what is pinned here, and the two readings give
+    opposite signs -- so truncating the EMA to any recent window fails this.
+    """
+    closes = decline_then_rally_closes()
+    assert closes[120] == Decimal(40)
+    assert closes[-1] == Decimal(94)
+    assert closes[-26] == Decimal(88)
+    assert votes_for(closes)["macd_12_26"] == -1
+    # The truncated reading this guards against, spelled out independently.
+    truncated = closes[-26:]
+    assert ema(truncated, 12) - ema(truncated, 26) > 0
+    whole = closes_before(history_for("VOTEUSDT", closes), DECISION)
+    assert ema(whole, 12) - ema(whole, 26) < 0
+
+
+# --------------------------------------------------------------------------
+# Calendar spans (P1.27 protocol 16.1: a window is a calendar span ending at
+# the decision, not a count of whatever closes happen to be on hand)
+# --------------------------------------------------------------------------
+
+MINIMUM_SPAN_DAYS = {
     "ma_20": 20,
     "ma_50": 50,
     "ma_100": 100,
@@ -292,37 +382,94 @@ MINIMUM_WINDOW = {
     "breakout_100": 100,
     "roc_20": 21,
     "roc_60": 61,
-    "macd_12_26": 26,
+    "macd_12_26": 121,
     "roc_120": 121,
 }
 
 
-def test_each_indicator_appears_exactly_at_its_minimum_window() -> None:
-    """An indicator whose window exceeds the series is absent, not zero: a
-    crossover needs the longer of its two SMAs, a rate of change needs n + 1
-    closes (the lagged one included) and the MACD needs its slow window."""
-    assert set(MINIMUM_WINDOW) == set(INDICATOR_NAMES)
-    series = rising_closes(max(MINIMUM_WINDOW.values()))
-    for name, minimum in MINIMUM_WINDOW.items():
-        assert name not in indicator_votes(series[: minimum - 1]), name
-        assert name in indicator_votes(series[:minimum]), name
+def test_complete_span_returns_the_closes_only_when_the_span_has_no_hole() -> None:
+    """The span is the `days` consecutive daily closes ending at the decision.
+    A hole anywhere inside it -- or no close at the decision at all -- makes it
+    empty rather than reaching further back to make up the count."""
+    history = history_for("SPANUSDT", rising_closes())
+    assert complete_span(history, DECISION, 3) == (Decimal(227), Decimal(228), Decimal(229))
+    assert len(complete_span(history, DECISION, DAYS)) == DAYS
+    # A 131-day span reaches one day past the start of the history.
+    assert complete_span(history, DECISION, DAYS + 1) == ()
+    holed = history_for("SPANUSDT", rising_closes(), holes=(2,))
+    assert complete_span(holed, DECISION, 2) == (Decimal(228), Decimal(229))
+    assert complete_span(holed, DECISION, 3) == ()
+    assert complete_span(history_for("SPANUSDT", rising_closes(), holes=(0,)), DECISION, 1) == ()
+
+
+def test_each_indicator_appears_exactly_at_its_minimum_span() -> None:
+    """An indicator whose calendar span reaches past the contract's history is
+    absent, not zero: a crossover needs the longer of its two SMAs, a rate of
+    change needs the lagged day as well (n + 1 days), and the MACD needs the
+    whole span the score rests on because its EMAs must not step across a hole
+    inside it."""
+    assert set(MINIMUM_SPAN_DAYS) == set(INDICATOR_NAMES)
+    series = rising_closes(max(MINIMUM_SPAN_DAYS.values()))
+    for name, minimum in MINIMUM_SPAN_DAYS.items():
+        assert name not in votes_for(series[-(minimum - 1) :]), name
+        assert name in votes_for(series[-minimum:]), name
+
+
+def test_an_interior_hole_drops_every_indicator_whose_span_covers_it() -> None:
+    """One day deleted 69 days before the decision, out of an otherwise
+    contiguous 130-day series.
+
+    The spans that reach past day 69 -- `ma_100` and `breakout_100` (100 days),
+    `ma_cross_50_100` (its slow leg is 100 days), `roc_120` (121 days, the
+    lagged day included) and `macd_12_26` (the score's own 121-day span) --
+    are no longer calendar-complete, so those five votes are absent. The 20-,
+    50- and 60-day spans all end before day 69 and are untouched. With five
+    votes missing there is no score, so the contract is not rankable at this
+    decision -- the same fail-closed outcome `_annualised_volatility` and
+    `select_universe` already produce for a hole in their own windows.
+    """
+    votes = votes_for(rising_closes(), holes=(69,))
+    assert set(votes) == {
+        "ma_20",
+        "ma_50",
+        "ma_cross_20_50",
+        "breakout_20",
+        "breakout_50",
+        "roc_20",
+        "roc_60",
+    }
+    assert score_for(rising_closes(), holes=(69,)) is None
+
+
+def test_a_hole_outside_every_span_changes_nothing() -> None:
+    """The longest span the score rests on is 121 days, so a day deleted 125
+    days before the decision lies outside every one of them: every vote is
+    computable and unchanged, and so is the score."""
+    assert votes_for(rising_closes(), holes=(125,)) == votes_for(rising_closes())
+    assert score_for(rising_closes(), holes=(125,)) == Decimal(1)
+
+
+def test_a_missing_decision_close_leaves_no_votes() -> None:
+    """Every span ends at the decision, so a contract with no bar at the
+    decision has no computable indicator at all."""
+    assert votes_for(rising_closes(), holes=(0,)) == {}
+    assert score_for(rising_closes(), holes=(0,)) is None
 
 
 def test_votes_come_back_in_the_declared_indicator_order() -> None:
-    assert tuple(indicator_votes(rising_closes())) == INDICATOR_NAMES
+    assert tuple(votes_for(rising_closes())) == INDICATOR_NAMES
 
 
 def test_trend_score_is_none_below_twelve_votes() -> None:
-    """120 closes give eleven votes -- every indicator but `roc_120`, which
-    needs its lagged close as a 121st. A contract with fewer than twelve
-    computable votes has no score."""
-    short = rising_closes(120)
-    votes = indicator_votes(short)
-    assert len(votes) == 11
+    """A 120-day history leaves the two 121-day spans (`roc_120` and
+    `macd_12_26`) short, so ten votes are computable and there is no score."""
+    votes = votes_for(rising_closes(120))
+    assert len(votes) == 10
     assert "roc_120" not in votes
-    assert trend_score(short) is None
-    assert trend_score(rising_closes(121)) is not None
-    assert trend_score(()) is None
+    assert "macd_12_26" not in votes
+    assert score_for(rising_closes(120)) is None
+    assert score_for(rising_closes(121)) is not None
+    assert score_for(()) is None
 
 
 # --------------------------------------------------------------------------
@@ -356,10 +503,15 @@ def test_threshold_sign_is_inclusive_at_both_edges() -> None:
 
 
 def test_trend_scores_skips_a_contract_without_twelve_votes() -> None:
-    histories = build_contract_histories(
-        tuple(bars_for("LONGUSDT", rising_closes()) + bars_for("SHORTUSDT", rising_closes(120)))
-    )
-    scores = trend_scores(histories, ("LONGUSDT:0", "SHORTUSDT:0"), DECISION)
+    histories = {
+        history.contract_id: history
+        for history in (
+            history_for("LONGUSDT", rising_closes()),
+            history_for("HOLEUSDT", rising_closes(), holes=(69,)),
+            history_for("SHORTUSDT", rising_closes(120)),
+        )
+    }
+    scores = trend_scores(histories, tuple(histories), DECISION)
     assert scores == {"LONGUSDT:0": Decimal(1)}
 
 
@@ -433,6 +585,42 @@ def test_a_falling_contract_is_shorted() -> None:
     weights = dict(vectors["ta_ts_t02"].weights)
     assert abs(weights["S000USDT:0"] - Decimal("0.5")) < TOLERANCE
     assert abs(weights["S001USDT:0"] + Decimal("0.5")) < TOLERANCE
+
+
+def test_the_trend_time_series_weights_are_the_panel_construction() -> None:
+    """P1.27 drift guard: fed one signed set, `trend_signals._time_series_weights`
+    and `panel_signals._time_series_weights` must return the identical vector.
+
+    The two differ only in where the sign comes from -- a thresholded score
+    here, a trailing return there -- so scores of +/-1 against trailing returns
+    of +/-0.1 with the same signs (and the two families' byte-identical weight
+    rules) have to produce the same inverse-volatility, water-filled book.
+    """
+    histories = build_panel(
+        {
+            "S000USDT": step_closes(1),
+            "S001USDT": step_closes(4),
+            "S002USDT": step_closes(-1),
+        }
+    )
+    snapshot = snapshot_for(histories)
+    eligible = tuple(item.contract_id for item in snapshot.contracts)
+    # `F000USDT` is one of the flat fillers: its realised sigma is exactly 0, so
+    # the volatility floor binds for it and not for the three staircases (sigma
+    # 5.0 and 20.1) -- both branches of `max(sigma, floor)` are exercised.
+    signs = {
+        "F000USDT:0": Decimal(1),
+        "S000USDT:0": Decimal(1),
+        "S001USDT:0": Decimal(1),
+        "S002USDT:0": Decimal(-1),
+    }
+    returns = {contract: sign / Decimal(10) for contract, sign in signs.items()}
+    ours = trend_time_series_weights(
+        signs, histories, eligible, DECISION, SPEC.weights, Decimal("0.2")
+    )
+    theirs = panel_time_series_weights(returns, histories, eligible, DECISION, PANEL_SPEC.weights)
+    assert ours == theirs
+    assert len(ours) == 4
 
 
 def test_the_higher_threshold_silences_a_mid_score_contract() -> None:
@@ -560,10 +748,9 @@ def test_an_empty_universe_propagates_its_reason_codes() -> None:
 
 def test_weight_vectors_ignore_a_bar_that_closes_after_the_decision() -> None:
     """Point-in-time regression: a bar closing one day after the decision must
-    change nothing -- not the scores (via `closes_before`) and not the
-    volatility window."""
-    signalled = {"S000USDT": step_closes(1), "S001USDT": step_closes(4)}
-    histories = build_panel(signalled)
+    change nothing -- not the scores (whose calendar spans end at the decision)
+    and not the volatility window."""
+    histories = build_panel({"S000USDT": step_closes(1), "S001USDT": step_closes(4)})
     earlier_decision = DECISION - DAY_NS
     snapshot = select_universe(histories, decision_close_ns=earlier_decision, rules=SPEC.universe)
     with_future = build_trend_weight_vectors(histories, snapshot, spec=SPEC)
