@@ -1,6 +1,7 @@
 """Frozen declaration of the funding carry experiment family."""
 
 import json
+import re
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
@@ -8,6 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from trading_bot.canonical import content_sha256
+from trading_bot.cost_evidence_rule import DECLARATION_RULE
 from trading_bot.panel_config import PanelFoldGeometry, PanelStatistics
 
 MEMBER_NAMES: tuple[str, ...] = ("carry_l1w_h4w", "carry_l4w_h4w", "carry_l4w_h13w")
@@ -17,11 +19,18 @@ MEMBER_NAMES_V2: tuple[str, ...] = (
     "carry_l4w_h26w_exit",
     "carry_l4w_h26w_exit_hurdle2",
 )
+# v3 is v2's book on measured execution costs: the same members, the same
+# universe, the same folds - the cost tables are the only thing the Binance cost
+# journal's receipt changes, so the two families stay comparable.
+MEASURED_COST_FAMILY = "funding_carry_panel_v3"
 MEMBER_NAMES_BY_FAMILY: dict[str, tuple[str, ...]] = {
     "funding_carry_panel_v1": MEMBER_NAMES,
     "funding_carry_panel_v2": MEMBER_NAMES_V2,
+    MEASURED_COST_FAMILY: MEMBER_NAMES_V2,
 }
 CONTROL_NAMES: tuple[str, ...] = ("no_trade", "random_pairs", "all_pairs_ew")
+
+_HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class _Frozen(BaseModel):
@@ -98,9 +107,55 @@ class CarryCosts(_Frozen):
     adverse: CarryCostTable
 
 
+class CostEvidenceReference(_Frozen):
+    """The measurement a declaration's slippage tiers were read off.
+
+    A measured family cites the Binance cost journal's finalisation receipt by
+    hash, names the journal spec that receipt bound, records the two notionals
+    spec section 5 fixes - the base table's and the adverse table's - and
+    repeats the rule the receipt carries, so the declaration says where every
+    basis point came from without its reader holding the journal.
+
+    The rule is the one sentence spec section 5 fixed before any number existed
+    (``cost_evidence_rule.DECLARATION_RULE``, the same string the receipt is
+    published under): a declaration citing any other reading is refused here,
+    and ``carry_measured_costs.verify_measured_declaration`` re-derives every
+    number the citation stands for from the receipt itself.
+    """
+
+    receipt_hash: str
+    journal_spec_hash: str
+    base_notional: Decimal
+    adverse_notional: Decimal
+    rule: str
+
+    @field_validator("receipt_hash", "journal_spec_hash")
+    @classmethod
+    def validate_hashes(cls, value: str) -> str:
+        if not _HEX64.match(value):
+            raise ValueError("an evidence hash is 64 lower-case hexadecimal characters")
+        return value
+
+    @field_validator("base_notional", "adverse_notional")
+    @classmethod
+    def validate_notionals(cls, value: Decimal) -> Decimal:
+        if value <= 0:
+            raise ValueError("a cited notional is positive")
+        return value
+
+    @field_validator("rule")
+    @classmethod
+    def validate_rule(cls, value: str) -> str:
+        if value != DECLARATION_RULE:
+            raise ValueError("the cited rule is spec section 5's sentence, verbatim")
+        return value
+
+
 class CarryFamilySpec(_Frozen):
     spec_version: Literal["1.0.0"]
-    family_name: Literal["funding_carry_panel_v1", "funding_carry_panel_v2"]
+    family_name: Literal[
+        "funding_carry_panel_v1", "funding_carry_panel_v2", "funding_carry_panel_v3"
+    ]
     hypothesis: str
     perpetual_venue: Literal["BINANCE_UM"]
     spot_venue: Literal["BINANCE_SPOT"]
@@ -114,6 +169,23 @@ class CarryFamilySpec(_Frozen):
     costs: CarryCosts
     folds: PanelFoldGeometry
     statistics: PanelStatistics
+    cost_evidence: CostEvidenceReference | None = None
+
+    @model_validator(mode="after")
+    def validate_cost_evidence(self) -> "CarryFamilySpec":
+        """Measured costs are cited, and assumed costs may not pretend to be.
+
+        A measured family's cost tables are a reading of a finalisation
+        receipt, so the declaration carries the evidence or it is not a
+        declaration; v1 and v2 declare the assumed tiers inherited from P1.27
+        and must not wear a citation they did not earn.
+        """
+        measured = self.family_name == MEASURED_COST_FAMILY
+        if measured and self.cost_evidence is None:
+            raise ValueError("a measured family cites the receipt its cost tables came from")
+        if not measured and self.cost_evidence is not None:
+            raise ValueError("only a measured family carries cost evidence")
+        return self
 
     @model_validator(mode="after")
     def validate_members(self) -> "CarryFamilySpec":
