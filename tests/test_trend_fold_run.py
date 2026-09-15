@@ -31,7 +31,12 @@ from trading_bot.panel_reader import load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.panel_universe import ContractHistory, build_contract_histories, select_universe
 from trading_bot.registry import MetadataRegistry
-from trading_bot.trend_config import TrendFamilySpec, load_trend_family_spec
+from trading_bot.trend_config import (
+    TREND_CONTROL_NAMES,
+    TREND_MEMBER_NAMES,
+    TrendFamilySpec,
+    load_trend_family_spec,
+)
 from trading_bot.trend_fold_run import (
     FOLD_WARMED_REASON_CODE,
     TrendFoldError,
@@ -294,6 +299,38 @@ def _expected_book(
             share = weight / Decimal(hold_weeks)
             totals[contract_id] = totals.get(contract_id, Decimal(0)) + share
     return tuple(sorted((key, value) for key, value in totals.items() if value != 0))
+
+
+FOLD_1_EXPECTED_PATH = Path(__file__).parent / "fixtures" / "trend_fold1_expected.json"
+
+
+def test_fold1_economics_are_reproducible(workspace: tuple[Path, Path, Path]) -> None:
+    """P1.31 reproducibility: this fixture's fold-1 numbers are frozen.
+
+    `trend_fold_run.py` is inside `_TREND_MODULES`, so any edit to the runner
+    moves `code_hash` and with it `report_hash`; the report hash therefore
+    cannot pin reproducibility across a runner change. The economics can:
+    every candidate's total and every episode's exposure, turnover, net return
+    and per-contract attribution were captured from this fixture at ea777b3,
+    before the fold loop was generalised into `vector_fold_run.py`, and every
+    later runner change must leave them exactly where they were, digit for
+    digit.
+    """
+    document = _run(workspace)
+    expected: dict[str, object] = json.loads(
+        FOLD_1_EXPECTED_PATH.read_text(encoding="utf-8")
+    )
+    assert sorted(expected) == sorted(TREND_MEMBER_NAMES + TREND_CONTROL_NAMES)
+    for name in expected:
+        for scenario in ("base", "adverse"):
+            want = _object_dict(_object_dict(expected[name])[scenario])
+            record = _object_dict(_candidate(document, name)[scenario])
+            assert record["total_net_return"] == want["total_net_return"], (name, scenario)
+            wanted = [_object_dict(item) for item in _object_list(want["episodes"])]
+            for episode, expected_episode in zip(
+                _episodes(document, name, scenario), wanted, strict=True
+            ):
+                assert {key: episode[key] for key in expected_episode} == expected_episode
 
 
 def test_fold_report_carries_every_member_control_and_the_three_extras(
