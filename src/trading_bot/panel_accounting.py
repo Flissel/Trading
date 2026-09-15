@@ -18,12 +18,18 @@ _BPS = Decimal(10_000)
 # on by callers pooling per-contract totals across many episodes) that an
 # episode's own net_contributions sum to its own net_return exactly.
 #
-# Real inputs need roughly 32 digits of headroom (measured); prec=50 leaves
-# ample margin. Inexact is trapped so that margin is an enforced guarantee,
-# not an assumption: if it is ever exceeded, this raises immediately rather
-# than silently rounding to a net_return that no longer matches its own
-# contract breakdown.
-_NET_RETURN_CONTEXT = Context(prec=50)
+# Single-vector books need roughly 32 digits of headroom (measured). Cohort
+# books (P1.31, P1.32) can hold residual weights of about 1e-28 where a long
+# in an older vector nearly cancels a short in a newer one; those residuals'
+# contributions carry their own 28 digits below that, so an exact sum with a
+# 1e-2 largest term needs about 60 digits. prec=120 leaves ample margin for
+# both (measured on the P1.32 fold that first exceeded 50). An exact sum is
+# the same at any sufficient precision, so raising the headroom changes no
+# previously produced value. Inexact is trapped so that margin is an enforced
+# guarantee, not an assumption: if it is ever exceeded, this raises
+# immediately rather than silently rounding to a net_return that no longer
+# matches its own contract breakdown.
+_NET_RETURN_CONTEXT = Context(prec=120)
 _NET_RETURN_CONTEXT.traps[Inexact] = True
 
 
