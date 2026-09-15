@@ -24,6 +24,7 @@ from trading_bot.panel_statistics import (
     sharpe_ratio,
 )
 from trading_bot.registry import ArtifactRecord, MetadataRegistry
+from trading_bot.trend_config import TrendFamilySpec
 
 # Section 8.1's declared weight construction reads from the *full eligible*
 # universe; the implementation reads from the subset of it that is actually
@@ -85,10 +86,10 @@ class PanelDecisionError(RuntimeError):
 
 
 # `build_panel_decision` reads only `members`, `controls`, `statistics` and
-# `family_name` from the loaded spec -- fields both family models declare --
-# so either can be pooled through the same gates without this module knowing
-# anything else about the carry family.
-FamilySpec = PanelFamilySpec | CarryFamilySpec
+# `family_name` from the loaded spec -- fields every family model declares --
+# so any of them can be pooled through the same gates without this module
+# knowing anything else about the carry or trend aggregate families.
+FamilySpec = PanelFamilySpec | CarryFamilySpec | TrendFamilySpec
 
 # Control dominance (a member must beat both) is measured against the two
 # "no active view" baseline controls -- no-trade and a random assignment --

@@ -1,0 +1,115 @@
+{
+  "spec_version": "1.0.0",
+  "family_name": "trend_aggregate_panel_v1",
+  "hypothesis": "A trend score aggregated from twelve fixed technical indicators over 20 to 120 days predicts the sign of the next week's return on a liquid USDT-perpetual universe well enough that a weekly-rebalanced book built on it earns positive net expectancy under base costs, non-negative under adverse costs, in enough folds, without single-fold, single-contract or single-week concentration, after correction across four members.",
+  "venue": "BINANCE_UM",
+  "holding_days": 7,
+  "indicators": [
+    "ma_20",
+    "ma_50",
+    "ma_100",
+    "ma_cross_20_50",
+    "ma_cross_50_100",
+    "breakout_20",
+    "breakout_50",
+    "breakout_100",
+    "roc_20",
+    "roc_60",
+    "macd_12_26",
+    "roc_120"
+  ],
+  "members": [
+    {
+      "name": "ta_ts_t02",
+      "kind": "time_series",
+      "threshold": "0.2",
+      "hold_weeks": 1
+    },
+    {
+      "name": "ta_ts_t05",
+      "kind": "time_series",
+      "threshold": "0.5",
+      "hold_weeks": 1
+    },
+    {
+      "name": "ta_ts_t02_h4w",
+      "kind": "time_series",
+      "threshold": "0.2",
+      "hold_weeks": 4
+    },
+    {
+      "name": "ta_xs_q5",
+      "kind": "cross_sectional",
+      "threshold": null,
+      "hold_weeks": 1
+    }
+  ],
+  "controls": [
+    {
+      "name": "no_trade",
+      "kind": "no_trade"
+    },
+    {
+      "name": "random_ranks",
+      "kind": "random_ranks"
+    },
+    {
+      "name": "passive_long_ew",
+      "kind": "passive_long"
+    }
+  ],
+  "universe": {
+    "minimum_history_days": 91,
+    "liquidity_window_days": 30,
+    "minimum_median_quote_volume": "5000000",
+    "maximum_contracts": 100,
+    "minimum_contracts": 40,
+    "tier_one_rank_limit": 20
+  },
+  "weights": {
+    "leg_gross": "0.5",
+    "minimum_quintile_size": 8,
+    "volatility_window_days": 30,
+    "volatility_floor": "0.20",
+    "time_series_cap_numerator": "2"
+  },
+  "costs": {
+    "base": {
+      "name": "base",
+      "fee_bps_per_side": "5",
+      "slippage_bps_per_side_tier_one": "5",
+      "slippage_bps_per_side_tier_two": "10",
+      "funding_receipt_multiplier": "1",
+      "funding_payment_multiplier": "1",
+      "forced_close_multiplier": "1"
+    },
+    "adverse": {
+      "name": "adverse",
+      "fee_bps_per_side": "5",
+      "slippage_bps_per_side_tier_one": "10",
+      "slippage_bps_per_side_tier_two": "20",
+      "funding_receipt_multiplier": "0",
+      "funding_payment_multiplier": "2",
+      "forced_close_multiplier": "2"
+    }
+  },
+  "folds": {
+    "train_duration_ns": 31536000000000000,
+    "validation_duration_ns": 7862400000000000,
+    "test_duration_ns": 15724800000000000,
+    "step_ns": 15724800000000000,
+    "embargo_ns": 1209600000000000,
+    "holdout_duration_ns": 15724800000000000
+  },
+  "statistics": {
+    "block_length": 4,
+    "bootstrap_repetitions": 2000,
+    "random_seed": 17,
+    "confidence": "0.95",
+    "false_discovery_gate": "0.10",
+    "pooled_episode_floor": 200,
+    "concentration_limit": "0.5",
+    "positive_fold_numerator": 2,
+    "positive_fold_denominator": 3
+  }
+}
