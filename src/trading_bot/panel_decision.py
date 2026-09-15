@@ -72,12 +72,20 @@ _DECLARED_DEVIATIONS: tuple[dict[str, object], ...] = (
 # `sum(contract_totals)` and `base_total` -- two different groupings of the
 # same underlying money -- agree exactly rather than approximately.
 #
-# Real inputs need roughly 32 digits of headroom (measured); prec=50 leaves
-# ample margin. Inexact is trapped so that margin is an enforced guarantee,
-# not an assumption: if it is ever exceeded, this raises immediately rather
-# than silently rounding to a wrong total that nothing downstream would
-# notice -- the exact failure mode this precision work exists to remove.
-_POOLING_CONTEXT = Context(prec=50)
+# Real inputs needed roughly 32 digits of headroom for P1.27 (measured) and
+# prec=50 covered P1.27 through P1.29. The trend family's four-week cohort
+# book (P1.31) can leave dust weights of about 1e-28 where a long in an older
+# vector nearly cancels a short in a newer one; a dust weight times a return
+# carries its 28 significant digits down to about 1e-57 and needs ~60 digits
+# to sum exactly. prec=120 keeps every previously exact sum exactly the same
+# (an exact sum is exact at any sufficient precision -- the P1.29 decision
+# re-derives to the identical report hash) and leaves twice the margin the
+# worst measured input needs. Inexact stays trapped so that margin is an
+# enforced guarantee, not an assumption: if it is ever exceeded, this raises
+# immediately rather than silently rounding to a wrong total that nothing
+# downstream would notice -- the exact failure mode this precision work
+# exists to remove.
+_POOLING_CONTEXT = Context(prec=120)
 _POOLING_CONTEXT.traps[Inexact] = True
 
 
