@@ -1,4 +1,5 @@
 import json
+from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -59,27 +60,32 @@ FOLD_1_WARM_UP_OFFSETS = (116, 123, 130)
 # four-week member still carries its warmed cohorts.
 DEAD_BAND_EPISODE_INDEX = 0
 
-# The five liquidity days ending on fold 1's middle decision (offset 144).
-# Dropping every symbol's quote volume across them pushes the median under the
-# declared floor for that one decision, so its universe comes back empty and the
-# week is skipped, while the weeks on either side are untouched --
-# `liquidity_window_days` is 5 in the reduced declaration below.
-_DIP_TARGET_OFFSET = 144
+# Dropping every symbol's quote volume across the five liquidity days ending on
+# one Sunday pushes the median under the declared floor for that Sunday alone, so
+# its universe comes back empty while the weeks on either side are untouched --
+# `liquidity_window_days` is 5 in the reduced declaration below. Two placements
+# are used: fold 1's middle decision, an in-window skipped week; and fold 1's
+# last warm-up Sunday, which lies outside the test window entirely.
 _DIP_WINDOW_DAYS = 5
-_DIP_DAYS = frozenset(
-    EPOCH_DAY_2020 + offset
-    for offset in range(_DIP_TARGET_OFFSET - _DIP_WINDOW_DAYS + 1, _DIP_TARGET_OFFSET + 1)
-)
+_IN_WINDOW_DIP_OFFSET = 144
+_WARM_UP_DIP_OFFSET = 130
 
 
-def kline_csv_with_liquidity_dip(symbol: str, month: str) -> str:
+def _dip_days(target_offset: int) -> frozenset[int]:
+    return frozenset(
+        EPOCH_DAY_2020 + offset
+        for offset in range(target_offset - _DIP_WINDOW_DAYS + 1, target_offset + 1)
+    )
+
+
+def kline_csv_with_liquidity_dip(symbol: str, month: str, dip_days: frozenset[int]) -> str:
     seed = int(symbol[1:3])
     lines = [KLINE_HEADER]
     for offset in range(MONTH_DAYS[month]):
         day = EPOCH_DAY_2020 + MONTH_START_DAY[month] + offset
         open_ms = day * DAY_MS
         close = 100 + seed * 10 + (day % 11) + (seed * (day % 5)) / 4
-        quote_volume = "1000000" if day in _DIP_DAYS else "50000000"
+        quote_volume = "1000000" if day in dip_days else "50000000"
         lines.append(
             f"{open_ms},{close},{close},{close},{close},10,{open_ms + DAY_MS - 1},"
             f"{quote_volume},100,50,25000000,0"
@@ -87,19 +93,46 @@ def kline_csv_with_liquidity_dip(symbol: str, month: str) -> str:
     return "\n".join(lines) + "\n"
 
 
-def fetch_with_liquidity_dip(url: str) -> PanelPayload:
-    symbol = next(item for item in SYMBOLS if f"/{item}/" in url or f"/{item}-" in url)
-    month = next(item for item in MONTHS if item in url)
-    if "fundingRate" in url:
-        day = EPOCH_DAY_2020 + MONTH_START_DAY[month]
-        text = "calc_time,funding_interval_hours,last_funding_rate\n"
-        text += f"{day * DAY_MS},8,0.0001\n"
-        return PanelPayload(url=url, raw_bytes=zip_bytes("f.csv", text), received_time_ns=1)
-    return PanelPayload(
-        url=url,
-        raw_bytes=zip_bytes("k.csv", kline_csv_with_liquidity_dip(symbol, month)),
-        received_time_ns=1,
+def fetch_with_liquidity_dip(target_offset: int) -> Callable[[str], PanelPayload]:
+    """A `capture_panel` fetch whose klines lose their liquidity at `target_offset`."""
+    dip_days = _dip_days(target_offset)
+
+    def fetch_dipped(url: str) -> PanelPayload:
+        symbol = next(item for item in SYMBOLS if f"/{item}/" in url or f"/{item}-" in url)
+        month = next(item for item in MONTHS if item in url)
+        if "fundingRate" in url:
+            day = EPOCH_DAY_2020 + MONTH_START_DAY[month]
+            text = "calc_time,funding_interval_hours,last_funding_rate\n"
+            text += f"{day * DAY_MS},8,0.0001\n"
+            return PanelPayload(url=url, raw_bytes=zip_bytes("f.csv", text), received_time_ns=1)
+        return PanelPayload(
+            url=url,
+            raw_bytes=zip_bytes("k.csv", kline_csv_with_liquidity_dip(symbol, month, dip_days)),
+            received_time_ns=1,
+        )
+
+    return fetch_dipped
+
+
+def dipped_workspace(tmp_path: Path, target_offset: int) -> tuple[Path, Path, Path]:
+    """`workspace`, captured through a fetch that empties one Sunday's universe."""
+    capture_panel(
+        workspace_root=tmp_path,
+        output_directory=tmp_path / "capture",
+        reserve_bytes=0,
+        symbols=SYMBOLS,
+        months=MONTHS,
+        fetch=fetch_with_liquidity_dip(target_offset),
     )
+    config_path = small_trend_config(tmp_path)
+    spec, spec_hash = load_trend_family_spec(config_path)
+    publish_panel_walk_forward(
+        tmp_path / "capture",
+        output_path=tmp_path / "manifest.json",
+        spec=spec,
+        family_spec_hash=spec_hash,
+    )
+    return tmp_path, tmp_path / "capture", config_path
 
 
 def small_trend_config(tmp_path: Path) -> Path:
@@ -483,22 +516,8 @@ def test_skipped_week_resets_the_four_week_cohort_vectors(tmp_path: Path) -> Non
     """A skipped week flattens the book (P1.27 semantics), so the retained weekly
     vectors go with it: the week after the skip opens on its own vector alone, a
     quarter of capital, rather than resuming the pre-skip cohorts."""
-    capture_panel(
-        workspace_root=tmp_path,
-        output_directory=tmp_path / "capture",
-        reserve_bytes=0,
-        symbols=SYMBOLS,
-        months=MONTHS,
-        fetch=fetch_with_liquidity_dip,
-    )
-    config_path = small_trend_config(tmp_path)
-    spec, spec_hash = load_trend_family_spec(config_path)
-    publish_panel_walk_forward(
-        tmp_path / "capture",
-        output_path=tmp_path / "manifest.json",
-        spec=spec,
-        family_spec_hash=spec_hash,
-    )
+    space = dipped_workspace(tmp_path, _IN_WINDOW_DIP_OFFSET)
+    config_path = space[2]
     manifest = json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))
     fold = next(item for item in manifest["folds"] if item["fold_index"] == FOLD_INDEX)
     test_ids = [str(value) for value in fold["test_ids"]]
@@ -529,6 +548,63 @@ def test_skipped_week_resets_the_four_week_cohort_vectors(tmp_path: Path) -> Non
     assert 0 < after < before
     # The carried position was reset too, so the resumed week pays full entry.
     assert _decimal(cohort[1]["turnover"]) == after
+
+
+def test_empty_warm_up_sunday_contributes_no_vector_but_resets_nothing(tmp_path: Path) -> None:
+    """The counterpart to the test above, and the line between the two rules.
+
+    A warm-up Sunday whose universe is too small forms no vector -- but there is
+    no position to flatten out there, so the vectors formed on the other warm-up
+    Sundays survive it and keep ageing out on the calendar. Only an in-window
+    skipped week resets, where a real position is actually closed (P1.27).
+
+    The dip is aimed at fold 1's *last* warm-up Sunday (offset 130), the one
+    placement that separates the two rules on this fixture: the earlier warm-up
+    Sunday at 116 is below the score's 121-day span and forms an empty vector
+    anyway, and the fold's own first decision abstains inside the dead band, so
+    the whole opening book is the single vector formed at offset 123. Resetting
+    on the dipped Sunday would discard it and open the fold flat.
+    """
+    space = dipped_workspace(tmp_path, _WARM_UP_DIP_OFFSET)
+    root, capture_root, config_path = space
+    spec, _ = load_trend_family_spec(config_path)
+    histories = _fold_histories(capture_root, root / "manifest.json", FOLD_INDEX)
+    decisions = _fold_decisions(root / "manifest.json", FOLD_INDEX)
+    warm_ups = tuple(decisions[0] - weeks * WEEK_NS for weeks in (3, 2, 1))
+    assert tuple(_offset_of(sunday) for sunday in warm_ups) == FOLD_1_WARM_UP_OFFSETS
+    # Sanity on the fixture: the dip emptied the last warm-up Sunday's universe
+    # and left the two before it, and the fold's own decisions, alone.
+    assert not select_universe(
+        histories, decision_close_ns=warm_ups[2], rules=spec.universe
+    ).contracts
+    for sunday in (warm_ups[0], warm_ups[1], *decisions):
+        assert select_universe(
+            histories, decision_close_ns=sunday, rules=spec.universe
+        ).contracts
+
+    document = _run(space)
+    # The dip is outside the test window, so no decision is skipped.
+    assert document["skipped_sample_ids"] == []
+    assert "SKIPPED_WEEK_EXIT_COST_UNCHARGED" not in _object_list(document["reason_codes"])
+
+    episode = _episodes(document, "ta_ts_t02_h4w")[0]
+    expected = _expected_book(
+        histories,
+        spec,
+        warm_ups + decisions[:1],
+        name="ta_ts_t02_h4w",
+        hold_weeks=4,
+        decision_close_ns=decisions[0],
+    )
+    assert expected  # the surviving warm-up vector is still in the book
+    assert _decimal(episode["gross_exposure"]) == sum(
+        (abs(weight) for _, weight in expected), Decimal(0)
+    )
+    assert _decimal(episode["net_exposure"]) == sum(
+        (weight for _, weight in expected), Decimal(0)
+    )
+    assert _decimal(episode["gross_exposure"]) > 0
+    assert episode["reason_codes"] == []
 
 
 def test_members_are_registered(workspace: tuple[Path, Path, Path]) -> None:
@@ -624,7 +700,10 @@ def test_cohort_book_drops_a_contract_without_a_bar_and_undeploys_its_capital() 
     }
     vector = (("A", Decimal("0.5")), ("B", Decimal("0.5")))
     book = assemble_cohort_book(
-        [vector] * 4, hold_weeks=4, histories=histories, decision_close_ns=decision
+        [(week * WEEK_NS, vector) for week in (1, 2, 3, 4)],
+        hold_weeks=4,
+        histories=histories,
+        decision_close_ns=decision,
     )
     assert book == (("A", Decimal("0.5")),)
 
@@ -634,23 +713,48 @@ def test_cohort_book_deploys_one_quarter_per_retained_vector() -> None:
     histories = {"A": _history("A", tuple(week * WEEK_NS for week in range(5)))}
     vector = (("A", Decimal(1)),)
     assert assemble_cohort_book(
-        [vector], hold_weeks=4, histories=histories, decision_close_ns=decision
+        [(4 * WEEK_NS, vector)], hold_weeks=4, histories=histories, decision_close_ns=decision
     ) == (("A", Decimal("0.25")),)
     assert assemble_cohort_book(
-        [vector, vector], hold_weeks=4, histories=histories, decision_close_ns=decision
+        [(3 * WEEK_NS, vector), (4 * WEEK_NS, vector)],
+        hold_weeks=4,
+        histories=histories,
+        decision_close_ns=decision,
     ) == (("A", Decimal("0.5")),)
     # An empty vector -- a week whose member signalled nothing -- contributes
     # nothing, and its quarter of capital stays undeployed.
     assert assemble_cohort_book(
-        [vector, (), vector, ()], hold_weeks=4, histories=histories, decision_close_ns=decision
+        [(week * WEEK_NS, vector if week % 2 else ()) for week in (1, 2, 3, 4)],
+        hold_weeks=4,
+        histories=histories,
+        decision_close_ns=decision,
     ) == (("A", Decimal("0.5")),)
+
+
+def test_cohort_book_ages_a_vector_out_by_the_calendar_not_by_list_position() -> None:
+    """A Sunday on which the whole panel had no universe forms no vector at all.
+    Counting list positions would then keep the oldest vector in the book for a
+    fifth week; ageing on the calendar (`carry_signals.assemble_book`'s rule)
+    retires it on time, and the gap simply stays undeployed."""
+    decision = 4 * WEEK_NS
+    histories = {"A": _history("A", tuple(week * WEEK_NS for week in range(5)))}
+    vector = (("A", Decimal(1)),)
+    # Four retained vectors, but the one formed four weeks ago has aged out and
+    # the Sunday three weeks ago formed none, so three quarters are deployed.
+    book = assemble_cohort_book(
+        [(week * WEEK_NS, vector) for week in (0, 2, 3, 4)],
+        hold_weeks=4,
+        histories=histories,
+        decision_close_ns=decision,
+    )
+    assert book == (("A", Decimal("0.75")),)
 
 
 def test_cohort_book_drops_a_contract_whose_cohorts_cancel_exactly() -> None:
     decision = 4 * WEEK_NS
     histories = {"A": _history("A", tuple(week * WEEK_NS for week in range(5)))}
     book = assemble_cohort_book(
-        [(("A", Decimal(1)),), (("A", Decimal(-1)),)],
+        [(3 * WEEK_NS, (("A", Decimal(1)),)), (4 * WEEK_NS, (("A", Decimal(-1)),))],
         hold_weeks=4,
         histories=histories,
         decision_close_ns=decision,

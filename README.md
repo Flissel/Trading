@@ -281,7 +281,7 @@ ihre Kreuzungen, Ausbrüche, Rate-of-Change, MACD), deklariert in
 (long ab Score 0.2 bzw. 0.5, short spiegelbildlich, eine Woche gehalten),
 `ta_ts_t02_h4w` (Schwelle 0.2, vier Wochen in überlappenden Kohorten zu je einem Viertel
 des Kapitals) und `ta_xs_q5` (oberstes gegen unterstes Quintil). Universum, Gewichte,
-Kosten, Folds und Statistik sind byte-gleich zu P1.27; Manifest und Entscheidung sind
+Kosten, Folds und Statistik sind wertgleich zu P1.27; Manifest und Entscheidung sind
 `panel-manifest` und `panel-decision` unverändert, neu ist nur `trend-fold`.
 
 ```powershell

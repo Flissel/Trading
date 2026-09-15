@@ -79,7 +79,7 @@ def warm_up_weeks_of(spec: TrendFamilySpec) -> int:
 
 
 def assemble_cohort_book(
-    vectors: Sequence[tuple[tuple[str, Decimal], ...]],
+    vectors: Sequence[tuple[int, tuple[tuple[str, Decimal], ...]]],
     *,
     hold_weeks: int,
     histories: dict[str, ContractHistory],
@@ -87,7 +87,14 @@ def assemble_cohort_book(
 ) -> tuple[tuple[str, Decimal], ...]:
     """The book a multi-week member holds at one decision (spec 4.2).
 
-    The sum over the last `hold_weeks` weekly vectors of `vector / hold_weeks`.
+    The sum of `vector / hold_weeks` over every retained vector still inside the
+    hold, each vector paired with the Sunday it was formed on. A vector ages out
+    on the calendar -- `decision_close_ns - formed_ns >= hold_weeks * WEEK_NS`,
+    `carry_signals.assemble_book`'s rule -- not on its position in the list: a
+    Sunday on which the whole panel had no universe forms no vector at all, and
+    counting positions would then keep the oldest vector in the book for a fifth
+    week.
+
     Capital is committed per week, not per contract: a week whose vector is empty
     contributes nothing and its share simply stays undeployed, and a contract
     with no bar at this decision is dropped rather than having its share spread
@@ -100,8 +107,11 @@ def assemble_cohort_book(
     if hold_weeks < 1:
         raise TrendFoldError("a holding period is at least one week")
     share = Decimal(hold_weeks)
+    horizon = hold_weeks * _WEEK_NS
     totals: dict[str, Decimal] = {}
-    for vector in vectors[-hold_weeks:]:
+    for formed_ns, vector in vectors:
+        if decision_close_ns - formed_ns >= horizon:
+            continue
         for contract_id, weight in vector:
             if decision_close_ns not in histories[contract_id].closes:
                 continue
@@ -167,7 +177,7 @@ def run_trend_fold(
     }
     # Only a member that holds for more than one week needs its past vectors
     # kept; every other candidate's book is this week's vector.
-    cohorts: dict[str, list[tuple[tuple[str, Decimal], ...]]] = {
+    cohorts: dict[str, list[tuple[int, tuple[tuple[str, Decimal], ...]]]] = {
         member.name: [] for member in spec.members if member.hold_weeks > 1
     }
     skipped: list[str] = []
@@ -181,10 +191,12 @@ def run_trend_fold(
     # window. Bars were loaded with `available_before_ns = test_end_ns + 1`,
     # which covers these Sundays, and `select_universe` and
     # `build_trend_weight_vectors` each read only data at or before the Sunday
-    # they are asked about, so no future data enters here. A warm-up Sunday
-    # whose universe is too small resets the retained vectors exactly as an
-    # in-window skipped week does: the same condition would have flattened the
-    # book, so nothing formed before it may survive it.
+    # they are asked about, so no future data enters here. A warm-up Sunday whose
+    # universe is too small simply contributes no vector: no position exists yet
+    # to be flattened, so there is nothing to reset, and the vectors formed on
+    # the warm-up Sundays around it keep ageing out on the calendar as usual.
+    # Only an in-window skipped week resets, where a real position is closed
+    # (P1.27); `carry_fold_run.py`'s warm-up does the same.
     warm_up_closes = (
         [decisions[0] - weeks * _WEEK_NS for weeks in range(warm_up_weeks, 0, -1)]
         if decisions
@@ -195,12 +207,15 @@ def run_trend_fold(
             histories, decision_close_ns=warm_up_close_ns, rules=spec.universe
         )
         if not warm_up.contracts:
-            for name in cohorts:
-                cohorts[name] = []
             continue
         vectors = build_trend_weight_vectors(histories, warm_up, spec=spec)
         for name in cohorts:
-            _retain(cohorts[name], vectors[name].weights, hold_weeks=members[name].hold_weeks)
+            _retain(
+                cohorts[name],
+                vectors[name].weights,
+                formed_ns=warm_up_close_ns,
+                hold_weeks=members[name].hold_weeks,
+            )
 
     for decision_close_ns in decisions:
         sample_id = f"BINANCE_UM:{decision_close_ns}:w1"
@@ -225,7 +240,12 @@ def run_trend_fold(
             member = members.get(name)
             if member is not None and member.hold_weeks > 1:
                 retained = cohorts[member.name]
-                _retain(retained, vectors[name].weights, hold_weeks=member.hold_weeks)
+                _retain(
+                    retained,
+                    vectors[name].weights,
+                    formed_ns=decision_close_ns,
+                    hold_weeks=member.hold_weeks,
+                )
                 weights = assemble_cohort_book(
                     retained,
                     hold_weeks=member.hold_weeks,
@@ -342,14 +362,20 @@ def run_trend_fold(
 
 
 def _retain(
-    vectors: list[tuple[tuple[str, Decimal], ...]],
+    vectors: list[tuple[int, tuple[tuple[str, Decimal], ...]]],
     vector: tuple[tuple[str, Decimal], ...],
     *,
+    formed_ns: int,
     hold_weeks: int,
 ) -> None:
-    """Append this week's vector and forget anything older than the hold."""
-    vectors.append(vector)
-    del vectors[:-hold_weeks]
+    """Append this Sunday's vector and forget anything the hold has aged out.
+
+    Age is the calendar distance from the Sunday just formed, the same rule
+    `assemble_cohort_book` applies; this only keeps the retained list bounded.
+    """
+    vectors.append((formed_ns, vector))
+    horizon = hold_weeks * _WEEK_NS
+    vectors[:] = [item for item in vectors if formed_ns - item[0] < horizon]
 
 
 def _abstained_contracts(
