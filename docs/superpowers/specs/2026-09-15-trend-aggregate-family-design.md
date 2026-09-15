@@ -54,6 +54,12 @@ requiring its own full window or abstaining with 0):
 **Score** `S_c(t)` = mean of the twelve votes (in [−1, 1]); a contract with fewer than
 twelve computable votes has no score and is not rankable.
 
+**Windows are calendar spans** (P1.27 protocol section 16.1, inherited): an indicator over
+*n* days needs a close on every one of the *n* calendar days ending at *t* (ROC: the close at
+*t* and at *t − n* days; MACD: the complete 26-day span, after which both EMAs run over the
+contract's whole observed series). An indicator whose span has a missing day is absent, so
+the contract has no score at that decision. Clarified 2026-09-15 before any fold ran.
+
 All arithmetic is `Decimal`; EMAs use the standard `α = 2/(n+1)` recursion seeded with
 the first close of the contract's history; signs of an exact zero difference are 0.
 
@@ -85,10 +91,12 @@ single-contract or single-week concentration, after correction across four membe
 | `ta_xs_q5` | cross-sectional | long the top quintile by `S`, short the bottom quintile, equal weight within each leg, dollar-neutral | 1 week |
 
 Time-series weights follow P1.27's `ts_mom` construction: inverse-volatility weights
-(30-day realised, calendar-complete window), capped at 0.20 per contract by water-filling,
-scaled so gross exposure is 1 when at least one contract has a signal; a member with no
-signalled contract holds nothing (`MEMBER_HELD_NOTHING`). The cross-sectional member uses
-the P1.27 quintile construction (minimum quintile size 2, at most 100 contracts).
+(30-day realised, calendar-complete window), water-filled at a cap of
+`time_series_cap_numerator / n` (2/n, P1.27's declared value), scaled so gross exposure is
+1 when at least one contract has a signal; a member with no signalled contract holds
+nothing (`MEMBER_HELD_NOTHING`). The cross-sectional member uses the P1.27 quintile
+construction (minimum quintile size 8, at most 100 contracts). The numbers are the frozen
+P1.27 declaration's, copied byte-for-byte into `configs/trend-aggregate-panel-v1.json`.
 
 ### 4.3 Controls (not trials)
 
