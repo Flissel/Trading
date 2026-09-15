@@ -313,6 +313,36 @@ lang hochzulaufen; der Report hält das als `warm_up_weeks` und
 `FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS` fest. Pro Episode kommen drei Extras dazu:
 `signalled_contracts`, `abstained_contracts` und `mean_score`.
 
+### Funding-Querschnitt (P1.32)
+
+Vierte Panel-Familie und die erste ohne Spot-Bein: ein dollarneutrales Buch, long im
+Quintil mit der niedrigsten und short im Quintil mit der höchsten Funding-Rate desselben
+Universums, deklariert in `configs/funding-xs-panel-v1.json`. Rangiert wird auf der Summe
+der Funding-Settlements der letzten ein oder vier Wochen (P1.28s Definition); vier
+Mitglieder: `fx_q5_l4w_h1w` (vier Wochen Rückblick, eine Woche gehalten),
+`fx_q5_l4w_h4w` und `fx_q5_l1w_h4w` (vier Wochen in überlappenden Kohorten zu je einem
+Viertel des Kapitals) und `fx_q5_l4w_h4w_exit` (wie das zweite, aber mit Ausstiegsregel:
+ein gehaltenes Bein, dessen letzte Woche das falsche Vorzeichen zeigt, wird in jedem
+gehaltenen Vektor auf null gesetzt, sein Kapitalanteil bleibt bis zum Auslaufen der
+Kohorte unangelegt). Universum, Gewichte, Folds und Statistik sind wertgleich zu P1.27,
+die Kosten bis auf eine deklarierte Änderung: im Adverse-Szenario zählen
+Funding-Einnahmen zu 0.75 und Zahlungen doppelt (P1.28s Regel statt P1.27s Nullreceipt),
+weil der Ertrag dieser Familie das Funding selbst ist. Manifest und Entscheidung sind
+`panel-manifest` und `panel-decision` unverändert, neu ist nur `funding-xs-fold`.
+
+```powershell
+uv run trading-research panel-manifest --capture <perp> --output artifacts/fxs/fxs-walk-forward-<datum>-usdt-perps-1d-w1-v1.json --family-spec configs/funding-xs-panel-v1.json
+uv run trading-research funding-xs-fold --capture <perp> --manifest <manifest> --family-spec configs/funding-xs-panel-v1.json --output artifacts/fxs/funding-xs-<datum>-fold0-v1.json --registry artifacts/fxs/metadata-funding-xs-v1.sqlite3 --fold-index 0
+uv run trading-research panel-decision --fold-report artifacts/fxs/funding-xs-<datum>-fold0-v1.json --family-spec configs/funding-xs-panel-v1.json --output artifacts/fxs/funding-xs-<datum>-decision-v1.json --registry artifacts/fxs/metadata-funding-xs-v1.sqlite3
+```
+
+Die Fold-Schleife ist dieselbe wie bei P1.31 — sie liegt seit dieser Familie in
+`vector_fold_run.py`, `trend-fold` und `funding-xs-fold` sind zwei dünne Hüllen darum,
+und P1.31s Fold-1-Zahlen sind gegen `tests/fixtures/trend_fold1_expected.json`
+festgenagelt. Aufwärmen und `warm_up_weeks` wie oben; pro Episode kommen vier Extras
+dazu: `signalled_contracts`, `funding_collected` (das Gegenteil der Funding-Kosten der
+Episode), `exit_rule_removals` und `mean_score`.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.

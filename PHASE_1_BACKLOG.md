@@ -430,6 +430,50 @@ Acceptance:
   question was closed;
 - the final holdout stays closed.
 
+### P1.32 Funding cross-section family
+
+Evaluate the pre-registered family `funding_xs_panel_v1` — the four members
+`fx_q5_l4w_h1w`, `fx_q5_l4w_h4w`, `fx_q5_l1w_h4w` and `fx_q5_l4w_h4w_exit` — a
+perpetual-only, dollar-neutral book long the lowest-funding quintile and short the
+highest-funding quintile of P1.27's universe, ranked on trailing one- or four-week funding
+and held one week or in four overlapping weekly cohorts of a quarter of capital each, on
+P1.27's perpetual panel under
+`docs/superpowers/specs/2026-09-15-funding-xs-family-design.md` and the evaluation
+protocol as of 2026-09-15. No spot leg, so no hedge capture and half the carry pair's
+round trip. Independent of P1.30 and P1.31; the decision records are written on different
+days.
+
+Acceptance:
+
+- the repaired perpetual capture verifies and the manifest binds it, reaching the
+  200-episode floor, otherwise the family stops at `INSUFFICIENT_EVIDENCE`;
+- the declaration's universe, weights, folds and statistics are P1.27's values unchanged
+  and its costs are P1.27's but for the one declared change — the adverse table's funding
+  receipts at 0.75 and payments at 2, P1.28's rule, because this family's return *is*
+  funding — and `panel_signals.py`, `panel_fold_run.py` and
+  `configs/xs-momentum-panel-v1.json` are untouched, so P1.27 stays reproducible;
+- P1.31 stays reproducible across the fold loop's generalisation into
+  `vector_fold_run.py`: fold 1 of the trend fixture reproduces
+  `tests/fixtures/trend_fold1_expected.json` digit for digit, only `code_hash` and
+  `report_hash` having moved;
+- all four members and the three P1.27 controls are evaluated on every fold in one
+  invocation per fold (`funding-xs-fold`), and the decision module's gates are the P1.27
+  gates unchanged;
+- each fold warms the three Sundays before its first decision so the four-week members'
+  books open full, recorded as `warm_up_weeks` and
+  `FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS`;
+- the exit rule runs for `fx_q5_l4w_h4w_exit` alone and for no control: a held leg whose
+  trailing one week of funding has the wrong sign for that leg (`None` counted as wrong)
+  is zeroed in every retained cohort vector before the book is assembled, never during the
+  warm-up, its share left undeployed until the cohort ages out, and counted per episode as
+  `exit_rule_removals`;
+- the decision report carries the four-key `extras_mean` per member --
+  `signalled_contracts`, `funding_collected`, `exit_rule_removals` and `mean_score`;
+- the decision record `P1_32_DECISION_<date>.md` records every member, including the
+  rejected ones, with turnover and deflated Sharpe, and states whether the funding
+  cross-section pays its own turnover under these rules;
+- the final holdout stays closed.
+
 ## Explicitly deferred
 
 - real-capital execution;
