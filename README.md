@@ -272,7 +272,6 @@ uv run trading-research binance-cost-journal-finalize --journal data/cost-journa
 Exit 2 bedeutet gestoppt. `status` ist nur lesend und der einzige sichere Blick auf ein
 laufendes Journal.
 
-<<<<<<< HEAD
 Aus der Quittung wird `funding_carry_panel_v3` erklärt — Basis-Tier = `tier_p50_of_p50`
 des schlechteren Beins bei 5 000 USDT, Adverse-Tier = `tier_p50_of_p90` bei 50 000 USDT,
 je auf ganze Basispunkte aufgerundet (Spec 5). Alles andere ist die v2-Erklärung
@@ -289,7 +288,7 @@ unveränderlich wie die Quittung — bricht der Prozess mitten im Schreiben ab, 
 unvollständige Datei liegen, die nicht parst: löschen und Befehl wiederholen.
 `carry-verify-measured` leitet jede Zahl der Erklärung neu aus Quittung und v2-Erklärung
 ab (Exit 2 bei jeder Abweichung) und druckt den Spec-Hash.
-=======
+
 ### Trend-Aggregat (P1.31)
 
 Dritte Panel-Familie und die erste gerichtete: ein Trend-Score als Mittel aus zwölf
@@ -313,7 +312,6 @@ keine Episoden), damit das Buch des Vier-Wochen-Mitglieds voll eröffnet statt d
 lang hochzulaufen; der Report hält das als `warm_up_weeks` und
 `FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS` fest. Pro Episode kommen drei Extras dazu:
 `signalled_contracts`, `abstained_contracts` und `mean_score`.
->>>>>>> codex/trend-aggregate
 
 ## Harte Grenzen
 

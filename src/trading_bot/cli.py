@@ -140,7 +140,6 @@ def main(arguments: list[str] | None = None) -> int:
     carry_fold.add_argument("--output", type=Path, required=True)
     carry_fold.add_argument("--registry", type=Path, required=True)
     carry_fold.add_argument("--fold-index", type=int, required=True)
-<<<<<<< HEAD
     carry_declare = commands.add_parser("carry-declare-measured")
     carry_declare.add_argument("--workspace-root", type=Path, default=Path.cwd())
     carry_declare.add_argument("--receipt", type=Path, required=True)
@@ -151,7 +150,6 @@ def main(arguments: list[str] | None = None) -> int:
     carry_verify.add_argument("--receipt", type=Path, required=True)
     carry_verify.add_argument("--spec", type=Path, required=True)
     carry_verify.add_argument("--base-config", type=Path, default=None)
-=======
     trend_fold = commands.add_parser("trend-fold")
     trend_fold.add_argument("--workspace-root", type=Path, default=Path.cwd())
     trend_fold.add_argument("--capture", type=Path, required=True)
@@ -160,7 +158,6 @@ def main(arguments: list[str] | None = None) -> int:
     trend_fold.add_argument("--output", type=Path, required=True)
     trend_fold.add_argument("--registry", type=Path, required=True)
     trend_fold.add_argument("--fold-index", type=int, required=True)
->>>>>>> codex/trend-aggregate
     journal_create = commands.add_parser("binance-cost-journal-create")
     journal_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_create.add_argument("--journal", type=Path, required=True)
@@ -402,12 +399,10 @@ def main(arguments: list[str] | None = None) -> int:
             fold_index=parsed.fold_index,
         )
         return 0
-<<<<<<< HEAD
     if parsed.command == "carry-declare-measured":
         return _carry_declare_measured(parsed)
     if parsed.command == "carry-verify-measured":
         return _carry_verify_measured(parsed)
-=======
     if parsed.command == "trend-fold":
         workspace = parsed.workspace_root.resolve()
         trend_paths = (
@@ -428,7 +423,6 @@ def main(arguments: list[str] | None = None) -> int:
             fold_index=parsed.fold_index,
         )
         return 0
->>>>>>> codex/trend-aggregate
     if parsed.command == "binance-cost-journal-create":
         return _binance_cost_journal_create(parsed)
     if parsed.command == "binance-cost-journal-run":
