@@ -400,6 +400,36 @@ Acceptance:
   closed at this venue and scale;
 - the final holdout stays closed.
 
+### P1.31 Trend aggregate family
+
+Evaluate the pre-registered family `trend_aggregate_panel_v1` — the four members
+`ta_ts_t02`, `ta_ts_t05`, `ta_ts_t02_h4w` and `ta_xs_q5` — a twelve-indicator trend vote
+over 20 to 120 days of daily closes, thresholded at 0.2 and at 0.5, held one week or in
+four overlapping weekly cohorts of a quarter of capital each, plus a cross-sectional
+quintile member, on P1.27's perpetual panel under
+`docs/superpowers/specs/2026-09-15-trend-aggregate-family-design.md` and the evaluation
+protocol as of 2026-09-15. May run before or after P1.30 (independent families); the two decision records
+are written on different days.
+
+Acceptance:
+
+- the repaired perpetual capture verifies and the manifest binds it, reaching the
+  200-episode floor, otherwise the family stops at `INSUFFICIENT_EVIDENCE`;
+- the declaration's universe, weights, costs, folds and statistics are P1.27's values
+  unchanged, and `panel_signals.py`, `panel_fold_run.py` and
+  `configs/xs-momentum-panel-v1.json` are untouched, so P1.27 stays reproducible;
+- all four members and the three P1.27 controls are evaluated on every fold in one
+  invocation per fold, and the decision module's gates are the P1.27 gates unchanged;
+- each fold warms the three Sundays before its first decision so the four-week member's
+  book opens full, recorded as `warm_up_weeks` and
+  `FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS`;
+- the decision report carries the three-key `extras_mean` per member —
+  `signalled_contracts`, `abstained_contracts` and `mean_score`;
+- the decision record `P1_31_DECISION_<date>.md` records every member, including the
+  rejected ones, with turnover and deflated Sharpe, and states which way the directional
+  question was closed;
+- the final holdout stays closed.
+
 ## Explicitly deferred
 
 - real-capital execution;

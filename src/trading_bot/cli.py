@@ -39,6 +39,7 @@ from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
 from trading_bot.storage import StoragePolicy, StoragePolicyError, StorageReserveError
 from trading_bot.strategy import CostScenario
+from trading_bot.trend_fold_run import run_trend_fold
 from trading_bot.walk_forward_run import derive_walk_forward_config, run_capture_walk_forward
 
 
@@ -139,6 +140,7 @@ def main(arguments: list[str] | None = None) -> int:
     carry_fold.add_argument("--output", type=Path, required=True)
     carry_fold.add_argument("--registry", type=Path, required=True)
     carry_fold.add_argument("--fold-index", type=int, required=True)
+<<<<<<< HEAD
     carry_declare = commands.add_parser("carry-declare-measured")
     carry_declare.add_argument("--workspace-root", type=Path, default=Path.cwd())
     carry_declare.add_argument("--receipt", type=Path, required=True)
@@ -149,6 +151,16 @@ def main(arguments: list[str] | None = None) -> int:
     carry_verify.add_argument("--receipt", type=Path, required=True)
     carry_verify.add_argument("--spec", type=Path, required=True)
     carry_verify.add_argument("--base-config", type=Path, default=None)
+=======
+    trend_fold = commands.add_parser("trend-fold")
+    trend_fold.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    trend_fold.add_argument("--capture", type=Path, required=True)
+    trend_fold.add_argument("--manifest", type=Path, required=True)
+    trend_fold.add_argument("--family-spec", type=Path, required=True)
+    trend_fold.add_argument("--output", type=Path, required=True)
+    trend_fold.add_argument("--registry", type=Path, required=True)
+    trend_fold.add_argument("--fold-index", type=int, required=True)
+>>>>>>> codex/trend-aggregate
     journal_create = commands.add_parser("binance-cost-journal-create")
     journal_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_create.add_argument("--journal", type=Path, required=True)
@@ -390,10 +402,33 @@ def main(arguments: list[str] | None = None) -> int:
             fold_index=parsed.fold_index,
         )
         return 0
+<<<<<<< HEAD
     if parsed.command == "carry-declare-measured":
         return _carry_declare_measured(parsed)
     if parsed.command == "carry-verify-measured":
         return _carry_verify_measured(parsed)
+=======
+    if parsed.command == "trend-fold":
+        workspace = parsed.workspace_root.resolve()
+        trend_paths = (
+            parsed.capture.resolve(),
+            parsed.manifest.resolve(),
+            parsed.family_spec.resolve(),
+            parsed.output.resolve(),
+            parsed.registry.resolve(),
+        )
+        if any(not path.is_relative_to(workspace) for path in trend_paths):
+            raise ValueError("trend fold paths must stay inside workspace")
+        run_trend_fold(
+            trend_paths[0],
+            manifest_path=trend_paths[1],
+            family_spec_path=trend_paths[2],
+            output_path=trend_paths[3],
+            registry_path=trend_paths[4],
+            fold_index=parsed.fold_index,
+        )
+        return 0
+>>>>>>> codex/trend-aggregate
     if parsed.command == "binance-cost-journal-create":
         return _binance_cost_journal_create(parsed)
     if parsed.command == "binance-cost-journal-run":

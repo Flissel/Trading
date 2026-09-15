@@ -122,8 +122,19 @@ dominance over both controls; deflated Sharpe reported only.
   through `panel_config.load_family_spec` (dispatch on `family_name`).
 - `trend_fold_run.py`: one fold; the P1.27 report schema (so `panel_decision.py` pools it)
   plus per-episode extras `signalled_contracts`, `abstained_contracts`, `mean_score`.
-  Cohort mechanics for `ta_ts_t02_h4w` reuse `carry_signals.Cohort`/`assemble_book`
-  semantics (1/H per cohort, capital undeployed when a cohort empties).
+  The four-week member's book at *t* is the sum of the last four weekly weight vectors
+  (its own included) divided by four, aged by calendar; an empty vector contributes nothing
+  (capital undeployed); a contract without a bar at *t* is dropped; an in-window
+  `UNIVERSE_TOO_SMALL` week resets the retained vectors and the carried position (P1.27).
+  **Warm-up (declared 2026-09-15, before any fold):** the three Sundays before each fold's
+  first test decision form weight vectors only — no episode, nothing carried — so the
+  four-week member opens on a full book instead of a one-quarter stub (the P1.29 rule);
+  a warm-up Sunday whose universe is too small contributes nothing and resets nothing.
+  Those Sundays fall inside the embargo/validation span and read only data at or before
+  themselves. The fold report carries `warm_up_weeks: 3` and the reason code
+  `FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS`; the decision record must repeat both.
+  Contracts a cohort still holds after leaving the eligible universe are charged tier-two
+  slippage on exit (`panel_accounting`'s default), which is disclosed in the record.
 - `cli.py`: `trend-fold`. Manifest: `panel-manifest` with the trend family spec.
 
 ## 6. Artifacts

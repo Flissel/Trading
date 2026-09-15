@@ -11,6 +11,7 @@ from trading_bot.canonical import content_sha256
 
 if TYPE_CHECKING:
     from trading_bot.carry_config import CarryFamilySpec
+    from trading_bot.trend_config import TrendFamilySpec
 
 MEMBER_NAMES: tuple[str, ...] = (
     "xs_mom_1w",
@@ -137,7 +138,10 @@ def load_panel_family_spec(path: Path) -> tuple[PanelFamilySpec, str]:
     return spec, content_sha256(document)
 
 
-def load_family_spec(path: Path) -> "tuple[PanelFamilySpec | CarryFamilySpec, str]":
+type FamilySpec = PanelFamilySpec | CarryFamilySpec | TrendFamilySpec
+
+
+def load_family_spec(path: Path) -> tuple[FamilySpec, str]:
     """Load whichever frozen family declaration the file holds.
 
     Dispatches on ``family_name`` so the walk-forward manifest and the
@@ -147,6 +151,7 @@ def load_family_spec(path: Path) -> "tuple[PanelFamilySpec | CarryFamilySpec, st
     """
     # local: avoids an import cycle
     from trading_bot.carry_config import MEMBER_NAMES_BY_FAMILY, CarryFamilySpec
+    from trading_bot.trend_config import TrendFamilySpec
 
     document = json.loads(path.read_text(encoding="utf-8"))
     family_name = document.get("family_name") if isinstance(document, dict) else None
@@ -156,4 +161,6 @@ def load_family_spec(path: Path) -> "tuple[PanelFamilySpec | CarryFamilySpec, st
         and family_name in MEMBER_NAMES_BY_FAMILY
     ):
         return CarryFamilySpec.model_validate(document), content_sha256(document)
+    if family_name == "trend_aggregate_panel_v1":
+        return TrendFamilySpec.model_validate(document), content_sha256(document)
     return PanelFamilySpec.model_validate(document), content_sha256(document)

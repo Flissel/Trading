@@ -16,6 +16,7 @@ from trading_bot.splits import (
     WalkForwardFold,
     build_walk_forward_views,
 )
+from trading_bot.trend_config import TrendFamilySpec
 
 DAY_NS = 86_400_000_000_000
 _SUNDAY_REMAINDER = 3  # the Unix epoch began on a Thursday
@@ -94,7 +95,7 @@ def publish_panel_walk_forward(
     capture_root: Path,
     *,
     output_path: Path,
-    spec: PanelFamilySpec | CarryFamilySpec,
+    spec: PanelFamilySpec | CarryFamilySpec | TrendFamilySpec,
     family_spec_hash: str,
     hedge_capture_root: Path | None = None,
 ) -> PanelManifestArtifact:
