@@ -272,6 +272,30 @@ uv run trading-research binance-cost-journal-finalize --journal data/cost-journa
 Exit 2 bedeutet gestoppt. `status` ist nur lesend und der einzige sichere Blick auf ein
 laufendes Journal.
 
+### Trend-Aggregat (P1.31)
+
+Dritte Panel-Familie und die erste gerichtete: ein Trend-Score als Mittel aus zwölf
+eingefrorenen Indikatoren über 20 bis 120 Tage Tagesschluss (gleitende Durchschnitte und
+ihre Kreuzungen, Ausbrüche, Rate-of-Change, MACD), deklariert in
+`configs/trend-aggregate-panel-v1.json`. Vier Mitglieder: `ta_ts_t02` und `ta_ts_t05`
+(long ab Score 0.2 bzw. 0.5, short spiegelbildlich, eine Woche gehalten),
+`ta_ts_t02_h4w` (Schwelle 0.2, vier Wochen in überlappenden Kohorten zu je einem Viertel
+des Kapitals) und `ta_xs_q5` (oberstes gegen unterstes Quintil). Universum, Gewichte,
+Kosten, Folds und Statistik sind byte-gleich zu P1.27; Manifest und Entscheidung sind
+`panel-manifest` und `panel-decision` unverändert, neu ist nur `trend-fold`.
+
+```powershell
+uv run trading-research panel-manifest --capture <perp> --output artifacts/trend/trend-walk-forward-<datum>-usdt-perps-1d-w1-v1.json --family-spec configs/trend-aggregate-panel-v1.json
+uv run trading-research trend-fold --capture <perp> --manifest <manifest> --family-spec configs/trend-aggregate-panel-v1.json --output artifacts/trend/trend-aggregate-<datum>-fold0-v1.json --registry artifacts/trend/metadata-trend-aggregate-v1.sqlite3 --fold-index 0
+uv run trading-research panel-decision --fold-report artifacts/trend/trend-aggregate-<datum>-fold0-v1.json --family-spec configs/trend-aggregate-panel-v1.json --output artifacts/trend/trend-aggregate-<datum>-decision-v1.json --registry artifacts/trend/metadata-trend-aggregate-v1.sqlite3
+```
+
+Jeder Fold wärmt die drei Sonntage vor seiner ersten Entscheidung auf (nur Gewichtsvektoren,
+keine Episoden), damit das Buch des Vier-Wochen-Mitglieds voll eröffnet statt drei Wochen
+lang hochzulaufen; der Report hält das als `warm_up_weeks` und
+`FOLD_OPENING_BOOK_WARMED_FROM_PRIOR_WEEKS` fest. Pro Episode kommen drei Extras dazu:
+`signalled_contracts`, `abstained_contracts` und `mean_score`.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.
