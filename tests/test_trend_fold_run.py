@@ -18,7 +18,7 @@ from tests.test_panel_fold_run import (
     small_config,
     zip_bytes,
 )
-from trading_bot import trend_fold_run as trend_fold_run_module
+from trading_bot import vector_fold_run as vector_fold_run_module
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_capture import PanelPayload, capture_panel
 from trading_bot.panel_config import load_panel_family_spec
@@ -37,13 +37,9 @@ from trading_bot.trend_config import (
     TrendFamilySpec,
     load_trend_family_spec,
 )
-from trading_bot.trend_fold_run import (
-    FOLD_WARMED_REASON_CODE,
-    TrendFoldError,
-    assemble_cohort_book,
-    run_trend_fold,
-)
+from trading_bot.trend_fold_run import FOLD_WARMED_REASON_CODE, TrendFoldError, run_trend_fold
 from trading_bot.trend_signals import build_trend_weight_vectors
+from trading_bot.vector_fold_run import assemble_cohort_book
 
 DAY_NS = 86_400_000_000_000
 WEEK_NS = 7 * DAY_NS
@@ -493,7 +489,7 @@ def test_warm_up_fills_the_opening_book_a_cold_fold_would_ramp_into(
         for episode in _episodes(_run(workspace), "ta_ts_t02_h4w")
     ]
 
-    monkeypatch.setattr(trend_fold_run_module, "warm_up_weeks_of", lambda spec: 0)
+    monkeypatch.setattr(vector_fold_run_module, "warm_up_weeks_of", lambda spec: 0)
     root, capture_root, config_path = workspace
     artifact = run_trend_fold(
         capture_root,

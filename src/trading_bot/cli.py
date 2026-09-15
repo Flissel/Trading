@@ -30,6 +30,7 @@ from trading_bot.carry_measured_costs import (
 )
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
+from trading_bot.funding_xs_fold_run import run_funding_xs_fold
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
 from trading_bot.panel_capture import capture_panel, repair_panel_capture
 from trading_bot.panel_config import load_family_spec
@@ -158,6 +159,14 @@ def main(arguments: list[str] | None = None) -> int:
     trend_fold.add_argument("--output", type=Path, required=True)
     trend_fold.add_argument("--registry", type=Path, required=True)
     trend_fold.add_argument("--fold-index", type=int, required=True)
+    funding_xs_fold = commands.add_parser("funding-xs-fold")
+    funding_xs_fold.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    funding_xs_fold.add_argument("--capture", type=Path, required=True)
+    funding_xs_fold.add_argument("--manifest", type=Path, required=True)
+    funding_xs_fold.add_argument("--family-spec", type=Path, required=True)
+    funding_xs_fold.add_argument("--output", type=Path, required=True)
+    funding_xs_fold.add_argument("--registry", type=Path, required=True)
+    funding_xs_fold.add_argument("--fold-index", type=int, required=True)
     journal_create = commands.add_parser("binance-cost-journal-create")
     journal_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_create.add_argument("--journal", type=Path, required=True)
@@ -420,6 +429,26 @@ def main(arguments: list[str] | None = None) -> int:
             family_spec_path=trend_paths[2],
             output_path=trend_paths[3],
             registry_path=trend_paths[4],
+            fold_index=parsed.fold_index,
+        )
+        return 0
+    if parsed.command == "funding-xs-fold":
+        workspace = parsed.workspace_root.resolve()
+        funding_xs_paths = (
+            parsed.capture.resolve(),
+            parsed.manifest.resolve(),
+            parsed.family_spec.resolve(),
+            parsed.output.resolve(),
+            parsed.registry.resolve(),
+        )
+        if any(not path.is_relative_to(workspace) for path in funding_xs_paths):
+            raise ValueError("funding cross-section fold paths must stay inside workspace")
+        run_funding_xs_fold(
+            funding_xs_paths[0],
+            manifest_path=funding_xs_paths[1],
+            family_spec_path=funding_xs_paths[2],
+            output_path=funding_xs_paths[3],
+            registry_path=funding_xs_paths[4],
             fold_index=parsed.fold_index,
         )
         return 0
