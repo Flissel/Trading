@@ -372,9 +372,14 @@ def run_vector_fold(
             # produce no weights while the universe itself was not too small
             # (too few rankable contracts to form both quintiles, every contract
             # inside a dead band, or -- for a four-week member -- four empty
-            # weeks behind it). The controls always have well-defined weights
-            # here and `no_trade`'s emptiness is a deliberate baseline, so a
-            # control is never marked.
+            # weeks behind it). An exit rule that zeroes every leg the member
+            # still holds is a fifth such cause, and it is marked the same way:
+            # the money rolls forward undeployed and there is no position to
+            # pool. `exit_rule_removals > 0` on the episode is what tells that
+            # case apart from a week the member simply could not signal in.
+            # The controls always have well-defined weights here and
+            # `no_trade`'s emptiness is a deliberate baseline, so a control is
+            # never marked.
             held_nothing[name].append(member is not None and not weights)
             entry = build_extras(name, weights, snapshot, decision_close_ns)
             if apply_exit is not None:

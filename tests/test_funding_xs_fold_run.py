@@ -549,13 +549,36 @@ def test_exit_member_drops_a_short_whose_trailing_week_turned_non_positive(
         _extras(exited)["signalled_contracts"]
     ) == Decimal(1)
 
+    # The defining semantic, over the whole fold: the removed leg's quarter of
+    # capital stays undeployed until the cohort holding it ages out, so gross
+    # recovers a quarter of a vector at a time rather than snapping back.
+    #
+    # At offset 137 all four retained cohorts (formed on the Sundays at offsets
+    # 116, 123, 130 and 137) had ranked C09 into the short quintile, so all four
+    # carry it zeroed and each deploys 0.75 of a vector: (4 x 0.75) / 4 = 0.75.
+    # At 144 the 116 cohort has aged out and the vector formed that day no
+    # longer ranks C09 short at all -- the flipped weeks have pulled its
+    # four-week funding below C07's -- so three zeroed vectors and one full one
+    # give (3 x 0.75 + 1) / 4 = 0.8125. At 151 the 123 cohort has aged out too:
+    # (2 x 0.75 + 2) / 4 = 0.875. Nothing is removed at either later decision,
+    # because C09 is no longer held anywhere but in the zeros already taken.
     for scenario in ("base", "adverse"):
-        assert _decimal(_extras(_episodes(document, "fx_q5_l4w_h4w_exit", scenario)[0])[
-            "exit_rule_removals"
-        ]) == Decimal(1)
+        exit_episodes = _episodes(document, "fx_q5_l4w_h4w_exit", scenario)
+        assert [_decimal(episode["gross_exposure"]) for episode in exit_episodes] == [
+            Decimal("0.75"),
+            Decimal("0.8125"),
+            Decimal("0.875"),
+        ]
+        assert [
+            _decimal(_extras(episode)["exit_rule_removals"]) for episode in exit_episodes
+        ] == [Decimal(1), Decimal(0), Decimal(0)]
+        # The sibling without the rule is fully invested throughout, and no
+        # other candidate ever sees a removal.
+        sibling = _episodes(document, "fx_q5_l4w_h4w", scenario)
+        assert [_decimal(episode["gross_exposure"]) for episode in sibling] == [Decimal(1)] * 3
         for name in ("fx_q5_l4w_h1w", "fx_q5_l4w_h4w", "fx_q5_l1w_h4w", "no_trade"):
-            episode = _episodes(document, name, scenario)[0]
-            assert _decimal(_extras(episode)["exit_rule_removals"]) == 0
+            for episode in _episodes(document, name, scenario):
+                assert _decimal(_extras(episode)["exit_rule_removals"]) == 0
 
 
 def test_warm_up_sunday_without_a_universe_contributes_nothing_but_resets_nothing(
