@@ -55,10 +55,12 @@ requiring its own full window or abstaining with 0):
 twelve computable votes has no score and is not rankable.
 
 **Windows are calendar spans** (P1.27 protocol section 16.1, inherited): an indicator over
-*n* days needs a close on every one of the *n* calendar days ending at *t* (ROC: the close at
-*t* and at *t − n* days; MACD: the complete 26-day span, after which both EMAs run over the
-contract's whole observed series). An indicator whose span has a missing day is absent, so
-the contract has no score at that decision. Clarified 2026-09-15 before any fold ran.
+*n* days needs a close on every one of its calendar days ending at *t* (SMA and breakout:
+the *n* days; ROC: the *n + 1* days from *t − n* to *t*; MACD: the score's whole 121-day
+span, after which both EMAs run over the contract's whole observed series). An indicator
+whose span has a missing day is absent, so the contract has no score at that decision —
+equivalently, a contract is scored only when its last 121 calendar days are complete.
+Clarified 2026-09-15 before any fold ran.
 
 All arithmetic is `Decimal`; EMAs use the standard `α = 2/(n+1)` recursion seeded with
 the first close of the contract's history; signs of an exact zero difference are 0.
@@ -137,5 +139,6 @@ A passing member becomes the first directional candidate with an edge and the ba
 which a learned gate may later be declared. A fail closes price-only directional work in
 this repository: the next directional declaration must bring a new information source
 (order-book, funding/basis regime, on-chain), not a new transformation of the same closes.
-No threshold moves either way. Sequencing: this family runs after P1.30's decision, so
-that the two records do not share a day.
+No threshold moves either way. Sequencing: this family is independent of P1.30 (different
+signal, different data leg) and may run before it; the two decision records are written on
+different days.
