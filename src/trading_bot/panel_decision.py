@@ -15,6 +15,7 @@ from trading_bot.evaluation import (
     block_bootstrap_mean_test,
 )
 from trading_bot.evaluation import _maximum_drawdown as _shared_maximum_drawdown
+from trading_bot.funding_xs_config import FundingXsFamilySpec
 from trading_bot.panel_config import PanelFamilySpec, load_family_spec
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE, verify_panel_fold_report
 from trading_bot.panel_statistics import (
@@ -96,8 +97,9 @@ class PanelDecisionError(RuntimeError):
 # `build_panel_decision` reads only `members`, `controls`, `statistics` and
 # `family_name` from the loaded spec -- fields every family model declares --
 # so any of them can be pooled through the same gates without this module
-# knowing anything else about the carry or trend aggregate families.
-FamilySpec = PanelFamilySpec | CarryFamilySpec | TrendFamilySpec
+# knowing anything else about the carry, trend aggregate or funding
+# cross-section families.
+FamilySpec = PanelFamilySpec | CarryFamilySpec | TrendFamilySpec | FundingXsFamilySpec
 
 # Control dominance (a member must beat both) is measured against the two
 # "no active view" baseline controls -- no-trade and a random assignment --

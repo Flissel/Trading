@@ -7,6 +7,7 @@ from pathlib import Path
 
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.carry_config import CarryFamilySpec
+from trading_bot.funding_xs_config import FundingXsFamilySpec
 from trading_bot.panel_capture import verify_panel_capture
 from trading_bot.panel_config import PanelFamilySpec, PanelFoldGeometry
 from trading_bot.panel_reader import PanelBar, load_panel_bars
@@ -95,7 +96,7 @@ def publish_panel_walk_forward(
     capture_root: Path,
     *,
     output_path: Path,
-    spec: PanelFamilySpec | CarryFamilySpec | TrendFamilySpec,
+    spec: PanelFamilySpec | CarryFamilySpec | TrendFamilySpec | FundingXsFamilySpec,
     family_spec_hash: str,
     hedge_capture_root: Path | None = None,
 ) -> PanelManifestArtifact:

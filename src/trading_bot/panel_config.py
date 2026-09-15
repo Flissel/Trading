@@ -11,6 +11,7 @@ from trading_bot.canonical import content_sha256
 
 if TYPE_CHECKING:
     from trading_bot.carry_config import CarryFamilySpec
+    from trading_bot.funding_xs_config import FundingXsFamilySpec
     from trading_bot.trend_config import TrendFamilySpec
 
 MEMBER_NAMES: tuple[str, ...] = (
@@ -138,7 +139,7 @@ def load_panel_family_spec(path: Path) -> tuple[PanelFamilySpec, str]:
     return spec, content_sha256(document)
 
 
-type FamilySpec = PanelFamilySpec | CarryFamilySpec | TrendFamilySpec
+type FamilySpec = PanelFamilySpec | CarryFamilySpec | TrendFamilySpec | FundingXsFamilySpec
 
 
 def load_family_spec(path: Path) -> tuple[FamilySpec, str]:
@@ -151,6 +152,7 @@ def load_family_spec(path: Path) -> tuple[FamilySpec, str]:
     """
     # local: avoids an import cycle
     from trading_bot.carry_config import MEMBER_NAMES_BY_FAMILY, CarryFamilySpec
+    from trading_bot.funding_xs_config import FundingXsFamilySpec
     from trading_bot.trend_config import TrendFamilySpec
 
     document = json.loads(path.read_text(encoding="utf-8"))
@@ -163,4 +165,6 @@ def load_family_spec(path: Path) -> tuple[FamilySpec, str]:
         return CarryFamilySpec.model_validate(document), content_sha256(document)
     if family_name == "trend_aggregate_panel_v1":
         return TrendFamilySpec.model_validate(document), content_sha256(document)
+    if family_name == "funding_xs_panel_v1":
+        return FundingXsFamilySpec.model_validate(document), content_sha256(document)
     return PanelFamilySpec.model_validate(document), content_sha256(document)
