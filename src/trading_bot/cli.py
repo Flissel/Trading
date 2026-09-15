@@ -22,6 +22,7 @@ from trading_bot.binance_cost_journal import (
     run_journal,
 )
 from trading_bot.carry_fold_run import run_carry_fold
+from trading_bot.carry_measured_costs import MeasuredCostError, declare_measured_cost_family
 from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
@@ -133,6 +134,11 @@ def main(arguments: list[str] | None = None) -> int:
     carry_fold.add_argument("--output", type=Path, required=True)
     carry_fold.add_argument("--registry", type=Path, required=True)
     carry_fold.add_argument("--fold-index", type=int, required=True)
+    carry_declare = commands.add_parser("carry-declare-measured")
+    carry_declare.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    carry_declare.add_argument("--receipt", type=Path, required=True)
+    carry_declare.add_argument("--base-config", type=Path, required=True)
+    carry_declare.add_argument("--output", type=Path, required=True)
     journal_create = commands.add_parser("binance-cost-journal-create")
     journal_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_create.add_argument("--journal", type=Path, required=True)
@@ -374,6 +380,8 @@ def main(arguments: list[str] | None = None) -> int:
             fold_index=parsed.fold_index,
         )
         return 0
+    if parsed.command == "carry-declare-measured":
+        return _carry_declare_measured(parsed)
     if parsed.command == "binance-cost-journal-create":
         return _binance_cost_journal_create(parsed)
     if parsed.command == "binance-cost-journal-run":
@@ -383,6 +391,32 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "binance-cost-journal-status":
         return _binance_cost_journal_status(parsed)
     raise AssertionError("unreachable command")
+
+
+def _carry_declare_measured(parsed: argparse.Namespace) -> int:
+    """Write the carry declaration a finalisation receipt's measured tiers imply.
+
+    2 is what a rerun cannot fix - a refused reading of the receipt, a base
+    declaration that is not v2, an output that already exists, a path outside
+    the workspace - and 1 anything else.
+    """
+    workspace: Path = parsed.workspace_root.resolve()
+    receipt: Path = parsed.receipt.resolve()
+    base: Path = parsed.base_config.resolve()
+    output: Path = parsed.output.resolve()
+    if any(not path.is_relative_to(workspace) for path in (receipt, base, output)):
+        return _journal_failure("measured declaration paths must stay inside workspace", 2)
+    try:
+        written, spec_hash = declare_measured_cost_family(
+            receipt_path=receipt, base_declaration_path=base, output_path=output
+        )
+    except MeasuredCostError as error:
+        return _journal_failure(f"{type(error).__name__}: {error}", 2)
+    except Exception as error:  # the operator reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", 1)
+    print(f"measured carry declaration written: {written}")
+    print(f"family spec hash: {spec_hash}")
+    return 0
 
 
 def _binance_cost_journal_create(parsed: argparse.Namespace) -> int:

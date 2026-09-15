@@ -272,6 +272,18 @@ uv run trading-research binance-cost-journal-finalize --journal data/cost-journa
 Exit 2 bedeutet gestoppt. `status` ist nur lesend und der einzige sichere Blick auf ein
 laufendes Journal.
 
+Aus der Quittung wird `funding_carry_panel_v3` erklärt — Basis-Tier = `tier_p50_of_p50`
+des schlechteren Beins bei 5 000 USDT, Adverse-Tier = `tier_p50_of_p90` bei 50 000 USDT,
+je auf ganze Basispunkte aufgerundet (Spec 5). Alles andere ist die v2-Erklärung
+unverändert; die Quittung wird gegen ihren eigenen Hash geprüft und zitiert:
+
+```powershell
+uv run trading-research carry-declare-measured --receipt artifacts/cost/binance-carry-v1-receipt.json --base-config configs/funding-carry-panel-v2.json --output configs/funding-carry-panel-v3.json
+```
+
+Exit 2 heißt: so nicht erklärbar (Quittung ohne Median, falsche Basis-Erklärung,
+Ausgabe existiert bereits). Die Ausgabe ist unveränderlich wie die Quittung.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.
