@@ -385,10 +385,12 @@ Acceptance:
 
 Declare `funding_carry_panel_v3` only from the Binance cost journal's finalisation receipt
 (`docs/superpowers/specs/2026-09-12-binance-cost-journal-design.md`, section 5 fixes the
-only admissible reading: base slippage tiers = `tier_p50_of_p50` of the worse leg at
-5,000 USDT, adverse = `tier_p50_of_p90` at 50,000 USDT, rounded up to whole basis points,
-receipt hash cited). The journal `data/cost-journals/binance-carry-v1` was created and
-launched on 2026-09-12 (15 pairs, 30 instruments, 11,000 rounds at 61 s).
+only admissible reading for a declaration without a `capital` block: base slippage tiers =
+`tier_p50_of_p50` of the worse leg at 5,000 USDT, adverse = `tier_p50_of_p90` at
+50,000 USDT, rounded up to whole basis points, receipt hash cited; section 5.1, added
+2026-09-16, fixes a second, capital-declared reading for a declaration that carries one —
+see P1.33). The journal `data/cost-journals/binance-carry-v1` was created and launched on
+2026-09-12 (15 pairs, 30 instruments, 11,000 rounds at 61 s).
 
 Acceptance:
 
@@ -472,6 +474,53 @@ Acceptance:
 - the decision record `P1_32_DECISION_<date>.md` records every member, including the
   rejected ones, with turnover and deflated Sharpe, and states whether the funding
   cross-section pays its own turnover under these rules;
+- the final holdout stays closed.
+
+### P1.33 Funding carry v4 (declared capital, slot book)
+
+Evaluate the pre-registered family `funding_carry_panel_v4` and its measured form
+`funding_carry_panel_v4_measured` (the evaluated family) — the four members
+`carry_s10_l4w_h13w`, `carry_s10_l4w_h13w_exit`, `carry_s10_l4w_h26w` and
+`carry_s10_l4w_h26w_exit` — a spot-hedged funding carry declared against the book the user
+would actually run: a 10,000 USDT book in ten equal pair slots, at most 500 USDT per leg
+per order, slots filled from the top decile of eligible pairs by trailing four-week
+funding and held up to 13 or 26 weeks, two members additionally vacating a slot when its
+pair's trailing one-week funding turns non-positive, under
+`docs/superpowers/specs/2026-09-16-funding-carry-v4-small-book-design.md`, the journal
+spec's section 5.1, and the evaluation protocol as of 2026-09-16. Independent of P1.30;
+the decision records are written on different days.
+
+Acceptance:
+
+- the Binance cost journal's finalisation receipt must exist and verify; the chain
+  refuses to declare or fold without it;
+- the base declaration carries a `capital` block with its four frozen values —
+  `book_usdt` 10,000, `pair_slots` 10, `per_leg_notional_usdt` 500, `fee_tier`
+  `standard_taker_no_bnb` — and the per-leg notional equals `book_usdt / (2 × pair_slots)`;
+- the measured declaration's four slippage values are exactly section 5.1's reading of the
+  receipt at the declared capital — base `tier_p50_of_p50` of the worse leg at 500 USDT,
+  adverse `tier_p50_of_p90` at 5,000 USDT, each rounded up to the next whole basis point —
+  and `carry-verify-measured` re-derives all four from the receipt and the base
+  declaration;
+- the slot mechanics run as declared: a slot releases when its pair has been held `H`
+  weeks or has lost a leg's bar; the two exit members additionally release a slot whose
+  pair's trailing one-week funding is non-positive or absent; empty slots fill from the
+  top decile of paying pairs by trailing four-week funding, skipping pairs already held
+  and, for the exit members, pairs whose trailing one-week funding is non-positive or
+  absent; a pair released and refilled in the same decision keeps its weights and is
+  charged no turnover;
+- no warm-up: every slot opens empty at a fold's first decision (`warm_up_weeks` 0);
+- each episode carries the twelve extras — the eight carry extras plus `filled_slots`,
+  `slot_fills`, `slot_releases` and `no_fill` — and each fold, candidate and scenario
+  carries `uncharged_final_exit_cost`;
+- P1.28's and P1.29's cohort path stays reproducible across the fold runner's slot-mode
+  addition: fold 0 of the v1 fixture reproduces
+  `tests/fixtures/carry_v1_fold0_expected.json` digit for digit, only `code_hash` and
+  `report_hash` having moved;
+- the decision record `P1_33_DECISION_<date>.md` records every member, including the
+  rejected ones, with turnover and deflated Sharpe, subtracts `uncharged_final_exit_cost`
+  from any member that passes narrowly, and states whether the small-book carry pays its
+  own execution at the declared fee tier;
 - the final holdout stays closed.
 
 ## Explicitly deferred

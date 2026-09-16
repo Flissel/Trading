@@ -343,6 +343,58 @@ festgenagelt. Aufwärmen und `warm_up_weeks` wie oben; pro Episode kommen vier E
 dazu: `signalled_contracts`, `funding_collected` (das Gegenteil der Funding-Kosten der
 Episode), `exit_rule_removals` und `mean_score`.
 
+### Funding-Carry v4, kleines Buch (P1.33)
+
+Fünfte Panel-Familie und die erste mit einer erklärten Kapitalgrenze: derselbe
+Spot/Perpetual-Carry wie P1.28/P1.29, aber auf das Buch erklärt, das tatsächlich gefahren
+würde — unter 10 000 USDT, in Orders von höchstens 500 USDT pro Bein statt der rund
+zweihundert gleichzeitigen Paarpositionen von v2. `configs/funding-carry-panel-v4.json`
+erklärt dafür einen `capital`-Block (`book_usdt` 10 000, `pair_slots` 10,
+`per_leg_notional_usdt` 500, `fee_tier` Standard-Taker ohne BNB); die gemessene Form
+`funding_carry_panel_v4_measured` liest die Journal-Quittung nach der neuen Regel in
+Abschnitt 5.1 der Journal-Spec: Basis-Tier `tier_p50_of_p50` des schlechteren Beins bei
+500 USDT, Adverse-Tier `tier_p50_of_p90` bei 5 000 USDT, je auf ganze Basispunkte
+aufgerundet, `carry-verify-measured` leitet beide Werte aus Quittung und Basis-Erklärung
+neu ab.
+
+Vier Mitglieder — `carry_s10_l4w_h13w`, `carry_s10_l4w_h13w_exit`, `carry_s10_l4w_h26w`
+und `carry_s10_l4w_h26w_exit` — testen 13 und 26 Wochen Haltedauer mit und ohne
+Ausstiegsregel; drei Kontrollen begleiten sie: `no_trade`, `random_pairs` (dasselbe
+Slot-Buch, in der zufälligen Reihenfolge von P1.28s Kontrolle statt nach Funding befüllt)
+und, nur als Kontext, P1.28s `all_pairs_ew`, das beim erklärten Kapital nicht handelbar
+wäre.
+
+Statt Wochen-Kohorten führt die Familie ein Slot-Buch: zehn feste Plätze, die frei werden,
+sobald ihr Paar `H` Wochen gehalten wurde oder ein Bein seinen Balken verliert (die beiden
+Exit-Mitglieder räumen zusätzlich, sobald das nachlaufende Ein-Wochen-Funding eines
+gehaltenen Paars nicht mehr positiv ist), und die aus dem obersten Dezil zahlender Paare
+neu befüllt werden — gehaltene Paare und, bei den Exit-Mitgliedern, zuletzt nicht
+zahlende Paare übersprungen; ein im selben Schritt frei- und wieder befülltes Paar behält
+seine Gewichte und löst keinen Turnover aus. Es gibt kein Warm-up: jeder Fold startet mit
+leerem Buch (`warm_up_weeks` 0).
+
+Pro Episode kommen vier neue Extras hinzu — `filled_slots`, `slot_fills`,
+`slot_releases` und `no_fill` — zu den acht, die die Carry-Familien schon melden; pro
+Kandidat und Szenario meldet jeder Fold zusätzlich `uncharged_final_exit_cost`, weil das
+Slot-Buch ohne aufgewärmte Kohorten am Fold-Ende einen größeren ungeladenen Ausstieg
+zurücklässt als v2.
+
+```powershell
+uv run trading-research carry-declare-measured --receipt artifacts/cost/binance-carry-v1-receipt.json --base-config configs/funding-carry-panel-v4.json --output configs/funding-carry-panel-v4-measured.json
+uv run trading-research carry-verify-measured --receipt artifacts/cost/binance-carry-v1-receipt.json --spec configs/funding-carry-panel-v4-measured.json --base-config configs/funding-carry-panel-v4.json
+uv run trading-research panel-manifest --capture <perp> --hedge-capture <spot> --output artifacts/carry/carry-v4-walk-forward-usdt-pairs-1d-w1-v1.json --family-spec configs/funding-carry-panel-v4-measured.json
+uv run trading-research carry-fold --capture <perp> --hedge-capture <spot> --manifest <manifest> --family-spec configs/funding-carry-panel-v4-measured.json --output artifacts/carry/funding-carry-v4-fold0-v1.json --registry artifacts/carry/metadata-funding-carry-v4.sqlite3 --fold-index 0
+uv run trading-research panel-decision --fold-report artifacts/carry/funding-carry-v4-fold0-v1.json --family-spec configs/funding-carry-panel-v4-measured.json --output artifacts/carry/funding-carry-v4-decision-v1.json --registry artifacts/carry/metadata-funding-carry-v4.sqlite3
+```
+
+Die Kette läuft neunmal (`--fold-index 0` bis `8`) und mündet in eine `panel-decision`
+über alle Folds; Manifest, Folds, Entscheidung und Registry heißen
+`artifacts/carry/carry-v4-walk-forward-usdt-pairs-1d-w1-v1.json`,
+`artifacts/carry/funding-carry-v4-fold<i>-v1.json`,
+`artifacts/carry/funding-carry-v4-decision-v1.json` und
+`artifacts/carry/metadata-funding-carry-v4.sqlite3`. Kein Fold ist gelaufen; Ergebnis
+folgt als `P1_33_DECISION_<date>.md`.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.
