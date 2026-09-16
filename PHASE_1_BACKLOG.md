@@ -482,7 +482,7 @@ Evaluate the pre-registered family `funding_carry_panel_v4` and its measured for
 `funding_carry_panel_v4_measured` (the evaluated family) — the four members
 `carry_s10_l4w_h13w`, `carry_s10_l4w_h13w_exit`, `carry_s10_l4w_h26w` and
 `carry_s10_l4w_h26w_exit` — a spot-hedged funding carry declared against the book the user
-would actually run: a 10,000 USDT book in ten equal pair slots, at most 500 USDT per leg
+would actually run: a book of at most 10 000 USDT in ten equal pair slots, at most 500 USDT per leg
 per order, slots filled from the top decile of eligible pairs by trailing four-week
 funding and held up to 13 or 26 weeks, two members additionally vacating a slot when its
 pair's trailing one-week funding turns non-positive, under

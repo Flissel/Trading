@@ -124,9 +124,12 @@ No hurdle member: P1.29 showed the top decile already clears twice the round tri
 - `no_trade`;
 - `random_pairs` (dominance): the same slot book, `H` 13 (the shortest member's), no exit
   rule, slots filled in the seeded random order of P1.28's control instead of by funding;
-- `all_pairs_ew` (context only): P1.28's control unchanged — every paying pair, equal
-  weight, weekly cohorts held 13 weeks. It is not executable at the declared capital and is
-  reported as context, never as a gate.
+- `all_pairs_ew` (context only): P1.28's construction — every paying pair, equal weight,
+  weekly cohorts held the shortest member's 13 weeks — run **without warm-up** under this
+  family (section 3.3 sets `warm_up_weeks` 0 for the whole family), so its book ramps 1/13
+  per week at every fold start; it is **not comparable** to P1.28's or P1.30's warmed
+  `all_pairs_ew`. It is not executable at the declared capital and is reported as context,
+  never as a gate. (corrected 2026-09-16, before any fold ran)
 
 ### 4.4 Costs
 
@@ -147,8 +150,8 @@ over `no_trade` and `random_pairs` in both scenarios.
 
 ### 4.6 Reported extras
 
-Per episode: `filled_slots`, `slot_fills`, `slot_releases` (age-outs), `exit_rule_removals`,
-`no_fill` (0/1); per fold, member and scenario: `uncharged_final_exit_cost`.
+Per episode: `filled_slots`, `slot_fills`, `slot_releases` (age-outs and lost-bar releases),
+`exit_rule_removals`, `no_fill` (0/1); per fold, member and scenario: `uncharged_final_exit_cost`.
 
 ## 5. Modules
 
