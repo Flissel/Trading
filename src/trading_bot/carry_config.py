@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from trading_bot.canonical import content_sha256
-from trading_bot.cost_evidence_rule import DECLARATION_RULE
+from trading_bot.cost_evidence_rule import CAPITAL_DECLARATION_RULE, DECLARATION_RULE
 from trading_bot.panel_config import PanelFoldGeometry, PanelStatistics
 
 MEMBER_NAMES: tuple[str, ...] = ("carry_l1w_h4w", "carry_l4w_h4w", "carry_l4w_h13w")
@@ -175,11 +175,14 @@ class CostEvidenceReference(_Frozen):
     repeats the rule the receipt carries, so the declaration says where every
     basis point came from without its reader holding the journal.
 
-    The rule is the one sentence spec section 5 fixed before any number existed
-    (``cost_evidence_rule.DECLARATION_RULE``, the same string the receipt is
-    published under): a declaration citing any other reading is refused here,
-    and ``carry_measured_costs.verify_measured_declaration`` re-derives every
-    number the citation stands for from the receipt itself.
+    The rule is one of the two sentences spec sections 5 and 5.1 fixed before
+    any number existed - ``cost_evidence_rule.DECLARATION_RULE`` for a
+    declaration without a ``capital`` block and ``CAPITAL_DECLARATION_RULE``
+    for one that carries one, each the same string the receipt is published
+    under: a declaration citing any other reading is refused here, and
+    ``carry_measured_costs.verify_measured_declaration`` re-derives every
+    number the citation stands for from the receipt itself, including which of
+    the two rules the declaration's own capital selects.
     """
 
     receipt_hash: str
@@ -205,8 +208,8 @@ class CostEvidenceReference(_Frozen):
     @field_validator("rule")
     @classmethod
     def validate_rule(cls, value: str) -> str:
-        if value != DECLARATION_RULE:
-            raise ValueError("the cited rule is spec section 5's sentence, verbatim")
+        if value not in (DECLARATION_RULE, CAPITAL_DECLARATION_RULE):
+            raise ValueError("the cited rule is spec section 5's or 5.1's sentence, verbatim")
         return value
 
 

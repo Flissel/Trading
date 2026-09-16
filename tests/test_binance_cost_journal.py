@@ -17,6 +17,7 @@ from tests.test_panel_fold_run import DAY_MS, EPOCH_DAY_2020, MONTH_START_DAY
 from trading_bot import binance_cost_journal as journal_module
 from trading_bot.binance_cost_journal import (
     ALLOWED_HOSTS,
+    CAPITAL_DECLARATION_RULE,
     DECLARATION_RULE,
     DEPTH_LIMIT,
     ELIGIBILITY_NOTIONAL,
@@ -1554,6 +1555,14 @@ def spec_declaration_sentence() -> str:
     return " ".join(text[start : text.index("\n\n", start)].split())
 
 
+def spec_capital_declaration_sentence() -> str:
+    """The rule as spec section 5.1 writes it, unwrapped to one line."""
+    text = SPEC_PATH.read_text(encoding="utf-8")
+    anchor = "(declared 2026-09-16, before the receipt exists):**"
+    start = text.index(anchor) + len(anchor)
+    return " ".join(text[start : text.index("\n\n", start)].split())
+
+
 def test_the_receipt_carries_hand_computed_quantiles_and_depth_counts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1726,6 +1735,25 @@ def test_the_declaration_rule_is_the_spec_s_sentence_verbatim(tmp_path: Path) ->
         )
 
 
+def test_the_capital_declaration_rule_is_the_spec_s_sentence_verbatim(tmp_path: Path) -> None:
+    """Spec 5.1's rung reading is bound the same way spec 5's fixed reading is."""
+    journal = journal_with_rounds(tmp_path, rounds=1, fetcher=LadderVenue())
+    receipt, _ = finalized_receipt(tmp_path, journal)
+    rule = spec_capital_declaration_sentence()
+    assert rule.startswith("a capital-declared family sets ")
+    assert rule.endswith("with its declared capital.")
+    assert rule == CAPITAL_DECLARATION_RULE
+    assert receipt.capital_declaration_rule == rule
+    # No other rule may be published under this version.
+    with pytest.raises(ValidationError):
+        FinalizationReceipt.model_validate(
+            {
+                **read_document(tmp_path / "receipt.json"),
+                "capital_declaration_rule": "round down",
+            }
+        )
+
+
 def test_a_published_receipt_is_immutable(tmp_path: Path) -> None:
     journal = journal_with_rounds(tmp_path, rounds=2, fetcher=LadderVenue())
     _, output = finalized_receipt(tmp_path, journal)
@@ -1815,6 +1843,7 @@ def test_the_cli_creates_runs_and_finalises_a_journal(
     assert f"receipt content hash: {document['content_hash']}" in printed
     receipt = FinalizationReceipt.model_validate(document)
     assert receipt.declaration_rule == spec_declaration_sentence()
+    assert receipt.capital_declaration_rule == spec_capital_declaration_sentence()
     assert receipt.segment_count == rounds
     assert receipt.segments_beyond_head == 0
     assert len(receipt.instruments) == 20

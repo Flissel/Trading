@@ -38,7 +38,12 @@ from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.carry_config import CarryUniverseRules, load_carry_family_spec
 from trading_bot.carry_signals import WEEK_NS
 from trading_bot.carry_universe import select_pair_universe
-from trading_bot.cost_evidence_rule import DECLARATION_RULE as DECLARATION_RULE  # re-export
+from trading_bot.cost_evidence_rule import (
+    CAPITAL_DECLARATION_RULE as CAPITAL_DECLARATION_RULE,  # re-export
+)
+from trading_bot.cost_evidence_rule import (
+    DECLARATION_RULE as DECLARATION_RULE,  # re-export
+)
 from trading_bot.depth_adapters import (
     DepthPayloadError,
     _decimal_string,
@@ -583,8 +588,10 @@ class FinalizationReceipt(_Frozen):
     It binds the journal it was taken from (the spec hash, the chain head's own
     hash and the number of segments), repeats the declared fees the journal
     never measured, carries the sample's statistics and the tier medians, and
-    states in ``declaration_rule`` the one use a carry declaration may make of
-    it. Anything else on top of these numbers is not a reading of this receipt.
+    states in ``declaration_rule`` and ``capital_declaration_rule`` the two uses
+    a carry declaration may make of it - spec 5's fixed reading and spec 5.1's
+    reading for a declaration with a ``capital`` block. Anything else on top of
+    these numbers is not a reading of this receipt.
 
     ``segment_count`` is exactly the number of segments the statistics cover -
     the ones the chain head bound - and ``segments_beyond_head`` how many
@@ -613,6 +620,7 @@ class FinalizationReceipt(_Frozen):
     instruments: tuple[InstrumentStatistics, ...]
     tiers: tuple[TierStatistics, ...]
     declaration_rule: str
+    capital_declaration_rule: str
     content_hash: str
 
     @field_validator("spec_hash", "chain_head_hash", "content_hash")
@@ -652,6 +660,13 @@ class FinalizationReceipt(_Frozen):
     def validate_declaration_rule(cls, value: str) -> str:
         if value != DECLARATION_RULE:
             raise ValueError("a receipt carries spec section 5's declaration rule verbatim")
+        return value
+
+    @field_validator("capital_declaration_rule")
+    @classmethod
+    def validate_capital_declaration_rule(cls, value: str) -> str:
+        if value != CAPITAL_DECLARATION_RULE:
+            raise ValueError("a receipt carries spec section 5.1's declaration rule verbatim")
         return value
 
     @model_validator(mode="after")
@@ -1518,6 +1533,7 @@ def finalize_journal(
             "instruments": [item.model_dump(mode="json") for item in instruments],
             "tiers": [item.model_dump(mode="json") for item in tiers],
             "declaration_rule": DECLARATION_RULE,
+            "capital_declaration_rule": CAPITAL_DECLARATION_RULE,
         }
         receipt = FinalizationReceipt.model_validate(
             {**material, "content_hash": content_sha256(material)}

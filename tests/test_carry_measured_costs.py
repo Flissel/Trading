@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from tests.carry_fixtures import small_carry_v4_config
 from tests.test_binance_cost_journal import (
     LadderVenue,
     finalized_receipt,
@@ -16,14 +17,20 @@ from tests.test_binance_cost_journal import (
     lower_the_eligibility_floors,
     read_document,
 )
-from trading_bot.binance_cost_journal import DECLARATION_RULE
+from trading_bot.binance_cost_journal import (
+    CAPITAL_DECLARATION_RULE,
+    DECLARATION_RULE,
+    FinalizationReceipt,
+)
 from trading_bot.carry_config import (
     MEMBER_NAMES_BY_FAMILY,
+    CarryCapital,
     CarryFamilySpec,
     load_carry_family_spec,
 )
 from trading_bot.carry_measured_costs import (
     MeasuredCostError,
+    declaration_notionals,
     declare_measured_cost_family,
     measured_slippage_tiers,
     verify_measured_declaration,
@@ -34,6 +41,7 @@ from trading_bot.panel_config import load_family_spec
 
 CONFIG_V1 = Path("configs/funding-carry-panel-v1.json")
 CONFIG_V2 = Path("configs/funding-carry-panel-v2.json")
+CONFIG_V4 = Path("configs/funding-carry-panel-v4.json")
 ROUNDS = 8
 LEGS_PER_TIER_AND_MARKET = 4
 # Four legs a tier and market, so every tier median clears the receipt's
@@ -104,6 +112,31 @@ def declared_family(
         output_path=tmp_path / "funding-carry-panel-v3.json",
     )
     return receipt, output, spec_hash
+
+
+def declared_v4_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict[str, object], Path, str]:
+    """The receipt, the v4-measured document it declares and that document's spec hash."""
+    receipt = measured_receipt(tmp_path, monkeypatch)
+    output, spec_hash = declare_measured_cost_family(
+        receipt_path=tmp_path / "receipt.json",
+        base_declaration_path=CONFIG_V4,
+        output_path=tmp_path / "funding-carry-panel-v4-measured.json",
+    )
+    return receipt, output, spec_hash
+
+
+def slot_capital(*, per_leg: str, slots: int = 10) -> CarryCapital:
+    """A capital block sized so `per_leg` and `slots` are its own arithmetic."""
+    return CarryCapital.model_validate(
+        {
+            "book_usdt": str(Decimal(per_leg) * 2 * slots),
+            "pair_slots": slots,
+            "per_leg_notional_usdt": per_leg,
+            "fee_tier": "standard_taker_no_bnb",
+        }
+    )
 
 
 def write_json(path: Path, document: dict[str, object]) -> Path:
@@ -258,6 +291,49 @@ def test_a_document_that_is_not_a_receipt_refuses(
     document = measured_receipt(tmp_path, monkeypatch)
     with pytest.raises(MeasuredCostError, match="not a finalisation receipt"):
         measured_slippage_tiers({**document, "declaration_rule": "round down"})
+
+
+def test_declaration_notionals_without_capital_reads_five_and_fifty_thousand(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = measured_receipt(tmp_path, monkeypatch)
+    receipt = FinalizationReceipt.model_validate(document)
+    assert declaration_notionals(receipt, capital=None) == ("5000", "50000")
+
+
+def test_declaration_notionals_with_capital_reads_the_ladder_rung_at_or_above_the_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """500 per leg picks the 500/5 000 rung; 1 250 per leg is above 500, so it
+    lands on the same 5 000/50 000 rung a declaration without capital reads."""
+    document = measured_receipt(tmp_path, monkeypatch)
+    receipt = FinalizationReceipt.model_validate(document)
+    assert declaration_notionals(receipt, capital=slot_capital(per_leg="500")) == (
+        "500", "5000",
+    )
+    assert declaration_notionals(
+        receipt, capital=slot_capital(per_leg="1250", slots=4)
+    ) == ("5000", "50000")
+
+
+def test_declaration_notionals_refuses_an_order_above_the_ladder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = measured_receipt(tmp_path, monkeypatch)
+    receipt = FinalizationReceipt.model_validate(document)
+    with pytest.raises(MeasuredCostError, match="60000"):
+        declaration_notionals(receipt, capital=slot_capital(per_leg="60000", slots=1))
+
+
+def test_declaration_notionals_refuses_a_ladder_without_the_tenfold_rung(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """5 000 is on the ladder but ten times it, 50 000, is not: refuse rather
+    than read a rung nobody measured."""
+    document = measured_receipt(tmp_path, monkeypatch)
+    truncated = FinalizationReceipt.model_validate({**document, "notionals": ["500", "5000"]})
+    with pytest.raises(MeasuredCostError, match="50000"):
+        declaration_notionals(truncated, capital=slot_capital(per_leg="5000", slots=1))
 
 
 def test_the_declared_family_carries_the_measured_tiers_and_its_evidence(
@@ -643,3 +719,133 @@ def test_the_cli_verifies_a_declaration_and_stops_on_an_edited_one(
         "--receipt", str(tmp_path / "receipt.json"), "--spec", str(CONFIG_V2.resolve()),
         "--base-config", str(base),
     ]) == 2
+
+
+# --- Task 2: capital-declared reading (spec 5.1) --------------------------------------
+
+
+def test_the_declared_v4_family_carries_the_measured_tiers_and_its_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v4 base reads 500 (base) and 5 000 (adverse): ladder(500) and ten times it."""
+    receipt, output, spec_hash = declared_v4_family(tmp_path, monkeypatch)
+    spec, loaded_hash = load_family_spec(output)
+    assert isinstance(spec, CarryFamilySpec)
+    assert (spec_hash, len(spec_hash)) == (loaded_hash, 64)
+    assert spec.family_name == "funding_carry_panel_v4_measured"
+    assert tuple(item.name for item in spec.members) == MEMBER_NAMES_BY_FAMILY[
+        "funding_carry_panel_v4"
+    ]
+    assert spec.costs.base.slippage_bps_per_side_tier_one == Decimal("800")
+    assert spec.costs.base.slippage_bps_per_side_tier_two == Decimal("1200")
+    assert spec.costs.adverse.slippage_bps_per_side_tier_one == Decimal("1600")
+    assert spec.costs.adverse.slippage_bps_per_side_tier_two == Decimal("2400")
+    v4_document = json.loads(CONFIG_V4.read_text(encoding="utf-8"))
+    assert read_document(output)["capital"] == v4_document["capital"]
+    assert spec.capital is not None
+    assert spec.capital.per_leg_notional_usdt == Decimal("500")
+    evidence = spec.cost_evidence
+    assert evidence is not None
+    assert evidence.receipt_hash == receipt["content_hash"]
+    assert evidence.journal_spec_hash == receipt["spec_hash"]
+    assert evidence.base_notional == Decimal("500")
+    assert evidence.adverse_notional == Decimal("5000")
+    assert evidence.rule == CAPITAL_DECLARATION_RULE
+
+
+def test_a_genuine_v4_declaration_verifies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, spec_hash = declared_v4_family(tmp_path, monkeypatch)
+    verified = verify_measured_declaration(
+        receipt_path=tmp_path / "receipt.json",
+        spec_path=output,
+        base_declaration_path=CONFIG_V4,
+    )
+    assert verified == spec_hash
+
+
+def test_v4_verification_refuses_an_edited_slippage_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_v4_family(tmp_path, monkeypatch)
+    edited = edited_cost_table(
+        output, tmp_path / "cheaper-v4.json", name="base",
+        slippage_bps_per_side_tier_one="799",
+    )
+    with pytest.raises(MeasuredCostError, match="slippage_bps_per_side_tier_one"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V4,
+        )
+
+
+def test_v4_verification_refuses_a_cited_notional_the_rule_does_not_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, output, _ = declared_v4_family(tmp_path, monkeypatch)
+    edited = edited_evidence(output, tmp_path / "other-notional-v4.json", base_notional="5000")
+    with pytest.raises(MeasuredCostError, match="notionals the rule does not fix"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V4,
+        )
+
+
+def test_v4_verification_refuses_the_v3_rule_text_in_a_v4_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v3 sentence is a valid rule in general, but not the one this capital selects."""
+    _, output, _ = declared_v4_family(tmp_path, monkeypatch)
+    edited = edited_evidence(output, tmp_path / "v3-rule-v4.json", rule=DECLARATION_RULE)
+    with pytest.raises(MeasuredCostError, match="capital does not select"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V4,
+        )
+
+
+def test_a_v4_measured_declaration_whose_base_was_v2_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A measured declaration's family name must be its own base's mapped name."""
+    _, output, _ = declared_v4_family(tmp_path, monkeypatch)
+    with pytest.raises(MeasuredCostError, match="funding_carry_panel_v3 declaration"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=output,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
+def test_the_cli_round_trips_the_v4_fixture_base(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """1 250 per leg lands on the same 5 000/50 000 rung `declared_family` exercises."""
+    measured_receipt(tmp_path, monkeypatch)
+    base = small_carry_v4_config(tmp_path)
+    output = tmp_path / "funding-carry-panel-v4-measured.json"
+    declare_arguments = [
+        "carry-declare-measured", "--workspace-root", str(tmp_path),
+        "--receipt", str(tmp_path / "receipt.json"), "--base-config", str(base),
+        "--output", str(output),
+    ]
+    assert main(declare_arguments) == 0
+    spec, spec_hash = load_family_spec(output)
+    assert isinstance(spec, CarryFamilySpec)
+    assert spec.family_name == "funding_carry_panel_v4_measured"
+    printed = capsys.readouterr().out
+    assert str(output) in printed
+    assert f"family spec hash: {spec_hash}" in printed
+    verify_arguments = [
+        "carry-verify-measured", "--workspace-root", str(tmp_path),
+        "--receipt", str(tmp_path / "receipt.json"), "--spec", str(output),
+        "--base-config", str(base),
+    ]
+    assert main(verify_arguments) == 0
+    printed = capsys.readouterr().out
+    assert str(output) in printed
+    assert f"family spec hash: {spec_hash}" in printed
