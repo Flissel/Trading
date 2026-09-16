@@ -120,22 +120,29 @@ the observation count and its own hash; it is immutable.
 family sets `slippage_bps_per_side_tier_<t>` in its base table to `tier_p50_of_p50` of the
 *worse leg* at 5 000 USDT and in its adverse table to `tier_p50_of_p90` at 50 000 USDT,
 rounded **up** to the next whole basis point, and cites the receipt hash. No other
-reading of the receipt is admissible for a declaration, except the one section 5.1 adds.
+reading of the receipt is admissible for a declaration.
 
 ### 5.1 Capital-declared reading (added 2026-09-16, before the receipt exists)
 
-A family that declares its capital — a book of at most `C` USDT in `n` equal pair slots, so
-at most `N = C / (2 n)` USDT per leg per order — reads the receipt at the smallest ladder
-notional that is at least `N`, `ladder(N)`: it sets `slippage_bps_per_side_tier_<t>` in its
-base table to `tier_p50_of_p50` of the *worse leg* at `ladder(N)` and in its adverse table to
-`tier_p50_of_p90` at `10 × ladder(N)`, rounded **up** to the next whole basis point, and cites
-the receipt hash together with its declared capital. For the v4 declaration (`C` 10 000,
-`n` 10, `N` 500) that is 500 and 5 000 USDT. The rule copies section 5's structure — base
-p50 at the order notional, adverse p90 at ten times it — and its notional follows from the
-declared capital. Disclosure: an interim, read-only preview of the tier medians at 3 580
-rounds was taken on 2026-09-15, before this addendum; nothing in the rule was chosen from
-it (see `2026-09-16-funding-carry-v4-small-book-design.md`, section 2). The receipt binds
-this sentence verbatim beside section 5's.
+Section 5's closing sentence stands for a declaration without a `capital` block. For a
+declaration that carries one — a book of at most `C` USDT in `n` equal pair slots, so at
+most `N = C / (2 n)` USDT per leg per order — this subsection fixes the one admissible
+reading, before the receipt exists; `ladder(N)` is the smallest notional the receipt read
+that is at least `N`. The receipt binds the sentence below verbatim beside section 5's.
+
+**How a capital-declared family may use it (declared 2026-09-16, before the receipt exists):**
+a capital-declared family sets `slippage_bps_per_side_tier_<t>` in its base table to
+`tier_p50_of_p50` of the *worse leg* at the smallest ladder notional that is at least its
+per-leg order notional and in its adverse table to `tier_p50_of_p90` at ten times that
+notional, rounded **up** to the next whole basis point, and cites the receipt hash together
+with its declared capital.
+
+For the v4 declaration (`C` 10 000, `n` 10, `N` 500) that is 500 and 5 000 USDT. The rule
+copies section 5's structure — base p50 at the order notional, adverse p90 at ten times it —
+and its notional follows from the declared capital. Disclosure: an interim, read-only preview
+of the tier medians at 3 580 rounds was taken on 2026-09-15, before this addendum; nothing in
+the rule was chosen from it (see `2026-09-16-funding-carry-v4-small-book-design.md`,
+section 2).
 
 ## 6. Modules
 
