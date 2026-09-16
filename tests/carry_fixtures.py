@@ -12,6 +12,7 @@ import json
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
+from typing import cast
 
 from tests.test_panel_fold_run import (
     DAY_MS,
@@ -248,6 +249,28 @@ def small_carry_v2_config(tmp_path: Path) -> Path:
     hurdle -- under exactly the reductions `small_carry_config` applies."""
     path = tmp_path / "small-carry-v2.json"
     document = _reduced(Path("configs/funding-carry-panel-v2.json"))
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
+def small_carry_v4_config(tmp_path: Path) -> Path:
+    """The frozen v4 carry declaration -- four slots on a 10,000 USDT book,
+    holds shrunk to 1 and 2 weeks so fold 0's three Sundays exercise age-out --
+    under exactly the reductions `small_carry_config` applies."""
+    path = tmp_path / "small-carry-v4.json"
+    document = _reduced(Path("configs/funding-carry-panel-v4.json"))
+    document["capital"] = {
+        "book_usdt": "10000",
+        "pair_slots": 4,
+        "per_leg_notional_usdt": "1250",
+        "fee_tier": "standard_taker_no_bnb",
+    }
+    hold_weeks = (1, 1, 2, 2)
+    members = cast("list[dict[str, object]]", document["members"])
+    document["members"] = [
+        {**member, "hold_weeks": weeks}
+        for member, weeks in zip(members, hold_weeks, strict=True)
+    ]
     path.write_text(json.dumps(document), encoding="utf-8")
     return path
 
