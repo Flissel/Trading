@@ -296,3 +296,38 @@ def perp_fetch_with_a_warm_up_hole(url: str) -> PanelPayload:
         if int(line.split(",")[0]) // DAY_MS - EPOCH_DAY_2020 not in WARM_UP_HOLE_DAY_OFFSETS
     ]
     return _payload(url, "k.csv", "\n".join(kept) + "\n")
+
+
+# The week `(109, 116]` -- the one that ends at fold 0's second decision --
+# holds exactly one weekly settlement, April's row at day offset 112. Forcing
+# only `EXIT_WEEK_SYMBOL`'s copy of that one row negative leaves its four-week
+# trailing funding positive (three normal rows against one negative one), so
+# the pair stays rankable and stays held, while the exit rule's one-week window
+# sees it pay nothing. That is the case a slot book's exit step exists for: one
+# held slot empties and refills from the ranking while its siblings' slots do
+# not move. C10USDT is the fixture's top payer, so it is held by every member
+# that fills a slot at all.
+EXIT_WEEK_SYMBOL = "C10USDT"
+EXIT_WEEK_DAY_OFFSET = 112
+
+
+def funding_csv_with_one_negative_week(symbol: str, month: str) -> str:
+    """Every symbol's funding, with `EXIT_WEEK_SYMBOL`'s one row at
+    `EXIT_WEEK_DAY_OFFSET` forced negative and nothing else touched."""
+    text = "calc_time,funding_interval_hours,last_funding_rate\n"
+    for offset in range(0, MONTH_DAYS[month], 7):
+        day = EPOCH_DAY_2020 + MONTH_START_DAY[month] + offset
+        negative = (
+            symbol == EXIT_WEEK_SYMBOL and day - EPOCH_DAY_2020 == EXIT_WEEK_DAY_OFFSET
+        )
+        text += f"{day * DAY_MS},8,{'-0.0001' if negative else funding_rate(symbol)}\n"
+    return text
+
+
+def perp_fetch_with_one_negative_week(url: str) -> PanelPayload:
+    if "/daily/klines/" in url:
+        raise PanelSourceAbsent("404: no daily dump")
+    symbol, month = _symbol_and_month(url)
+    if "fundingRate" in url:
+        return _payload(url, "f.csv", funding_csv_with_one_negative_week(symbol, month))
+    return _payload(url, "k.csv", kline_csv(symbol, month))

@@ -7,6 +7,7 @@ from uuid import NAMESPACE_URL, uuid5
 import pytest
 
 from tests.carry_fixtures import (
+    EXIT_WEEK_SYMBOL,
     HOLE_SYMBOL,
     build_captures,
     funding_rate,
@@ -14,19 +15,31 @@ from tests.carry_fixtures import (
     perp_fetch_with_a_liquidity_dip,
     perp_fetch_with_a_warm_up_hole,
     perp_fetch_with_negative_funding_weeks,
+    perp_fetch_with_one_negative_week,
     small_carry_config,
     small_carry_v2_config,
+    small_carry_v4_config,
 )
-from tests.test_panel_fold_run import EPOCH_DAY_2020, MONTH_DAYS, MONTH_START_DAY, MONTHS, SYMBOLS
+from tests.test_panel_fold_run import (
+    DAY_MS,
+    EPOCH_DAY_2020,
+    MONTH_DAYS,
+    MONTH_START_DAY,
+    MONTHS,
+    SYMBOLS,
+    kline_csv,
+)
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.carry_config import (
     CONTROL_NAMES,
     MEMBER_NAMES,
     MEMBER_NAMES_V2,
+    MEMBER_NAMES_V4,
     load_carry_family_spec,
 )
 from trading_bot.carry_fold_run import CarryFoldError, control_reference, run_carry_fold
-from trading_bot.carry_signals import hurdle_minimum_trailing
+from trading_bot.carry_signals import hurdle_minimum_trailing, random_pair_order
+from trading_bot.carry_universe import EligiblePair, PairUniverseSnapshot
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_fold_run import verify_panel_fold_report
 from trading_bot.panel_samples import publish_panel_walk_forward
@@ -635,3 +648,391 @@ def test_the_cost_hurdle_counts_the_pairs_that_cannot_pay_for_the_round_trip(
     hurdled = _episodes(document, "carry_l4w_h26w_exit_hurdle2")
     plain = _episodes(document, "carry_l4w_h26w_exit")
     assert [e["gross_exposure"] for e in hurdled] == [e["gross_exposure"] for e in plain]
+
+
+# --- the v4 declaration: a declared-capital slot book ------------------------
+
+COHORT_EXTRA_KEYS = {
+    "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
+    "forced_spot_legs", "forced_perpetual_legs", "exit_rule_removals", "hurdle_rejections",
+}
+SLOT_EXTRA_KEYS = {"filled_slots", "slot_fills", "slot_releases", "no_fill"}
+# The fixture's decile is two pairs wide -- twelve eligible pairs over a
+# denominator of ten, floored at `minimum_selected` 2 -- so a slot candidate
+# never fills more than two of the four declared slots, and the two it fills
+# are the fixture's two top payers.
+TOP_PAYING_SYMBOLS = ("C10USDT", "C09USDT")
+
+
+@pytest.fixture
+def v4_workspace(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_config)
+
+
+@pytest.fixture
+def v4_workspace_with_a_hole(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_hole)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_config)
+
+
+@pytest.fixture
+def v4_workspace_with_negative_funding_weeks(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(
+        tmp_path, perp_fetch_function=perp_fetch_with_negative_funding_weeks
+    )
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_config)
+
+
+@pytest.fixture
+def v4_workspace_with_one_negative_week(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_one_negative_week)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_config)
+
+
+@pytest.fixture
+def v4_workspace_with_a_liquidity_dip(tmp_path: Path) -> Workspace:
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_liquidity_dip)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_config)
+
+
+def _held_symbols(episode: dict[str, object]) -> set[str]:
+    """The symbols an episode attributed a return or a cost to."""
+    return {
+        contract_id.split(":")[0]
+        for contract_id, _ in _pairs(episode["contract_net_contributions"])
+    }
+
+
+def _pair_id_suffix(document: dict[str, object]) -> str:
+    """Whatever the capture appended to each symbol to make its contract id.
+
+    Every fixture symbol starts on the same day, so they all share one suffix;
+    reading it off a report keeps these tests free of the reader's
+    contract-id spelling.
+    """
+    episode = _episodes(document, "all_pairs_ew")[0]
+    return next(
+        contract_id.split(":", 1)[1]
+        for contract_id, _ in _pairs(episode["contract_net_contributions"])
+    )
+
+
+def _seeded_pair_order(space: Workspace, document: dict[str, object], index: int) -> list[str]:
+    """The order `random_pairs` draws its slots in at one decision.
+
+    Every fixture symbol is eligible at every in-window decision and they all
+    share one quote volume, so the snapshot the runner builds is this one up
+    to the fields the draw does not read.
+    """
+    spec, _ = load_carry_family_spec(space[3])
+    suffix = _pair_id_suffix(document)
+    pairs = tuple(
+        EligiblePair(
+            pair_id=f"{symbol}:{suffix}",
+            perpetual_contract_id=f"{symbol}:{suffix}",
+            spot_contract_id=f"{symbol}:{suffix}",
+            perpetual_tier=2, spot_tier=2, tier=2,
+            liquidity_rank=rank, median_quote_volume=Decimal(1),
+        )
+        for rank, symbol in enumerate(sorted(SYMBOLS), start=1)
+    )
+    decision_close_ns = int(_ordered_test_sample_ids(space[0])[index].split(":")[1])
+    return random_pair_order(
+        PairUniverseSnapshot(decision_close_ns, pairs, ()),
+        selection=spec.selection, random_seed=spec.statistics.random_seed,
+    )
+
+
+def _fixture_close(symbol: str, day_offset: int) -> Decimal:
+    """The perpetual close the fixture's capture carries for one day."""
+    month = next(
+        item for item in MONTHS
+        if MONTH_START_DAY[item] <= day_offset < MONTH_START_DAY[item] + MONTH_DAYS[item]
+    )
+    for line in kline_csv(symbol, month).splitlines()[1:]:
+        fields = line.split(",")
+        if int(fields[0]) // DAY_MS - EPOCH_DAY_2020 == day_offset:
+            return Decimal(fields[4])
+    raise AssertionError(f"the fixture has no bar for {symbol} on day offset {day_offset}")
+
+
+def _expected_uncharged(
+    space: Workspace,
+    document: dict[str, object],
+    name: str,
+    scenario: str,
+    *,
+    symbols: tuple[str, ...],
+) -> Decimal:
+    """Liquidating the last episode's drifted book, by hand.
+
+    Each held slot is a quarter of the declared book, so its spot leg opens at
+    `+1/8` and its perpetual leg at `-1/8`. The accounting drifts each leg by
+    its own return over the holding week against the book's gross return
+    (which the episode reports), and leaving costs one side of the leg's fee
+    plus its tier's slippage. The fixture's spot closes sit exactly one unit
+    under the perpetual's.
+    """
+    spec, _ = load_carry_family_spec(space[3])
+    assert spec.capital is not None
+    table = spec.costs.base if scenario == "base" else spec.costs.adverse
+    tier_one = set(sorted(SYMBOLS)[: spec.universe.tier_one_rank_limit])
+    last_day = _decision_day_offsets(space)[-1]
+    gross_return = _decimal(_episodes(document, name, scenario)[-1]["gross_return"])
+    leg_weight = Decimal(1) / Decimal(spec.capital.pair_slots) / Decimal(2)
+    total = Decimal(0)
+    for symbol in symbols:
+        slippage = (
+            table.slippage_bps_per_side_tier_one
+            if symbol in tier_one
+            else table.slippage_bps_per_side_tier_two
+        )
+        entry = _fixture_close(symbol, last_day)
+        exit_close = _fixture_close(symbol, last_day + spec.holding_days)
+        legs = (
+            (table.spot_fee_bps_per_side, leg_weight, entry - 1, exit_close - 1),
+            (table.perpetual_fee_bps_per_side, -leg_weight, entry, exit_close),
+        )
+        for fee, weight, leg_entry, leg_exit in legs:
+            leg_return = leg_exit / leg_entry - Decimal(1)
+            drifted = weight * (Decimal(1) + leg_return) / (Decimal(1) + gross_return)
+            total += abs(drifted) * (fee + slippage) / Decimal(10_000)
+    return total
+
+
+def _scenario(document: dict[str, object], name: str, scenario: str) -> dict[str, object]:
+    return _object_dict(_candidate(document, name)[scenario])
+
+
+def test_a_slot_family_warms_nothing_and_fills_its_slots_at_the_first_decision(
+    v4_workspace: Workspace,
+) -> None:
+    """Spec 3.3: a slot book has no warm-up. Every slot is empty at the fold's
+    first decision and is filled there, so `warm_up_weeks` is zero, the report
+    never claims a warmed opening book, and the first episode buys the whole
+    book inside the window."""
+    document = _run(v4_workspace)
+    assert document["family_name"] == "funding_carry_panel_v4"
+    names = [_object_dict(item)["candidate_name"] for item in _object_list(document["candidates"])]
+    assert names == list(MEMBER_NAMES_V4 + CONTROL_NAMES)
+    assert document["warm_up_weeks"] == 0
+    assert document["reason_codes"] == ["FOLD_FINAL_EXIT_COST_UNCHARGED"]
+    for name in MEMBER_NAMES_V4:
+        first = _episodes(document, name)[0]
+        extras = _object_dict(first["extras"])
+        assert set(extras) == COHORT_EXTRA_KEYS | SLOT_EXTRA_KEYS
+        assert _decimal(extras["filled_slots"]) == 2
+        assert _decimal(extras["slot_fills"]) == 2
+        assert _decimal(extras["slot_releases"]) == 0
+        assert _decimal(extras["no_fill"]) == 0
+        # two filled slots of four: spot +1/8 and perp -1/8 apiece, so gross is
+        # the filled share of the declared book and the two legs still hedge
+        assert _decimal(first["gross_exposure"]) == Decimal("0.5")
+        assert _decimal(first["net_exposure"]) == 0
+        assert _decimal(first["turnover"]) == _decimal(first["gross_exposure"])
+        assert _held_symbols(first) == set(TOP_PAYING_SYMBOLS)
+
+
+def test_a_released_slot_refilled_by_the_same_pair_costs_nothing(
+    v4_workspace: Workspace,
+) -> None:
+    """Spec 3.2: a pair released by age that still ranks is filled again in the
+    same decision, its weights do not change and its hold clock restarts. The
+    one-week member releases both slots at the second decision and refills them
+    with the same two pairs, so its episodes are the two-week member's digit
+    for digit -- only the slot bookkeeping tells the two apart."""
+    document = _run(v4_workspace)
+    weekly, fortnightly = MEMBER_NAMES_V4[0], MEMBER_NAMES_V4[2]
+    assert _extras(document, weekly, "slot_releases") == [Decimal(0), Decimal(2), Decimal(2)]
+    assert _extras(document, weekly, "slot_fills") == [Decimal(2), Decimal(2), Decimal(2)]
+    # the two-week member holds its first slots through the second decision and
+    # ages them out at the third
+    assert _extras(document, fortnightly, "slot_releases") == [Decimal(0), Decimal(0), Decimal(2)]
+    assert _extras(document, fortnightly, "slot_fills") == [Decimal(2), Decimal(0), Decimal(2)]
+    for name in (weekly, fortnightly):
+        assert _extras(document, name, "filled_slots") == [Decimal(2)] * 3
+    for scenario in ("base", "adverse"):
+        economics = [
+            [
+                {key: value for key, value in episode.items() if key != "extras"}
+                for episode in _episodes(document, name, scenario)
+            ]
+            for name in (weekly, fortnightly)
+        ]
+        assert economics[0] == economics[1]
+
+
+def test_the_exit_rule_frees_one_slot_and_the_next_ranked_pair_takes_it(
+    v4_workspace_with_one_negative_week: Workspace,
+) -> None:
+    """Spec 3.2 step 2, per slot: the one settlement inside the week that ends
+    at the second decision is negative for C10USDT alone, so the exit member
+    empties that pair's slot and refills it from the next ranked paying pair it
+    does not already hold, while its non-exit sibling keeps the pair and fills
+    a third slot beside it."""
+    document = _run(v4_workspace_with_one_negative_week)
+    exiting, holding = MEMBER_NAMES_V4[3], MEMBER_NAMES_V4[2]
+    assert _extras(document, exiting, "exit_rule_removals") == [
+        Decimal(0), Decimal(1), Decimal(0),
+    ]
+    assert _extras(document, holding, "exit_rule_removals") == [Decimal(0)] * 3
+    # the emptied slot is refilled in the same decision, so the exit member
+    # still holds two slots where its sibling now holds three
+    assert _extras(document, exiting, "slot_fills") == [Decimal(2), Decimal(1), Decimal(1)]
+    assert _extras(document, exiting, "filled_slots") == [Decimal(2), Decimal(2), Decimal(2)]
+    assert _extras(document, holding, "slot_fills") == [Decimal(2), Decimal(1), Decimal(1)]
+    assert _extras(document, holding, "filled_slots") == [Decimal(2), Decimal(3), Decimal(2)]
+    assert _decimal(_episodes(document, exiting)[1]["gross_exposure"]) == Decimal("0.5")
+    assert _decimal(_episodes(document, holding)[1]["gross_exposure"]) == Decimal("0.75")
+    # only the sibling still carries the dropped pair into the third decision,
+    # where its slot ages out -- the exit member parted with it a week earlier
+    assert _extras(document, exiting, "slot_releases") == [Decimal(0), Decimal(0), Decimal(1)]
+    assert _extras(document, holding, "slot_releases") == [Decimal(0), Decimal(0), Decimal(2)]
+    assert EXIT_WEEK_SYMBOL not in _held_symbols(_episodes(document, exiting)[2])
+    assert EXIT_WEEK_SYMBOL in _held_symbols(_episodes(document, holding)[2])
+
+
+def test_a_force_closed_pair_frees_its_slot_rather_than_ageing_out(
+    v4_workspace_with_a_hole: Workspace,
+) -> None:
+    """A slot whose pair lost a leg is emptied by the forced close that already
+    ended the episode, exactly as the cohort book strips the pair, so the slot
+    is free at the next decision and is not released a second time."""
+    document = _run(v4_workspace_with_a_hole)
+    name = MEMBER_NAMES_V4[2]
+    episodes = _episodes(document, name)
+    assert len(episodes) == 3
+    assert episodes[1]["forced_close_count"] == 1
+    assert _decimal(episodes[1]["forced_close_cost"]) > 0
+    assert _extras(document, name, "filled_slots") == [Decimal(2), Decimal(2), Decimal(2)]
+    assert _extras(document, name, "slot_releases") == [Decimal(0), Decimal(0), Decimal(1)]
+    assert _extras(document, name, "slot_fills") == [Decimal(2), Decimal(0), Decimal(2)]
+    assert episodes[2]["forced_close_count"] == 0
+    assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.5")
+    # the pair is out of the universe and out of the book; its surviving spot
+    # leg still leaves through ordinary turnover under the pair's id
+    assert HOLE_SYMBOL in _held_symbols(episodes[2])
+
+
+def test_a_week_that_pays_nothing_fills_no_slot(
+    v4_workspace_with_negative_funding_weeks: Workspace,
+) -> None:
+    """Spec 3.2's fill step: fewer than `minimum_selected` paying pairs means
+    no fill this week. The slots stay empty, the decision is not a skip, and
+    the sample joins the candidate's `no_carry_cohort_sample_ids`."""
+    space = v4_workspace_with_negative_funding_weeks
+    document = _run(space)
+    ordered_ids = _ordered_test_sample_ids(space[0])
+    assert document["skipped_sample_ids"] == []
+    for name in MEMBER_NAMES_V4:
+        assert _extras(document, name, "no_fill") == [Decimal(1), Decimal(1), Decimal(0)]
+        assert _extras(document, name, "filled_slots") == [Decimal(0), Decimal(0), Decimal(2)]
+        assert _candidate(document, name)["no_carry_cohort_sample_ids"] == ordered_ids[:2]
+        episodes = _episodes(document, name)
+        assert [episode["reason_codes"] for episode in episodes] == [
+            ["MEMBER_HELD_NOTHING"], ["MEMBER_HELD_NOTHING"], [],
+        ]
+        assert _decimal(episodes[2]["gross_exposure"]) == Decimal("0.5")
+    # the seeded control draws from every pair rather than only the paying
+    # ones, so it fills its slots in the weeks the members cannot
+    assert _extras(document, "random_pairs", "no_fill") == [Decimal(0)] * 3
+
+
+def test_the_controls_of_a_slot_family_keep_their_own_books(v4_workspace: Workspace) -> None:
+    """Spec 4.3: `random_pairs` runs the same slot book off the seeded draw,
+    `no_trade` holds nothing and `all_pairs_ew` stays on the cohort book at the
+    reference hold. The slot extras are reported for all three, at zero
+    wherever the mechanic does not apply."""
+    space = v4_workspace
+    document = _run(space)
+    for scenario in ("base", "adverse"):
+        for episode in _episodes(document, "no_trade", scenario):
+            assert _decimal(episode["net_return"]) == 0
+            assert _decimal(episode["gross_exposure"]) == 0
+    for key in sorted(SLOT_EXTRA_KEYS):
+        assert _extras(document, "no_trade", key) == [Decimal(0)] * 3
+        assert _extras(document, "all_pairs_ew", key) == [Decimal(0)] * 3
+    drawn = _seeded_pair_order(space, document, 0)
+    first_random = _episodes(document, "random_pairs")[0]
+    held = {contract_id for contract_id, _ in _pairs(first_random["contract_net_contributions"])}
+    assert held == set(drawn[:2])
+    filled = _extras(document, "random_pairs", "filled_slots")
+    assert filled == [Decimal(2)] * 3
+    assert all(value <= 4 for value in filled)
+    # every paying pair at equal weight: eleven of the twelve pairs, each at
+    # spot +1/22 and perp -1/22, so the cohort book is unit gross
+    context = _episodes(document, "all_pairs_ew")[0]
+    contributions = _pairs(context["contract_net_contributions"])
+    assert len(contributions) == len(SYMBOLS) - 1
+    assert "C11USDT" not in _held_symbols(context)
+    # eleven-pair shares are not exact in Decimal, so unit gross and the hedge
+    # are bounded rather than equalities
+    assert abs(_decimal(context["gross_exposure"]) - Decimal(1)) < Decimal("1e-25")
+    assert abs(_decimal(context["net_exposure"])) < Decimal("1e-25")
+
+
+def test_uncharged_final_exit_cost_prices_the_last_book_s_liquidation(
+    v4_workspace: Workspace,
+) -> None:
+    """Spec 3.3: a fold's final exit falls outside the window and is never
+    charged, and because a slot book holds no warmed cohorts the uncharged
+    share is the whole book -- so the report states it, per candidate and
+    scenario, at that scenario's fees and tier slippage."""
+    space = v4_workspace
+    document = _run(space)
+    for scenario in ("base", "adverse"):
+        flat = _scenario(document, "no_trade", scenario)
+        assert _decimal(flat["uncharged_final_exit_cost"]) == 0
+    name = MEMBER_NAMES_V4[0]
+    assert _episodes(document, name)[-1]["forced_close_count"] == 0
+    assert _held_symbols(_episodes(document, name)[-1]) == set(TOP_PAYING_SYMBOLS)
+    costs: dict[str, Decimal] = {}
+    for scenario in ("base", "adverse"):
+        expected = _expected_uncharged(
+            space, document, name, scenario, symbols=TOP_PAYING_SYMBOLS
+        )
+        assert expected > 0
+        costs[scenario] = _decimal(
+            _scenario(document, name, scenario)["uncharged_final_exit_cost"]
+        )
+        assert abs(costs[scenario] - expected) < Decimal("1e-25")
+    # the adverse table doubles tier slippage, so the same book costs more to
+    # liquidate under it
+    assert costs["adverse"] > costs["base"]
+
+
+def test_a_cohort_family_reports_neither_slot_extras_nor_an_uncharged_exit(
+    v2_workspace: Workspace,
+) -> None:
+    """The slot bookkeeping is a slot family's alone: v2's fold report keeps
+    exactly the eight extras keys it had and states no uncharged exit."""
+    document = _run(v2_workspace)
+    for name in (*MEMBER_NAMES_V2, *CONTROL_NAMES):
+        for scenario in ("base", "adverse"):
+            assert set(_scenario(document, name, scenario)) == {"total_net_return", "episodes"}
+            for episode in _episodes(document, name, scenario):
+                assert set(_object_dict(episode["extras"])) == COHORT_EXTRA_KEYS
+
+
+def test_a_universe_too_small_week_empties_every_slot(
+    v4_workspace_with_a_liquidity_dip: Workspace,
+) -> None:
+    """Spec 3.3: a week whose universe is too small is skipped and empties
+    every slot, as it resets every cohort under v2; the slots refill at the
+    next tradeable decision and the book restarts from flat, so nothing is
+    released there and the refill is charged its full entry."""
+    space = v4_workspace_with_a_liquidity_dip
+    document = _run(space)
+    middle = _ordered_test_sample_ids(space[0])[1]
+    assert document["skipped_sample_ids"] == [middle]
+    for name in MEMBER_NAMES_V4:
+        episodes = _episodes(document, name)
+        assert len(episodes) == 2
+        assert _extras(document, name, "filled_slots") == [Decimal(2), Decimal(2)]
+        assert _extras(document, name, "slot_fills") == [Decimal(2), Decimal(2)]
+        # the skip emptied the slots, so the refill releases nothing and no
+        # exit of the pre-skip book is charged (P1.27's uncharged-skip rule)
+        assert _extras(document, name, "slot_releases") == [Decimal(0), Decimal(0)]
+        assert _decimal(episodes[1]["gross_exposure"]) == Decimal("0.5")
+        assert _decimal(episodes[1]["turnover"]) == Decimal("0.5")

@@ -5,7 +5,13 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.carry_fixtures import perp_fetch, small_carry_config, small_carry_v2_config, spot_fetch
+from tests.carry_fixtures import (
+    perp_fetch,
+    small_carry_config,
+    small_carry_v2_config,
+    small_carry_v4_config,
+    spot_fetch,
+)
 from tests.test_panel_fold_run import MONTHS, SYMBOLS
 from trading_bot.cli import main
 
@@ -13,17 +19,25 @@ EXTRAS = {
     "funding_collected", "basis_pnl", "spot_trading_cost", "perpetual_trading_cost",
     "forced_spot_legs", "forced_perpetual_legs", "exit_rule_removals", "hurdle_rejections",
 }
+# A slot family reports its book's mechanics beside the eight (spec 4.6), and
+# the decision pools every extras key it is handed, so all twelve come through.
+SLOT_EXTRAS = {"filled_slots", "slot_fills", "slot_releases", "no_fill"}
 
 
 @pytest.mark.parametrize(
-    "config_builder,expected_member_count",
-    [(small_carry_config, 3), (small_carry_v2_config, 4)],
-    ids=["v1", "v2"],
+    "config_builder,expected_member_count,expected_extras",
+    [
+        (small_carry_config, 3, EXTRAS),
+        (small_carry_v2_config, 4, EXTRAS),
+        (small_carry_v4_config, 4, EXTRAS | SLOT_EXTRAS),
+    ],
+    ids=["v1", "v2", "v4"],
 )
 def test_spot_capture_manifest_carry_folds_and_decision_compose(
     tmp_path: Path,
     config_builder: Callable[[Path], Path],
     expected_member_count: int,
+    expected_extras: set[str],
 ) -> None:
     config_path = config_builder(tmp_path)
     capture_arguments = [
@@ -76,4 +90,4 @@ def test_spot_capture_manifest_carry_folds_and_decision_compose(
     assert len(decision["members"]) == expected_member_count
     assert decision["hedge_capture_root_hash"] == manifest["hedge_capture_root_hash"]
     assert decision["hedge_dataset_root_hash"] == manifest["hedge_dataset_root_hash"]
-    assert all(set(member["extras_mean"]) == EXTRAS for member in decision["members"])
+    assert all(set(member["extras_mean"]) == expected_extras for member in decision["members"])

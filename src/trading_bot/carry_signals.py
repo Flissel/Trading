@@ -68,6 +68,19 @@ def _entries(
     )
 
 
+def entries_for(
+    snapshot: PairUniverseSnapshot, pair_ids: list[str]
+) -> tuple[CohortEntry, ...]:
+    """The cohort entries of `pair_ids` in this snapshot, in the given order.
+
+    What cohort selection builds its own entries from, under a public name: a
+    slot book (spec 3.2) turns one filled pair id into the one-entry cohort
+    that is its slot, and does it through the same construction rather than a
+    second one that could drift from it.
+    """
+    return _entries(snapshot, pair_ids)
+
+
 def _decile_size(count: int, selection: CarrySelectionRules) -> int:
     return max(selection.minimum_selected, count // selection.decile_denominator)
 
