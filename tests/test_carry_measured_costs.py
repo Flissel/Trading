@@ -336,6 +336,44 @@ def test_declaration_notionals_refuses_a_ladder_without_the_tenfold_rung(
         declaration_notionals(truncated, capital=slot_capital(per_leg="5000", slots=1))
 
 
+def test_declaration_notionals_resolves_a_rescaled_tenfold_rung_to_its_own_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The receipt may record its top rung as "50000.0": numerically ten times
+    the 5 000 base, but a different string than a freshly computed "50000".
+
+    The tier statistics are keyed by the receipt's own notional strings
+    (`_notional_keys`), so the adverse notional `declaration_notionals` returns
+    must be resolved from the receipt's own elements, not recomputed - a
+    recomputed "50000" would pass the numeric-equality membership check yet
+    miss the real "50000.0" key, and `_worse_leg` would refuse it as never
+    measured even though the receipt did measure it.
+    """
+    lower_the_eligibility_floors(monkeypatch)
+    journal = journal_with_rounds(
+        tmp_path,
+        rounds=ROUNDS,
+        fetcher=LadderVenue(multipliers=sample_multipliers()),
+        instruments=sample_instruments(),
+        notionals=["500", "5000", "50000.0"],
+    )
+    _, output = finalized_receipt(tmp_path, journal)
+    document = read_document(output)
+    row = tier_row(document, tier=1, market="um")
+    slippage = row["slippage"]
+    assert isinstance(slippage, dict)
+    assert set(slippage) == {"500", "5000", "50000.0"}
+
+    receipt = FinalizationReceipt.model_validate(document)
+    capital = slot_capital(per_leg="5000", slots=1)
+    assert declaration_notionals(receipt, capital=capital) == ("5000", "50000.0")
+    # The pre-fix code returned a computed "50000", which this receipt never
+    # keys, and `_worse_leg` would have refused it as never measured.
+    base, adverse = measured_slippage_tiers(document, capital=capital)
+    assert base == {1: Decimal("800"), 2: Decimal("1200")}
+    assert adverse == {1: Decimal("1600"), 2: Decimal("2400")}
+
+
 def test_the_declared_family_carries_the_measured_tiers_and_its_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

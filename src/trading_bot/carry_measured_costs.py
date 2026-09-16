@@ -84,6 +84,13 @@ def declaration_notionals(
     ``N``, and the adverse notional is ten times it. Both must be notionals the
     receipt actually measured - Decimal-equal to one of ``receipt.notionals`` -
     or the declaration refuses rather than reading a rung nobody sampled.
+
+    The two returned strings are always ``str()`` of the actual elements of
+    ``receipt.notionals``, never of a freshly computed ``Decimal`` - a receipt
+    entry that is numerically ten times the base but written with a different
+    exponent (``Decimal("50000.0")`` rather than ``Decimal("50000")``) keys the
+    tier statistics under its own string, and a computed ``"50000"`` would miss
+    that key even though the membership check above it would pass.
     """
     if capital is None:
         return BASE_NOTIONAL, ADVERSE_NOTIONAL
@@ -95,10 +102,13 @@ def declaration_notionals(
             f"{order_notional} USDT per-leg order"
         )
     base_notional = ladder[0]
-    adverse_notional = base_notional * 10
-    if adverse_notional not in receipt.notionals:
+    adverse_target = base_notional * 10
+    adverse_notional = next(
+        (value for value in receipt.notionals if value == adverse_target), None
+    )
+    if adverse_notional is None:
         raise MeasuredCostError(
-            f"the receipt's notional ladder has no {adverse_notional} USDT rung, ten times "
+            f"the receipt's notional ladder has no {adverse_target} USDT rung, ten times "
             f"the {base_notional} USDT the declared capital selects"
         )
     return str(base_notional), str(adverse_notional)
