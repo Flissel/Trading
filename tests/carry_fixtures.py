@@ -275,6 +275,28 @@ def small_carry_v4_config(tmp_path: Path) -> Path:
     return path
 
 
+def small_carry_v4_one_slot_config(tmp_path: Path) -> Path:
+    """The v4 declaration pinned to a single pair slot, so `pair_slots` binds
+    the fill even though the fixture's ranking is two pairs wide -- otherwise
+    identical to `small_carry_v4_config`."""
+    path = tmp_path / "small-carry-v4-one-slot.json"
+    document = _reduced(Path("configs/funding-carry-panel-v4.json"))
+    document["capital"] = {
+        "book_usdt": "10000",
+        "pair_slots": 1,
+        "per_leg_notional_usdt": "5000",
+        "fee_tier": "standard_taker_no_bnb",
+    }
+    hold_weeks = (1, 1, 2, 2)
+    members = cast("list[dict[str, object]]", document["members"])
+    document["members"] = [
+        {**member, "hold_weeks": weeks}
+        for member, weeks in zip(members, hold_weeks, strict=True)
+    ]
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
+
+
 # C10USDT's perpetual is dark from day offset 103 through 109: it enters the
 # warm-up cohorts formed on Sundays 88, 95 and 102 and has no bar at fold 0's
 # first decision (day 109), the case a forced close cannot catch because no

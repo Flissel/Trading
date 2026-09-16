@@ -31,9 +31,9 @@ MEMBER_NAMES_V4: tuple[str, ...] = (
 # v3 is v2's book on measured execution costs: the same members, the same
 # universe, the same folds - the cost tables are the only thing the Binance cost
 # journal's receipt changes, so the two families stay comparable. v4_measured
-# is the same relationship for the slot book. `MEASURED_COST_FAMILY` stays
-# exported at its v3 value for `carry_measured_costs.py`'s existing callers;
-# `MEASURED_FAMILY_BY_BASE` is the general map a new base family joins.
+# is the same relationship for the slot book. `MEASURED_COST_FAMILY` is kept
+# as the v3 family's name and as `MEASURED_FAMILY_BY_BASE`'s value for the v2
+# base; `MEASURED_FAMILY_BY_BASE` is the general map a new base family joins.
 MEASURED_COST_FAMILY = "funding_carry_panel_v3"
 MEASURED_FAMILY_BY_BASE: dict[str, str] = {
     "funding_carry_panel_v2": MEASURED_COST_FAMILY,

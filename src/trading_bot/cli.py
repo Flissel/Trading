@@ -467,8 +467,9 @@ def _carry_declare_measured(parsed: argparse.Namespace) -> int:
     """Write the carry declaration a finalisation receipt's measured tiers imply.
 
     2 is what a rerun cannot fix - a refused reading of the receipt, a base
-    declaration that is not v2, an output that already exists, a path outside
-    the workspace - and 1 anything else.
+    declaration whose family is not a key of `MEASURED_FAMILY_BY_BASE` (v2 or
+    v4), an output that already exists, a path outside the workspace - and 1
+    anything else.
     """
     workspace: Path = parsed.workspace_root.resolve()
     receipt: Path = parsed.receipt.resolve()

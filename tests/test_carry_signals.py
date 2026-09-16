@@ -394,6 +394,7 @@ def test_fill_slots_returns_fewer_when_the_ranking_runs_out_first() -> None:
 
 def test_fill_slots_returns_nothing_when_no_slots_are_free() -> None:
     assert fill_slots(["A", "B"], held=set(), skip=set(), free=0) == []
+    assert fill_slots(["A", "B"], held=set(), skip=set(), free=-1) == []
 
 
 def _slot(week: int, pair_id: str) -> Cohort:

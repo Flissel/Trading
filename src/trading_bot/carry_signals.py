@@ -311,7 +311,7 @@ def fill_slots(
     """
     filled: list[str] = []
     for pair_id in ranked:
-        if len(filled) == free:
+        if len(filled) >= free:
             break
         if pair_id in held or pair_id in skip:
             continue

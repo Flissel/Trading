@@ -639,6 +639,22 @@ def test_verification_refuses_a_wrong_rule_string(
         )
 
 
+def test_v3_verification_refuses_the_v4_rule_text_in_a_v3_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The v4 capital sentence is a valid rule in general, but not the one an
+    uncapitalised v3 base selects (mirrors
+    `test_v4_verification_refuses_the_v3_rule_text_in_a_v4_citation`)."""
+    _, output, _ = declared_family(tmp_path, monkeypatch)
+    edited = edited_evidence(output, tmp_path / "v4-rule-v3.json", rule=CAPITAL_DECLARATION_RULE)
+    with pytest.raises(MeasuredCostError, match="capital does not select"):
+        verify_measured_declaration(
+            receipt_path=tmp_path / "receipt.json",
+            spec_path=edited,
+            base_declaration_path=CONFIG_V2,
+        )
+
+
 def test_verification_refuses_an_edited_member_field(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

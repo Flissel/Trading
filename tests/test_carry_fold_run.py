@@ -19,6 +19,7 @@ from tests.carry_fixtures import (
     small_carry_config,
     small_carry_v2_config,
     small_carry_v4_config,
+    small_carry_v4_one_slot_config,
 )
 from tests.test_panel_fold_run import (
     DAY_MS,
@@ -696,6 +697,15 @@ def v4_workspace_with_a_liquidity_dip(tmp_path: Path) -> Workspace:
     return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_config)
 
 
+@pytest.fixture
+def v4_one_slot_workspace(tmp_path: Path) -> Workspace:
+    """The v4 fixture pinned to one declared slot, against a ranking that is
+    two pairs wide -- the case that binds `pair_slots` as a real cap rather
+    than a number the fill never reaches."""
+    perp, spot = build_captures(tmp_path)
+    return tmp_path, perp, spot, _publish(tmp_path, perp, spot, small_carry_v4_one_slot_config)
+
+
 def _held_symbols(episode: dict[str, object]) -> set[str]:
     """The symbols an episode attributed a return or a cost to."""
     return {
@@ -832,6 +842,26 @@ def test_a_slot_family_warms_nothing_and_fills_its_slots_at_the_first_decision(
         assert _decimal(first["net_exposure"]) == 0
         assert _decimal(first["turnover"]) == _decimal(first["gross_exposure"])
         assert _held_symbols(first) == set(TOP_PAYING_SYMBOLS)
+
+
+def test_pair_slots_caps_the_fill_even_when_the_ranking_is_wider(
+    v4_one_slot_workspace: Workspace,
+) -> None:
+    """`_slot_decision` wires `free = capital.pair_slots - len(held_slots)`, but
+    the fixture's ranking is only two pairs wide, so a four-slot book never
+    exercises the cap. Pin the declaration to one slot instead: every member
+    fills exactly that one slot, from the top of the ranking, at every one of
+    fold 0's three decisions, and the seeded control does too."""
+    document = _run(v4_one_slot_workspace)
+    top = TOP_PAYING_SYMBOLS[0]
+    for name in MEMBER_NAMES_V4:
+        assert _extras(document, name, "filled_slots") == [Decimal(1)] * 3
+        episodes = _episodes(document, name)
+        assert len(episodes) == 3
+        for episode in episodes:
+            assert _decimal(episode["gross_exposure"]) == Decimal(1)
+            assert _held_symbols(episode) == {top}
+    assert _extras(document, "random_pairs", "filled_slots") == [Decimal(1)] * 3
 
 
 def test_a_released_slot_refilled_by_the_same_pair_costs_nothing(
