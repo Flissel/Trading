@@ -69,10 +69,11 @@ At every weekly decision (Sunday close), in this order, for each member:
    funding descending, ties by pair id, cut to the top decile exactly as
    `select_member_cohort` cuts it (`max(minimum_selected, eligible // 10)`; fewer than
    `minimum_selected` paying pairs means no fill this week, counted as `no_fill_weeks`) —
-   skipping pairs already held, in rank order, until no slot is empty or the list is
-   exhausted. A pair released in step 1 that still ranks is filled again in the same
-   decision; its weights do not change, so no turnover is charged, and its hold clock
-   restarts.
+   skipping pairs already held and, for members with the exit rule, pairs whose trailing
+   one-week funding is non-positive or absent (v2's treatment of its freshly formed
+   cohort), in rank order, until no slot is empty or the list is exhausted. A pair
+   released in step 1 that still ranks is filled again in the same decision; its weights
+   do not change, so no turnover is charged, and its hold clock restarts.
 
 The book is the union of the filled slots. Turnover, fees, slippage, funding and forced
 closes are P1.28's accounting unchanged (`carry_accounting.evaluate_carry_episode`).
