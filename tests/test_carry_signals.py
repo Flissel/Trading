@@ -2,14 +2,20 @@
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
 from trading_bot.carry_config import CarrySelectionRules, load_carry_family_spec
 from trading_bot.carry_signals import (
     Cohort,
     CohortEntry,
     assemble_book,
+    assemble_slot_book,
     exit_rule_pairs,
+    fill_slots,
     hurdle_minimum_trailing,
     perp_leg,
+    random_pair_order,
+    rank_paying_pairs,
     round_trip_cost_bps,
     select_control_cohort,
     select_member_cohort,
@@ -322,3 +328,133 @@ def test_a_shrunken_cohort_leaves_its_stripped_pair_undeployed() -> None:
     assert book["spot:A:7"] == Decimal("0.0625")
     assert book["perp:A:0"] == Decimal("-0.0625")
     assert sum(abs(v) for v in book.values()) == Decimal("0.125")
+
+
+def test_rank_paying_pairs_matches_select_member_cohort_without_a_hurdle() -> None:
+    snapshot = PairUniverseSnapshot(DECISION, tuple(pair(i) for i in range(20)), ())
+    trailing: dict[str, Decimal | None] = {
+        f"P{i}:0": Decimal(i) - Decimal(5) for i in range(20)
+    }  # P0..P5 <= 0
+    trailing["P19:0"] = None
+    ids, rejections = rank_paying_pairs(snapshot, trailing=trailing, selection=SELECTION)
+    cohort = select_member_cohort(snapshot, trailing=trailing, selection=SELECTION)
+    assert ids == [e.pair_id for e in cohort.entries] == ["P18:0", "P17:0"]
+    assert rejections == cohort.hurdle_rejections == 0
+
+
+def test_rank_paying_pairs_matches_select_member_cohort_with_a_hurdle() -> None:
+    snapshot = PairUniverseSnapshot(DECISION, tuple(pair(i) for i in range(40)), ())
+    trailing: dict[str, Decimal | None] = {f"P{i}:0": Decimal(i + 1) for i in range(40)}
+    hurdle = {f"P{i}:0": Decimal(36) for i in range(40)}
+    ids, rejections = rank_paying_pairs(
+        snapshot, trailing=trailing, selection=SELECTION, hurdle=hurdle
+    )
+    cohort = select_member_cohort(
+        snapshot, trailing=trailing, selection=SELECTION, hurdle=hurdle
+    )
+    assert ids == [e.pair_id for e in cohort.entries] == ["P39:0", "P38:0", "P37:0", "P36:0"]
+    assert rejections == cohort.hurdle_rejections == 35
+
+
+def test_rank_paying_pairs_is_empty_under_the_minimum() -> None:
+    """Mirrors select_member_cohort's NO_CARRY_COHORT case: too few pairs pay
+    at all, so the ranking is empty rather than short."""
+    snapshot = PairUniverseSnapshot(DECISION, tuple(pair(i) for i in range(20)), ())
+    trailing: dict[str, Decimal | None] = {f"P{i}:0": Decimal(-1) for i in range(20)}
+    trailing["P3:0"] = Decimal("0.5")
+    ids, rejections = rank_paying_pairs(snapshot, trailing=trailing, selection=SELECTION)
+    assert ids == [] and rejections == 0
+
+
+def test_random_pair_order_reproduces_the_random_control_s_entry_set() -> None:
+    snapshot = PairUniverseSnapshot(DECISION, tuple(pair(i) for i in range(20)), ())
+    trailing: dict[str, Decimal | None] = {
+        f"P{i}:0": Decimal(1) if i % 2 else Decimal(-1) for i in range(20)
+    }
+    ids = random_pair_order(snapshot, selection=SELECTION, random_seed=17)
+    control = select_control_cohort(
+        snapshot,
+        kind="random_pairs",
+        trailing=trailing,
+        selection=SELECTION,
+        random_seed=17,
+    )
+    assert set(ids) == {e.pair_id for e in control.entries}
+    assert len(ids) == len(control.entries) == 2
+
+
+def test_fill_slots_skips_held_and_skipped_ids_in_rank_order() -> None:
+    ranked = ["A", "B", "C", "D", "E"]
+    assert fill_slots(ranked, held={"A"}, skip={"C"}, free=2) == ["B", "D"]
+
+
+def test_fill_slots_returns_fewer_when_the_ranking_runs_out_first() -> None:
+    assert fill_slots(["A", "B"], held=set(), skip=set(), free=5) == ["A", "B"]
+
+
+def test_fill_slots_returns_nothing_when_no_slots_are_free() -> None:
+    assert fill_slots(["A", "B"], held=set(), skip=set(), free=0) == []
+
+
+def _slot(week: int, pair_id: str) -> Cohort:
+    return Cohort(
+        week * WEEK_NS,
+        (CohortEntry(pair_id, perp_leg(pair_id), spot_leg(pair_id.replace(":0", ":7")), 1),),
+        (),
+    )
+
+
+def test_assemble_slot_book_splits_capital_evenly_across_declared_slots() -> None:
+    slots = (_slot(9, "A:0"), _slot(10, "B:0"))
+    book = dict(
+        assemble_slot_book(slots, pair_slots=4, hold_weeks=4, decision_close_ns=10 * WEEK_NS)
+    )
+    # 1/4 per slot, halved across the two legs: +-1/8 each; two filled slots
+    # of four deploy half the book's gross.
+    assert book["spot:A:7"] == Decimal("0.125") and book["perp:A:0"] == Decimal("-0.125")
+    assert book["spot:B:7"] == Decimal("0.125") and book["perp:B:0"] == Decimal("-0.125")
+    assert sum(abs(v) for v in book.values()) == Decimal("0.5")
+    assert list(book) == sorted(book)
+
+
+def test_assemble_slot_book_drops_a_slot_the_week_it_ages_out() -> None:
+    aged_out = _slot(6, "Z:0")  # age = 10 - 6 = 4 weeks == hold_weeks
+    still_held = _slot(7, "A:0")
+    book = dict(
+        assemble_slot_book(
+            (aged_out, still_held),
+            pair_slots=4,
+            hold_weeks=4,
+            decision_close_ns=10 * WEEK_NS,
+        )
+    )
+    assert "perp:Z:0" not in book and "spot:Z:7" not in book
+    assert book["perp:A:0"] == Decimal("-0.125")
+
+
+def test_assemble_slot_book_skips_an_empty_slot() -> None:
+    empty = Cohort(10 * WEEK_NS, (), ("NO_CARRY_COHORT",))
+    book = assemble_slot_book(
+        (empty,), pair_slots=4, hold_weeks=4, decision_close_ns=10 * WEEK_NS
+    )
+    assert book == ()
+
+
+def test_assemble_slot_book_refuses_a_two_entry_cohort() -> None:
+    two_entries = Cohort(
+        10 * WEEK_NS,
+        (
+            CohortEntry("A:0", "perp:A:0", "spot:A:7", 1),
+            CohortEntry("B:0", "perp:B:0", "spot:B:7", 1),
+        ),
+        (),
+    )
+    with pytest.raises(ValueError):
+        assemble_slot_book(
+            (two_entries,), pair_slots=4, hold_weeks=4, decision_close_ns=10 * WEEK_NS
+        )
+
+
+def test_assemble_slot_book_refuses_fewer_than_one_pair_slot() -> None:
+    with pytest.raises(ValueError):
+        assemble_slot_book((), pair_slots=0, hold_weeks=4, decision_close_ns=10 * WEEK_NS)

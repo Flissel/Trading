@@ -114,23 +114,25 @@ def hurdle_minimum_trailing(
     )
 
 
-def select_member_cohort(
+def rank_paying_pairs(
     snapshot: PairUniverseSnapshot,
     *,
     trailing: dict[str, Decimal | None],
     selection: CarrySelectionRules,
     hurdle: dict[str, Decimal] | None = None,
-) -> Cohort:
-    """Top decile of the eligible pairs by trailing funding, positive funding required.
+) -> tuple[list[str], int]:
+    """The top-decile ranking `select_member_cohort` builds its entries from.
 
-    `hurdle` maps a pair id to the minimum trailing funding it must carry to
-    be ranked at all (spec 3.3). A pair with no entry is not hurdle-checked.
-    The decile width is unchanged by the hurdle: it is still computed from
-    every eligible pair, so the hurdle can only cap how many pairs a cohort
-    holds, never widen it. A cohort that ends up with fewer pairs still
-    deploys its full 1/H share across them (`assemble_book` divides by the
-    entry count), so the per-pair weight is bounded only by
-    `minimum_selected`, which the declaration fixes at eight.
+    Positive trailing funding only, the hurdle applied exactly as spec 3.3
+    states it (a pair with no hurdle entry is not checked), sorted by
+    `(-funding, pair_id)` and cut to the decile width computed from every
+    eligible pair -- the hurdle can thin the ranking but never widens the
+    decile it is cut to. Returns `([], rejections)` when fewer than
+    `minimum_selected` pairs clear the hurdle, the same "not enough to form a
+    cohort" case `select_member_cohort` reports as `NO_CARRY_COHORT`. A slot
+    book (spec 4.2) fills its empty slots from this same ranking rather than
+    from a fresh one, so cohort and slot members agree on who is carrying
+    funding this week.
     """
     paying = [
         (value, pair.pair_id)
@@ -149,14 +151,41 @@ def select_member_cohort(
             qualified.append((value, pair_id))
         paying = qualified
     if len(paying) < selection.minimum_selected:
+        return [], rejections
+    paying.sort(key=lambda item: (-item[0], item[1]))
+    size = min(len(paying), _decile_size(len(snapshot.pairs), selection))
+    return [pid for _, pid in paying[:size]], rejections
+
+
+def select_member_cohort(
+    snapshot: PairUniverseSnapshot,
+    *,
+    trailing: dict[str, Decimal | None],
+    selection: CarrySelectionRules,
+    hurdle: dict[str, Decimal] | None = None,
+) -> Cohort:
+    """Top decile of the eligible pairs by trailing funding, positive funding required.
+
+    `hurdle` maps a pair id to the minimum trailing funding it must carry to
+    be ranked at all (spec 3.3). A pair with no entry is not hurdle-checked.
+    The decile width is unchanged by the hurdle: it is still computed from
+    every eligible pair, so the hurdle can only cap how many pairs a cohort
+    holds, never widen it. A cohort that ends up with fewer pairs still
+    deploys its full 1/H share across them (`assemble_book` divides by the
+    entry count), so the per-pair weight is bounded only by
+    `minimum_selected`, which the declaration fixes at eight. Expressed
+    through `rank_paying_pairs` so the two never drift apart.
+    """
+    ids, rejections = rank_paying_pairs(
+        snapshot, trailing=trailing, selection=selection, hurdle=hurdle
+    )
+    if not ids:
         return Cohort(
             snapshot.decision_close_ns, (), (NO_CARRY_COHORT,), hurdle_rejections=rejections
         )
-    paying.sort(key=lambda item: (-item[0], item[1]))
-    size = min(len(paying), _decile_size(len(snapshot.pairs), selection))
     return Cohort(
         snapshot.decision_close_ns,
-        _entries(snapshot, [pid for _, pid in paying[:size]]),
+        _entries(snapshot, ids),
         (),
         hurdle_rejections=rejections,
     )
@@ -180,6 +209,22 @@ def exit_rule_pairs(
     }
 
 
+def random_pair_order(
+    snapshot: PairUniverseSnapshot, *, selection: CarrySelectionRules, random_seed: int
+) -> list[str]:
+    """The seeded shuffle `select_control_cohort` draws `random_pairs` from.
+
+    Every pair id, seed-shuffled and cut to the decile width, in shuffle
+    order rather than sorted -- `select_control_cohort` sorts its cohort's
+    entries afterward, but a slot book (spec 4.2) fills its newest empty
+    slots in the order the draw names them, so it needs the unsorted order.
+    """
+    ids = sorted(pair.pair_id for pair in snapshot.pairs)
+    Random(random_seed ^ snapshot.decision_close_ns).shuffle(ids)
+    size = min(len(ids), _decile_size(len(snapshot.pairs), selection))
+    return ids[:size]
+
+
 def select_control_cohort(
     snapshot: PairUniverseSnapshot,
     *,
@@ -199,11 +244,9 @@ def select_control_cohort(
         )
         return Cohort(snapshot.decision_close_ns, _entries(snapshot, ids), ())
     if kind == "random_pairs":
-        ids = sorted(pair.pair_id for pair in snapshot.pairs)
-        Random(random_seed ^ snapshot.decision_close_ns).shuffle(ids)
-        size = min(len(ids), _decile_size(len(snapshot.pairs), selection))
+        ids = random_pair_order(snapshot, selection=selection, random_seed=random_seed)
         return Cohort(
-            snapshot.decision_close_ns, _entries(snapshot, sorted(ids[:size])), ()
+            snapshot.decision_close_ns, _entries(snapshot, sorted(ids)), ()
         )
     raise ValueError(f"unknown control kind: {kind}")
 
@@ -238,4 +281,60 @@ def assemble_book(
             weights[entry.perpetual_leg] = (
                 weights.get(entry.perpetual_leg, Decimal(0)) - pair_share / 2
             )
+    return tuple(sorted(weights.items()))
+
+
+def fill_slots(
+    ranked: list[str], *, held: set[str], skip: set[str], free: int
+) -> list[str]:
+    """The first `free` ranked ids that are neither already held nor skipped.
+
+    A slot book fills its empty slots from the newest ranking (`rank_paying_
+    pairs` for members, `random_pair_order` for the random control) in rank
+    order, passing over a pair already holding a slot (`held`) and one this
+    decision must not re-enter (`skip` -- exited this week, or otherwise put
+    out of bounds). Fewer than `free` ids come back when the ranking runs out
+    first; a slot the ranking has nothing left for simply stays empty.
+    """
+    filled: list[str] = []
+    for pair_id in ranked:
+        if len(filled) == free:
+            break
+        if pair_id in held or pair_id in skip:
+            continue
+        filled.append(pair_id)
+    return filled
+
+
+def assemble_slot_book(
+    slots: tuple[Cohort, ...], *, pair_slots: int, hold_weeks: int, decision_close_ns: int
+) -> tuple[tuple[str, Decimal], ...]:
+    """Union of the still-held slots, each on a fixed `1/pair_slots` share.
+
+    A slot is a `Cohort` with exactly one entry -- the pair filling it. Unlike
+    `assemble_book`'s weekly cohorts, a slot's share never divides by an entry
+    count: it is `1/pair_slots` of the declared book regardless of how many of
+    the other slots are filled, because an empty slot leaves its share
+    undeployed rather than being redistributed onto its neighbours (spec
+    4.2's declared, not proportional, capital). The age test is
+    `assemble_book`'s, unchanged: a slot still counts while
+    `0 <= decision_close_ns - slot.decision_close_ns < hold_weeks` weeks, and
+    ages out the decision it turns `hold_weeks` old. A cohort with more than
+    one entry is not a slot and is refused rather than silently read as one.
+    """
+    if pair_slots < 1:
+        raise ValueError("pair_slots must be positive")
+    share = Decimal(1) / Decimal(pair_slots)
+    weights: dict[str, Decimal] = {}
+    for slot in slots:
+        if len(slot.entries) > 1:
+            raise ValueError("a slot cohort holds at most one entry")
+        age = decision_close_ns - slot.decision_close_ns
+        if age < 0 or age >= hold_weeks * WEEK_NS or not slot.entries:
+            continue
+        entry = slot.entries[0]
+        weights[entry.spot_leg] = weights.get(entry.spot_leg, Decimal(0)) + share / 2
+        weights[entry.perpetual_leg] = (
+            weights.get(entry.perpetual_leg, Decimal(0)) - share / 2
+        )
     return tuple(sorted(weights.items()))
