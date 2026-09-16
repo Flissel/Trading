@@ -334,19 +334,12 @@ def run_carry_fold(
                     if removed:
                         cohorts[name] = _without_pairs(cohorts[name], removed)
                 exit_removals[name].append(len(removed))
-                # A pair whose leg has no bar at this decision cannot be
-                # entered or held. In-window that leg was already force-closed
-                # and its pair stripped when it lost its exit bar; a pair that
-                # went dark during the warm-up, where no episode runs, is
-                # caught only here. Its cohort share stays undeployed, exactly
-                # as after a forced close.
-                untradeable = {
-                    entry.pair_id
-                    for retained in cohorts[name]
-                    for entry in retained.entries
-                    if decision_close_ns not in leg_histories[entry.perpetual_leg].closes
-                    or decision_close_ns not in leg_histories[entry.spot_leg].closes
-                }
+                # A pair that went dark cannot be entered or held; its cohort
+                # share stays undeployed, exactly as after a forced close.
+                untradeable = _untradeable_pairs(
+                    cohorts[name],
+                    leg_histories=leg_histories, decision_close_ns=decision_close_ns,
+                )
                 if untradeable:
                     cohorts[name] = _without_pairs(cohorts[name], untradeable)
                 weights = assemble_book(
@@ -498,6 +491,30 @@ def _without_pairs(
     return [c for c in stripped if c.entries] if drop_empty else stripped
 
 
+def _untradeable_pairs(
+    cohorts: list[Cohort],
+    *,
+    leg_histories: dict[str, ContractHistory],
+    decision_close_ns: int,
+) -> set[str]:
+    """Held pairs that have no close on one of their legs at this decision.
+
+    P1.28's untradeable rule, which the slot book takes over unchanged (spec
+    3.2), so the two books read it here rather than each keeping its own copy.
+    A pair whose leg has no bar cannot be entered or held: there is no price to
+    trade it at. In-window that leg was already force-closed and its pair
+    stripped when it lost its exit bar; a pair that went dark during the
+    warm-up, where no episode runs, is caught only here.
+    """
+    return {
+        entry.pair_id
+        for cohort in cohorts
+        for entry in cohort.entries
+        if decision_close_ns not in leg_histories[entry.perpetual_leg].closes
+        or decision_close_ns not in leg_histories[entry.spot_leg].closes
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class _SlotStep:
     """One slot candidate's slots after a decision's release, exit and fill."""
@@ -559,13 +576,9 @@ def _slot_decision(
         if decision_close_ns - slot.decision_close_ns < hold_weeks * WEEK_NS
     ]
     releases = len(slots) - len(held_slots)
-    untradeable = {
-        entry.pair_id
-        for slot in held_slots
-        for entry in slot.entries
-        if decision_close_ns not in leg_histories[entry.perpetual_leg].closes
-        or decision_close_ns not in leg_histories[entry.spot_leg].closes
-    }
+    untradeable = _untradeable_pairs(
+        held_slots, leg_histories=leg_histories, decision_close_ns=decision_close_ns
+    )
     if untradeable:
         standing = len(held_slots)
         held_slots = _without_pairs(held_slots, untradeable, drop_empty=True)
