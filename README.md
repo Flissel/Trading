@@ -395,6 +395,60 @@ Die Kette läuft neunmal (`--fold-index 0` bis `8`) und mündet in eine `panel-d
 `artifacts/carry/metadata-funding-carry-v4.sqlite3`. Kein Fold ist gelaufen; Ergebnis
 folgt als `P1_33_DECISION_<date>.md`.
 
+### Holdout-Read (P1.34)
+
+Der eine Befehl, der das finale Holdout einer Panel- oder Carry-Familie liest —
+Protokoll Abschnitt 2.3: einmal, für einen benannten Kandidaten, bevor eine Bestätigung
+irgendetwas autorisiert. Bis jetzt gab es kein Kommando, das ein Holdout lesen konnte,
+kein Kriterium, das eine Bestätigung war, und nichts, was einen zweiten Lesevorgang
+verhindert hätte; Protokoll-Abschnitt 16.2 (2026-09-17) und
+`docs/superpowers/specs/2026-09-17-holdout-read-design.md` legen das jetzt fest, bevor
+irgendein Holdout geöffnet wird.
+
+Herkunftsregel: gelesen wird mit den `final_holdout_ids` und dem Kalender des
+**ursprünglichen** Walk-forward-Manifests, nie mit neu abgeleiteten — eine erweiterte
+Aufnahme würde sie verschieben. Die Bars kommen aus **erweiterten** Captures (Perpetual
+und Spot), die als geprüfte Obermengen der ursprünglichen Captures vorliegen müssen: jede
+`sources`-Zeile der Original-Capture-Manifeste mit identischem `raw_sha256` und Status.
+Vier Links binden das Manifest zuerst an die Original-Captures — `capture_root_hash`,
+`dataset_root_hash`, `hedge_capture_root_hash`, `hedge_dataset_root_hash` —, sonst könnte
+eine beliebige, bloß in der erweiterten Capture enthaltene Aufnahme die Obermengenprüfung
+bestehen, ohne die Aufnahme zu sein, auf der die Familie tatsächlich entschieden wurde.
+
+Der Kandidat wird nicht gewählt, sondern abgeleitet: das entscheidungsfähige Mitglied mit
+dem höchsten Adverse-Gesamtertrag nach Abzug seines gepoolten adversen
+`uncharged_final_exit_cost` (0 bei Kohorten-Familien), bei Gleichstand nach
+Deklarationsreihenfolge. Gelesen werden nur der Kandidat und die zwei
+Dominanz-Kontrollen `no_trade` und `random_pairs`; die übrigen Mitglieder und die
+Kontext-Kontrolle bleiben ungelesen, damit eine spätere Generation von ihrem Holdout nicht
+informiert ist.
+
+Bestätigt wird auf den Holdout-Episoden des Kandidaten, wenn zutrifft: Basis-Gesamtertrag
+> 0; Adverse-Gesamtertrag nach dem Abzug ≥ 0; Dominanz über `no_trade` und `random_pairs`
+in beiden Szenarien; größter Episoden- und größter Paaranteil ≤ 0.5; höchstens 4 der 26
+Entscheidungen als `UNIVERSE_TOO_SMALL` übersprungen. Kein statistischer Test — 26 Wochen
+bestätigen ein Vorzeichen und eine Größenordnung, sie entdecken nichts —; gemeldet, aber
+nie gegatet, werden der mittlere wöchentliche Nettoertrag unter beiden Szenarien, der
+Anteil positiver Wochen und ob der Holdout-Basis-Mittelwert innerhalb des
+Bootstrap-Intervalls der Folds liegt. Verdikt `holdout_confirmed` oder `holdout_failed`;
+der Befehl endet in beiden Fällen mit Exit 0, denn ein gescheitertes Holdout ist ein
+Ergebnis, das der Report festhält, kein Kommandofehler.
+
+Einmalgebrauch: die Ausgabedatei ist unveränderlich, und die Registry hält ein Artefakt
+vom Typ `holdout`, dessen Id allein aus der Familie abgeleitet ist; ein zweiter
+Lesevorgang derselben Familie scheitert an der schon vorhandenen Datei oder am schon
+vorhandenen Registry-Eintrag. Scheitert nur die Registrierung, nachdem der Report
+geschrieben wurde, löscht der Befehl den gerade geschriebenen Report wieder, damit ein
+Wiederholungsversuch sauber neu starten kann, statt die Familie in einem Zustand
+zurückzulassen, der weder als gelesen noch als ungelesen behandelbar wäre.
+
+```powershell
+uv run trading-research carry-holdout --capture <perp-erweitert> --hedge-capture <spot-erweitert> --original-capture <perp-original> --original-hedge-capture <spot-original> --manifest artifacts/carry/carry-v4-walk-forward-usdt-pairs-1d-w1-v1.json --family-spec configs/funding-carry-panel-v4-measured.json --decision artifacts/carry/funding-carry-v4-decision-v1.json --fold-report artifacts/carry/funding-carry-v4-fold0-v1.json --fold-report artifacts/carry/funding-carry-v4-fold1-v1.json --fold-report artifacts/carry/funding-carry-v4-fold2-v1.json --fold-report artifacts/carry/funding-carry-v4-fold3-v1.json --fold-report artifacts/carry/funding-carry-v4-fold4-v1.json --fold-report artifacts/carry/funding-carry-v4-fold5-v1.json --fold-report artifacts/carry/funding-carry-v4-fold6-v1.json --fold-report artifacts/carry/funding-carry-v4-fold7-v1.json --fold-report artifacts/carry/funding-carry-v4-fold8-v1.json --output artifacts/carry/funding-carry-v4-holdout-v1.json --registry artifacts/carry/metadata-funding-carry-v4.sqlite3
+```
+
+Es ist noch kein Holdout gelesen worden; das Öffnen bleibt eine eigene, ausdrückliche
+Entscheidung des Nutzers.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.

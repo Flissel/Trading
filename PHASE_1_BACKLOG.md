@@ -523,6 +523,54 @@ Acceptance:
   own execution at the declared fee tier;
 - the final holdout stays closed.
 
+### P1.34 Final holdout read machinery
+
+Builds the command that opens a panel or carry family's final holdout exactly once, for a
+release candidate the command derives itself rather than one chosen by hand, under
+`docs/superpowers/specs/2026-09-17-holdout-read-design.md` and protocol section 16.2
+(added 2026-09-17, prospective, binding every family whose holdout is unopened). This item
+registers `carry-holdout` and the modules it is built from; it opens no holdout.
+
+Acceptance:
+
+- the read takes the holdout's membership and calendar from the **original** walk-forward
+  manifest's `final_holdout_ids`, never a re-derived one, which an extended capture would
+  shift;
+- the two extended captures (`--capture`/`--hedge-capture`) must each verify and be a
+  proven superset of the original capture handed in alongside them
+  (`--original-capture`/`--original-hedge-capture`) — every `sources` row of the original
+  present in the extended manifest with the identical `raw_sha256` and status — and only
+  after the manifest's four capture links (`capture_root_hash`, `dataset_root_hash`,
+  `hedge_capture_root_hash`, `hedge_dataset_root_hash`) are shown to match those original
+  captures, so the superset check cannot be satisfied by an unrelated capture;
+- the candidate is derived, not chosen: the decision's eligible member with the highest
+  adverse total net return after subtracting its pooled adverse
+  `uncharged_final_exit_cost` (zero for a cohort family), ties broken by declaration
+  order; only that member plus the two dominance controls `no_trade` and `random_pairs`
+  are evaluated — the other members and the context control are never read, so a later
+  generation is not informed by them;
+- confirmation on the candidate's holdout episodes requires all of: base total net return
+  > 0; adverse total net return minus the uncharged final exit cost ≥ 0; base total >
+  `no_trade` and > `random_pairs` base total, and the same adverse figure ≥
+  `random_pairs` adverse total and ≥ 0; largest episode share and largest pair share ≤
+  0.5; at most 4 of the 26 holdout decisions skipped as `UNIVERSE_TOO_SMALL`; no
+  statistical test is applied, and the holdout's mean weekly net return under both
+  scenarios, its fraction of positive weeks, and whether its base mean sits at or above
+  the winning declaration's bootstrap lower bound are reported, never gated;
+- the read is single use per family: the output path is created once and stays immutable,
+  and the registry (`--registry`) records one artifact of kind `holdout` keyed by the
+  family; a second read of the same family refuses on either the existing output path or
+  the existing registry record; a registration failure after the report is written
+  removes that report so a retry starts from a family that still reads as unopened;
+- extracting the fold loop into `carry_fold_run.evaluate_carry_decisions` leaves
+  `run_carry_fold` reproducible: fold 0 of the v1 fixture still reproduces
+  `tests/fixtures/carry_v1_fold0_expected.json` digit for digit, only `code_hash` and
+  `report_hash` having moved;
+- the holdout stays closed: this item runs no `carry-holdout` invocation; a read waits on
+  the September funding monthly dump (Binance publishes it in early October) and on the
+  user's explicit decision to open a holdout;
+- once a holdout is read, the record is `P1_33_HOLDOUT_<date>.md`.
+
 ## Explicitly deferred
 
 - real-capital execution;
