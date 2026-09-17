@@ -397,13 +397,15 @@ folgt als `P1_33_DECISION_<date>.md`.
 
 ### Holdout-Read (P1.34)
 
-Der eine Befehl, der das finale Holdout einer Panel- oder Carry-Familie liest —
+Der eine Befehl, der das finale Holdout einer **Carry**-Familie liest —
 Protokoll Abschnitt 2.3: einmal, für einen benannten Kandidaten, bevor eine Bestätigung
 irgendetwas autorisiert. Bis jetzt gab es kein Kommando, das ein Holdout lesen konnte,
 kein Kriterium, das eine Bestätigung war, und nichts, was einen zweiten Lesevorgang
 verhindert hätte; Protokoll-Abschnitt 16.2 (2026-09-17) und
 `docs/superpowers/specs/2026-09-17-holdout-read-design.md` legen das jetzt fest, bevor
-irgendein Holdout geöffnet wird.
+irgendein Holdout geöffnet wird. Abschnitt 16.2 bindet jede Familie mit ungeöffnetem
+Holdout, ausführbar ist bisher aber nur der Carry-Weg: einen Panel-Holdout-Pfad gibt es
+noch nicht, er wäre ein eigenes Kommando auf derselben Regel.
 
 Herkunftsregel: gelesen wird mit den `final_holdout_ids` und dem Kalender des
 **ursprünglichen** Walk-forward-Manifests, nie mit neu abgeleiteten — eine erweiterte
@@ -414,6 +416,21 @@ Vier Links binden das Manifest zuerst an die Original-Captures — `capture_root
 `dataset_root_hash`, `hedge_capture_root_hash`, `hedge_dataset_root_hash` —, sonst könnte
 eine beliebige, bloß in der erweiterten Capture enthaltene Aufnahme die Obermengenprüfung
 bestehen, ohne die Aufnahme zu sein, auf der die Familie tatsächlich entschieden wurde.
+Verifiziert werden alle vier Captures, die erweiterten wie die originalen: die
+Original-Manifeste sind die Autorität für genau diese Links, für die Obermengenzeilen und
+für die zwei `original_*`-Hashes, die das Artefakt bindet.
+
+Abdeckung ist eine eigene Abweisung, und sie hat zwei Stufen. Erstens der Kalender: die
+erweiterten Captures müssen den Exit-Monat der letzten Holdout-Episode **in jeder
+Datenart** erreichen, die sie führen — der Monat wird je Art genommen (Vereinigung über
+Symbole, nie über Arten), denn Klines und Funding-Settlements werden getrennt
+veröffentlicht. Für P1.33 heißt das: die September-Klines **beider** Märkte und die
+September-Funding-Dumps (die es nur im Perpetual-Markt gibt). Eine Aufnahme mit
+September-Klines, aber August-Funding würde den letzten Exit bepreisen und die
+Settlements der letzten Woche stillschweigend verschlucken. Zweitens der Balken selbst:
+nach dem Laden muss zum Schlusszeitpunkt des letzten Exits in beiden Märkten tatsächlich
+ein Bar vorliegen, sonst würde jede letzte Episode zwangsgeschlossen statt zu ihrem
+eigenen Preis auszusteigen — genau das, wofür die erweiterte Aufnahme existiert.
 
 Der Kandidat wird nicht gewählt, sondern abgeleitet: das entscheidungsfähige Mitglied mit
 dem höchsten Adverse-Gesamtertrag nach Abzug seines gepoolten adversen
@@ -429,14 +446,20 @@ in beiden Szenarien; größter Episoden- und größter Paaranteil ≤ 0.5; höch
 Entscheidungen als `UNIVERSE_TOO_SMALL` übersprungen. Kein statistischer Test — 26 Wochen
 bestätigen ein Vorzeichen und eine Größenordnung, sie entdecken nichts —; gemeldet, aber
 nie gegatet, werden der mittlere wöchentliche Nettoertrag unter beiden Szenarien, der
-Anteil positiver Wochen und ob der Holdout-Basis-Mittelwert innerhalb des
-Bootstrap-Intervalls der Folds liegt. Verdikt `holdout_confirmed` oder `holdout_failed`;
+Anteil positiver Wochen, die gepoolte Zahl der Zwangsschließungen des Kandidaten und ob
+der Holdout-Basis-Mittelwert **auf oder über** der Bootstrap-Untergrenze liegt, die die
+Entscheidung für genau diesen Kandidaten ausweist — einseitig, kein Intervall: ein
+Holdout, das besser ausfällt als die Folds, ist kein Befund gegen den Kandidaten.
+Verdikt `holdout_confirmed` oder `holdout_failed`;
 der Befehl endet in beiden Fällen mit Exit 0, denn ein gescheitertes Holdout ist ein
 Ergebnis, das der Report festhält, kein Kommandofehler.
 
 Einmalgebrauch: die Ausgabedatei ist unveränderlich, und die Registry hält ein Artefakt
-vom Typ `holdout`, dessen Id allein aus der Familie abgeleitet ist; ein zweiter
-Lesevorgang derselben Familie scheitert an der schon vorhandenen Datei oder am schon
+vom Typ `holdout`, dessen Id allein aus der **Deklaration** abgeleitet ist
+(`uuid5(NAMESPACE_URL, "holdout:<Familienname>:<family_spec_hash>")`) — nichts vom
+Walk-forward-Manifest steckt darin, damit eine Reparatur, die dieselbe Familie auf einem
+neuen Manifest neu veröffentlicht, ihr keinen zweiten Lesevorgang verschafft. Ein zweiter
+Lesevorgang derselben Deklaration scheitert an der schon vorhandenen Datei oder am schon
 vorhandenen Registry-Eintrag. Scheitert nur die Registrierung, nachdem der Report
 geschrieben wurde, löscht der Befehl den gerade geschriebenen Report wieder, damit ein
 Wiederholungsversuch sauber neu starten kann, statt die Familie in einem Zustand
@@ -444,6 +467,19 @@ zurückzulassen, der weder als gelesen noch als ungelesen behandelbar wäre.
 
 ```powershell
 uv run trading-research carry-holdout --capture <perp-erweitert> --hedge-capture <spot-erweitert> --original-capture <perp-original> --original-hedge-capture <spot-original> --manifest artifacts/carry/carry-v4-walk-forward-usdt-pairs-1d-w1-v1.json --family-spec configs/funding-carry-panel-v4-measured.json --decision artifacts/carry/funding-carry-v4-decision-v1.json --fold-report artifacts/carry/funding-carry-v4-fold0-v1.json --fold-report artifacts/carry/funding-carry-v4-fold1-v1.json --fold-report artifacts/carry/funding-carry-v4-fold2-v1.json --fold-report artifacts/carry/funding-carry-v4-fold3-v1.json --fold-report artifacts/carry/funding-carry-v4-fold4-v1.json --fold-report artifacts/carry/funding-carry-v4-fold5-v1.json --fold-report artifacts/carry/funding-carry-v4-fold6-v1.json --fold-report artifacts/carry/funding-carry-v4-fold7-v1.json --fold-report artifacts/carry/funding-carry-v4-fold8-v1.json --output artifacts/carry/funding-carry-v4-holdout-v1.json --registry artifacts/carry/metadata-funding-carry-v4.sqlite3
+```
+
+Ob ein Lesevorgang durchginge, wird mit `--check-only` geklärt, nicht mit dem Lesevorgang
+selbst: derselbe Befehl mit diesem Schalter führt jede Eingabeprüfung aus — beide
+Capture-Paare, Herkunft, Links, Siegel, die Kandidatenableitung und beide
+Abdeckungsprüfungen einschließlich des Balkens am letzten Exit —, gibt eine Zeile mit dem
+abgeleiteten Kandidaten und `ready` aus und endet mit 0. Er wertet nichts aus, schreibt
+nichts und registriert nichts; die eine Lesung der Familie bleibt unverbraucht. Jede
+Abweisung bleibt eine Abweisung. Ein Holdout-Read ist nicht wiederholbar — deshalb wird
+die Bereitschaft so festgestellt und nicht dadurch, dass man ihn probiert.
+
+```powershell
+uv run trading-research carry-holdout --check-only ...  # gleiche Argumente wie oben
 ```
 
 Es ist noch kein Holdout gelesen worden; das Öffnen bleibt eine eigene, ausdrückliche

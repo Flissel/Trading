@@ -57,6 +57,13 @@ holdout exit + 1. The report has the fold-report schema plus `holdout: true`, th
 name, the decision report hash, the original manifest hash, the four capture hashes and
 the confirmation verdict.
 
+A dry run (`--check-only`, added 2026-09-17) runs every input check — both captures, the
+lineage, the manifest links, the seals, the candidate derivation and both coverage checks,
+the exit month per data kind and a bar at the exit close itself — and then stops: nothing
+is evaluated, nothing is written and no artifact is registered, so the family's one read is
+still unspent. A read cannot be retried, so readiness is confirmed this way rather than by
+running the read and finding out.
+
 ## 5. Confirmation criteria (fixed here, before any read)
 
 On the candidate's holdout episodes, all of the following:
@@ -71,13 +78,20 @@ On the candidate's holdout episodes, all of the following:
 
 No statistical test is applied: 26 weeks confirm a sign and a magnitude, they do not
 discover. Reported, never gated: the holdout's mean weekly net under both scenarios, the
-fraction of positive weeks, and whether the holdout base mean lies inside the folds'
-bootstrap interval of the pooled mean. Verdict `holdout_confirmed` or `holdout_failed`.
+fraction of positive weeks, the candidate's pooled forced-close count, and whether the
+holdout's base mean is at or above the decision's bootstrap lower bound for the candidate
+(clarified 2026-09-17: one-sided, against the decision's own lower bound for that member —
+not membership of an interval, which would also fail a holdout that came out *better* than
+the folds). Verdict `holdout_confirmed` or `holdout_failed`.
 
 ## 6. Single use
 
 The output path is immutable and the registry records an artifact of kind `holdout` whose
-id is derived from the family id alone; a second read of the same family refuses on either.
+id is derived from the family's **declaration** alone —
+`uuid5(NAMESPACE_URL, "holdout:<family name>:<family spec hash>")`, carrying nothing of the
+walk-forward manifest the read ran on, so a capture repair that republishes the family on a
+new manifest cannot hand it a second read; a second read of the same declaration refuses on
+either the existing output path or the existing record.
 A failed holdout ends the family's generation (protocol 2.3): no re-read, no re-declaration
 of the same family; a successor family needs a later untouched period.
 

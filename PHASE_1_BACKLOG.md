@@ -525,24 +525,35 @@ Acceptance:
 
 ### P1.34 Final holdout read machinery
 
-Builds the command that opens a panel or carry family's final holdout exactly once, for a
+Builds the command that opens a **carry** family's final holdout exactly once, for a
 release candidate the command derives itself rather than one chosen by hand, under
 `docs/superpowers/specs/2026-09-17-holdout-read-design.md` and protocol section 16.2
-(added 2026-09-17, prospective, binding every family whose holdout is unopened). This item
-registers `carry-holdout` and the modules it is built from; it opens no holdout.
+(added 2026-09-17, prospective, binding every family whose holdout is unopened). Section
+16.2 binds every such family, but only the carry path is built: a panel holdout read would
+be a second command on the same rule and does not exist yet. This item registers
+`carry-holdout` and the modules it is built from; it opens no holdout.
 
 Acceptance:
 
 - the read takes the holdout's membership and calendar from the **original** walk-forward
   manifest's `final_holdout_ids`, never a re-derived one, which an extended capture would
   shift;
-- the two extended captures (`--capture`/`--hedge-capture`) must each verify and be a
-  proven superset of the original capture handed in alongside them
-  (`--original-capture`/`--original-hedge-capture`) — every `sources` row of the original
-  present in the extended manifest with the identical `raw_sha256` and status — and only
-  after the manifest's four capture links (`capture_root_hash`, `dataset_root_hash`,
+- all four captures verify — the two extended ones (`--capture`/`--hedge-capture`) and the
+  two originals (`--original-capture`/`--original-hedge-capture`), whose manifests are the
+  authority for everything below — and each extended capture must be a proven superset of
+  the original handed in alongside it (every `sources` row of the original present in the
+  extended manifest with the identical `raw_sha256` and status), and only after the
+  manifest's four capture links (`capture_root_hash`, `dataset_root_hash`,
   `hedge_capture_root_hash`, `hedge_dataset_root_hash`) are shown to match those original
   captures, so the superset check cannot be satisfied by an unrelated capture;
+- the extended captures must reach the holdout's last exit twice over, or the read
+  refuses: the exit month in **every data kind** they carry — the month is taken per kind,
+  the union over symbols but never over kinds, so for P1.33 the September klines of both
+  markets *and* the September funding dumps (perpetual only) are required, a capture whose
+  klines reach September while its funding stops in August pricing the last exit and
+  losing the final week's settlements — and, once the bars are loaded, an actual bar at the
+  last exit close in both markets, without which every last episode would be force-closed
+  instead of exiting at its own price;
 - the candidate is derived, not chosen: the decision's eligible member with the highest
   adverse total net return after subtracting its pooled adverse
   `uncharged_final_exit_cost` (zero for a cohort family), ties broken by declaration
@@ -555,13 +566,22 @@ Acceptance:
   `random_pairs` adverse total and ≥ 0; largest episode share and largest pair share ≤
   0.5; at most 4 of the 26 holdout decisions skipped as `UNIVERSE_TOO_SMALL`; no
   statistical test is applied, and the holdout's mean weekly net return under both
-  scenarios, its fraction of positive weeks, and whether its base mean sits at or above
-  the winning declaration's bootstrap lower bound are reported, never gated;
-- the read is single use per family: the output path is created once and stays immutable,
-  and the registry (`--registry`) records one artifact of kind `holdout` keyed by the
-  family; a second read of the same family refuses on either the existing output path or
-  the existing registry record; a registration failure after the report is written
-  removes that report so a retry starts from a family that still reads as unopened;
+  scenarios, its fraction of positive weeks, the candidate's pooled forced-close count,
+  and whether its base mean sits at or above the decision's bootstrap lower bound for that
+  candidate — one-sided, not membership of an interval — are reported, never gated;
+- the read is single use per **declaration**: the output path is created once and stays
+  immutable, and the registry (`--registry`) records one artifact of kind `holdout` whose
+  id is `uuid5(NAMESPACE_URL, "holdout:<family name>:<family spec hash>")` and carries
+  nothing of the walk-forward manifest, so a repair that republishes the same family on a
+  new manifest cannot reopen its holdout; a second read of the same declaration refuses on
+  either the existing output path or the existing registry record; a registration failure
+  after the report is written removes that report so a retry starts from a family that
+  still reads as unopened;
+- `--check-only` is the dry run: every input check above, the candidate derivation and both
+  coverage checks run, one line names the derived candidate and `ready`, exit 0 — nothing
+  is evaluated, nothing is written, nothing is registered, and the declaration's one read
+  stays unspent; refusals behave exactly as in a real read, so readiness is established
+  without spending the read on finding out;
 - extracting the fold loop into `carry_fold_run.evaluate_carry_decisions` leaves
   `run_carry_fold` reproducible: fold 0 of the v1 fixture still reproduces
   `tests/fixtures/carry_v1_fold0_expected.json` digit for digit, only `code_hash` and
