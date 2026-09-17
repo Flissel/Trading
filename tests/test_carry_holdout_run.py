@@ -45,8 +45,9 @@ from trading_bot.carry_holdout_run import (
 from trading_bot.cli import main
 from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_panel
 from trading_bot.panel_config import load_family_spec
+from trading_bot.panel_fold_run import verify_panel_fold_report
 from trading_bot.panel_samples import publish_panel_walk_forward
-from trading_bot.registry import MetadataRegistry
+from trading_bot.registry import ArtifactRecord, MetadataRegistry, RegistryConflictError
 
 # The eighth month the extended captures add. `kline_csv`/`funding_csv` read the
 # month tables of `tests.test_panel_fold_run` by key at call time, and those
@@ -125,6 +126,7 @@ def _seal_decision(
     manifest: dict[str, object],
     fold_report_hashes: tuple[str, ...],
     eligible: tuple[str, ...],
+    split_manifest_hash: str | None = None,
 ) -> str:
     """Write a decision document sealed exactly as `panel_decision` seals one.
 
@@ -136,7 +138,11 @@ def _seal_decision(
         "status": "development_only",
         "family_name": str(manifest["family_name"]),
         "family_spec_hash": str(manifest["family_spec_hash"]),
-        "split_manifest_hash": str(manifest["split_manifest_hash"]),
+        "split_manifest_hash": (
+            split_manifest_hash
+            if split_manifest_hash is not None
+            else str(manifest["split_manifest_hash"])
+        ),
         "source_report_hashes": list(fold_report_hashes),
         "members": [
             {
@@ -265,6 +271,7 @@ def _read(
     original_perp: Path | None = None,
     original_spot: Path | None = None,
     decision: Path | None = None,
+    fold_reports: tuple[Path, ...] | None = None,
     output_name: str = "holdout.json",
 ) -> CarryHoldoutArtifact:
     return run_carry_holdout(
@@ -279,7 +286,7 @@ def _read(
         manifest_path=chain.manifest,
         family_spec_path=chain.config,
         decision_path=decision if decision is not None else chain.decision,
-        fold_report_paths=chain.fold_reports,
+        fold_report_paths=fold_reports if fold_reports is not None else chain.fold_reports,
         output_path=directory / output_name,
         registry_path=directory / "registry.sqlite3",
     )
@@ -637,6 +644,95 @@ def test_a_decision_whose_seal_does_not_recompute_refuses(chain: Chain) -> None:
     decision.write_bytes(canonical_json(document))
     with pytest.raises(CarryHoldoutError):
         _read(chain, directory, decision=decision)
+
+
+def test_a_decision_made_on_another_walk_forward_manifest_refuses(chain: Chain) -> None:
+    """The declaration is shared across manifests; the split hash is not.
+
+    A capture repair republishes the same family on a new walk-forward, so a
+    decision pooled under the older one carries the right `family_spec_hash`
+    and would otherwise be read against this manifest's calendar, holdout
+    membership and single-use artifact id.
+    """
+    directory = _case(chain, "decision-manifest")
+    decision = directory / "decision.json"
+    _seal_decision(
+        decision, manifest=_document(chain.manifest),
+        fold_report_hashes=tuple(
+            str(_document(path)["report_hash"]) for path in chain.fold_reports
+        ),
+        eligible=(LOSING_MEMBER, WINNING_MEMBER),
+        split_manifest_hash="9" * 64,
+    )
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(chain, directory, decision=decision)
+    assert str(error.value) == "decision is not linked to this manifest (split_manifest_hash)"
+    assert not (directory / "holdout.json").exists()
+
+
+def test_a_fold_report_from_another_manifest_refuses(chain: Chain) -> None:
+    """Resealed the way a fold report is sealed, so only the link can catch it.
+
+    The decision names the tampered report, so the `source_report_hashes` check
+    passes; `verify_panel_fold_report` passes too, because the report is a
+    valid seal over its own (wrong) manifest hash.
+    """
+    directory = _case(chain, "fold-manifest")
+    material = {
+        key: value
+        for key, value in _document(chain.fold_reports[0]).items()
+        if key != "report_hash"
+    }
+    material["manifest_hash"] = "9" * 64
+    report_hash = content_sha256(material)
+    document = dict(material)
+    document["report_hash"] = report_hash
+    tampered = directory / "fold0.json"
+    tampered.write_bytes(canonical_json(document))
+    assert verify_panel_fold_report(tampered)
+
+    decision = directory / "decision.json"
+    _seal_decision(
+        decision, manifest=_document(chain.manifest),
+        fold_report_hashes=(
+            report_hash, str(_document(chain.fold_reports[1])["report_hash"])
+        ),
+        eligible=(LOSING_MEMBER, WINNING_MEMBER),
+    )
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(
+            chain, directory, decision=decision,
+            fold_reports=(tampered, chain.fold_reports[1]),
+        )
+    assert str(error.value) == (
+        "fold report fold0.json is not linked to this manifest (manifest_hash)"
+    )
+    assert not (directory / "holdout.json").exists()
+
+
+def test_a_registry_failure_leaves_no_report_behind(
+    chain: Chain, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec section 6: the report and its registry record are one artifact.
+
+    A report nothing recorded would be immutable at a path no retry could
+    reuse while the family still read as unopened, so the failed call takes
+    its own report back out and a corrected retry runs to completion.
+    """
+    directory = _case(chain, "registry-failure")
+
+    def refuse(self: MetadataRegistry, artifact: ArtifactRecord) -> None:
+        raise RegistryConflictError("simulated registry failure")
+
+    monkeypatch.setattr(MetadataRegistry, "register_artifact", refuse)
+    with pytest.raises(CarryHoldoutError):
+        _read(chain, directory)
+    assert not (directory / "holdout.json").exists()
+    assert list(directory.glob("holdout.json*")) == []
+
+    monkeypatch.undo()
+    artifact = _read(chain, directory)
+    assert artifact.output_path.exists()
 
 
 def test_a_decision_without_an_eligible_member_refuses(chain: Chain) -> None:

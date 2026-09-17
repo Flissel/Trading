@@ -53,6 +53,12 @@ CONCENTRATION_LIMIT = Decimal("0.5")
 # control (`all_pairs_ew`) and the other members are never evaluated, so their
 # holdout stays unread and a later generation is not informed by it.
 DOMINANCE_CONTROL_NAMES: tuple[str, ...] = ("no_trade", "random_pairs")
+# What every fold report the decision pooled must share with the walk-forward
+# manifest this read takes its calendar from: the same walk-forward, the same
+# published manifest, and the same two original captures.
+_FOLD_MANIFEST_LINKS: tuple[str, ...] = (
+    "split_manifest_hash", "manifest_hash", "capture_root_hash", "hedge_capture_root_hash",
+)
 # The evaluation path the fold runner hashes, plus the two modules only a
 # holdout read runs through.
 _HOLDOUT_MODULES: tuple[str, ...] = (
@@ -228,10 +234,22 @@ def run_carry_holdout(
         "confirmation": confirmation,
     }
     report_hash = _seal(material, output_path)
-    _register(
-        verified.artifact_id,
-        output_path=output_path, report_hash=report_hash, registry_path=registry_path,
-    )
+    try:
+        _register(
+            verified.artifact_id,
+            output_path=output_path, report_hash=report_hash, registry_path=registry_path,
+        )
+    except Exception as error:
+        # The report and the registry record are one artifact (spec section 6):
+        # a report nothing recorded would be immutable at a path no retry could
+        # reuse, while the family still reads as unopened -- the one state that
+        # can neither be used nor cleared. This report was written by this call
+        # alone (the pre-check proved the family had no holdout record), so
+        # removing it puts the family back exactly where it was.
+        output_path.unlink(missing_ok=True)
+        raise CarryHoldoutError(
+            f"holdout artifact could not be registered: {type(error).__name__}: {error}"
+        ) from error
     return CarryHoldoutArtifact(
         output_path=output_path,
         report_hash=report_hash,
@@ -258,10 +276,11 @@ def _verify_inputs(
     published under this declaration; the originals handed in are the very
     captures that manifest was published from; each extended capture is a
     superset of its original (spec section 2); the decision's seal recomputes,
-    it was made under this declaration and it names exactly these fold reports,
-    in order; every fold report verifies; the family has no holdout artifact yet
-    (spec section 6); and the extended captures reach the calendar month the
-    holdout's last episode exits in. Nothing is written before all of them hold.
+    it was made under this declaration and on this manifest, and it names
+    exactly these fold reports, in order; every fold report verifies and was
+    itself run on this manifest; the family has no holdout artifact yet (spec
+    section 6); and the extended captures reach the calendar month the holdout's
+    last episode exits in. Nothing is written before all of them hold.
     """
     for root, label in ((perp_capture_root, "perpetual"), (spot_capture_root, "spot")):
         valid, errors = verify_panel_capture(root)
@@ -276,6 +295,7 @@ def _verify_inputs(
     manifest = _load_object(manifest_path)
     if manifest.get("family_spec_hash") != family_spec_hash:
         raise CarryHoldoutError("family declaration does not match the manifest")
+    split_manifest_hash = _text(manifest.get("split_manifest_hash"), "split_manifest_hash")
 
     # The lineage check below only proves the extended capture contains the
     # original; it cannot tell whether that original is the capture the
@@ -312,6 +332,14 @@ def _verify_inputs(
         raise CarryHoldoutError("decision verification failed")
     if decision.get("family_spec_hash") != family_spec_hash:
         raise CarryHoldoutError("family declaration does not match the decision")
+    # The declaration alone does not pin the walk-forward: a repair republishes
+    # the same family on a new manifest, and a decision pooled under the older
+    # one would otherwise pass every check here while this read takes its
+    # calendar, its holdout membership and its single-use artifact id from the
+    # newer one. The split manifest hash is what says which walk-forward the
+    # decision was actually made on.
+    if decision.get("split_manifest_hash") != split_manifest_hash:
+        raise CarryHoldoutError("decision is not linked to this manifest (split_manifest_hash)")
     fold_reports = tuple(_load_object(path) for path in fold_report_paths)
     named = [
         _text(value, "source_report_hashes entry")
@@ -321,11 +349,18 @@ def _verify_inputs(
         _text(document.get("report_hash"), "fold report_hash") for document in fold_reports
     ]:
         raise CarryHoldoutError("the decision does not name these fold reports in this order")
-    for path in fold_report_paths:
+    for path, document in zip(fold_report_paths, fold_reports, strict=True):
         if not verify_panel_fold_report(path):
             raise CarryHoldoutError(f"fold report failed verification: {path.name}")
+        # Same reasoning one level down: every fold the decision pooled must
+        # have been run on this manifest and on the captures it names, or the
+        # holdout would be opened for a candidate derived from other windows.
+        for key in _FOLD_MANIFEST_LINKS:
+            if document.get(key) != manifest.get(key):
+                raise CarryHoldoutError(
+                    f"fold report {path.name} is not linked to this manifest ({key})"
+                )
 
-    split_manifest_hash = _text(manifest.get("split_manifest_hash"), "split_manifest_hash")
     family_id = uuid5(NAMESPACE_URL, f"{split_manifest_hash}:{spec.family_name}")
     artifact_id = uuid5(family_id, HOLDOUT_ARTIFACT_KIND)
     with MetadataRegistry(registry_path) as registry:
