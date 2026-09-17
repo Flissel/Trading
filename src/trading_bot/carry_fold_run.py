@@ -99,6 +99,22 @@ class CarryFoldArtifact:
     skipped_sample_count: int
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionRun:
+    """What evaluating a list of decisions produced, before it is sealed.
+
+    Exactly the parts of a fold report that come out of the decision loop
+    rather than out of the manifest, so a fold report and a holdout read are
+    assembled from one evaluation rather than from two copies of it.
+    """
+
+    candidates: list[dict[str, object]]
+    skipped_sample_ids: list[str]
+    episode_count: int
+    reason_codes: list[str]
+    warm_up_weeks: int
+
+
 def run_carry_fold(
     perp_capture_root: Path,
     spot_capture_root: Path,
@@ -175,9 +191,89 @@ def run_carry_fold(
 
     test_ids = [str(value) for value in fold["test_ids"]]
     decisions = sorted(int(value.split(":")[1]) for value in test_ids)
+    run = evaluate_carry_decisions(
+        spec,
+        perp_histories=perp_histories, spot_histories=spot_histories,
+        leg_histories=leg_histories, funding_by_leg=funding_by_leg,
+        decisions=decisions,
+    )
+    material: dict[str, object] = {
+        "report_version": "1.0.0",
+        "status": "development_only",
+        "reason_codes": run.reason_codes,
+        "family_name": spec.family_name,
+        "family_spec_hash": family_spec_hash,
+        "capture_root_hash": str(manifest["capture_root_hash"]),
+        "dataset_root_hash": str(manifest["dataset_root_hash"]),
+        "hedge_capture_root_hash": str(manifest["hedge_capture_root_hash"]),
+        "hedge_dataset_root_hash": str(manifest["hedge_dataset_root_hash"]),
+        "split_manifest_hash": str(manifest["split_manifest_hash"]),
+        "manifest_hash": str(manifest["manifest_hash"]),
+        "fold_index": fold_index,
+        "fold_count": len(folds),
+        "train_sample_count": len(fold["train_ids"]),
+        "validation_sample_count": len(fold["validation_ids"]),
+        "test_sample_count": len(test_ids),
+        "train_membership_hash": content_sha256(list(fold["train_ids"])),
+        "validation_membership_hash": content_sha256(list(fold["validation_ids"])),
+        "test_membership_hash": content_sha256(test_ids),
+        "random_seed": spec.statistics.random_seed,
+        "block_length": spec.statistics.block_length,
+        "bootstrap_repetitions": spec.statistics.bootstrap_repetitions,
+        "skipped_sample_ids": run.skipped_sample_ids,
+        "warm_up_weeks": run.warm_up_weeks,
+        "code_hash": _code_hash(),
+        "candidates": run.candidates,
+    }
+    report_hash = content_sha256(material)
+    document = dict(material)
+    document["report_hash"] = report_hash
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+    temporary.write_bytes(canonical_json(document))
+    temporary.replace(output_path)
+    _register(spec, manifest, report_hash, registry_path)
+    return CarryFoldArtifact(
+        output_path, report_hash, fold_index, run.episode_count, len(run.skipped_sample_ids)
+    )
+
+
+def evaluate_carry_decisions(
+    spec: CarryFamilySpec,
+    *,
+    perp_histories: dict[str, ContractHistory],
+    spot_histories: dict[str, ContractHistory],
+    leg_histories: dict[str, ContractHistory],
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]],
+    decisions: list[int],
+    candidate_names: tuple[str, ...] | None = None,
+) -> DecisionRun:
+    """Evaluate one list of weekly decisions for a declaration's candidates.
+
+    The fold runner's in-window loop, warm-up included: `warm_up_weeks_of(spec)`
+    Sundays before `decisions[0]` form cohorts that no episode is evaluated on,
+    then every decision is evaluated on the cohort or the slot book as the
+    declaration says. A holdout read is the same loop over the holdout's
+    decisions, so it runs through here rather than through a second copy.
+
+    `candidate_names` restricts the evaluation to those members and controls,
+    in declaration order (`None` is every candidate); a name the declaration
+    does not carry is refused. Nothing else is filtered: the controls still
+    borrow `control_reference(spec)`'s hold and the prune still bounds state at
+    the declaration's longest hold, so a candidate's record is the same record
+    whether or not its siblings were asked for.
+    """
     members: dict[str, CarryMember] = {m.name: m for m in spec.members}
     controls: dict[str, CarryControl] = {c.name: c for c in spec.controls}
     names: list[str] = [m.name for m in spec.members] + [c.name for c in spec.controls]
+    if candidate_names is not None:
+        for name in candidate_names:
+            if name not in members and name not in controls:
+                raise CarryFoldError(
+                    f"{name} is neither a declared member nor a declared control"
+                )
+        requested = set(candidate_names)
+        names = [name for name in names if name in requested]
     scenarios: tuple[CarryCostTable, ...] = (spec.costs.base, spec.costs.adverse)
     episodes: dict[tuple[str, str], list[CarryEpisode]] = {
         (n, s.name): [] for n in names for s in scenarios
@@ -216,8 +312,8 @@ def run_carry_fold(
     slot_names: set[str] = (
         set()
         if capital is None
-        else {member.name for member in spec.members}
-        | {control.name for control in spec.controls if control.kind == "random_pairs"}
+        else {name for name in names if name in members}
+        | {name for name in names if name in controls and controls[name].kind == "random_pairs"}
     )
 
     # Warm-up: form (only) the cohorts of the Sundays before the fold's
@@ -382,7 +478,7 @@ def run_carry_fold(
                 c for c in cohorts[name] if decision_close_ns - c.decision_close_ns < longest
             ]
 
-    episode_count = len(episodes[(names[0], "base")])
+    episode_count = len(episodes[(names[0], "base")]) if names else 0
     # Spec 3.3: what liquidating the fold's last book would cost, stated
     # because a slot book never warms and so leaves its whole final exit
     # outside the window. `tiers` is the last evaluated decision's.
@@ -407,7 +503,7 @@ def run_carry_fold(
     else:
         reason_codes.append("FOLD_FINAL_EXIT_COST_UNCHARGED")
 
-    candidates = [
+    candidates: list[dict[str, object]] = [
         {
             "candidate_name": name,
             "role": "member" if name in members else "control",
@@ -428,43 +524,13 @@ def run_carry_fold(
         }
         for name in names
     ]
-    material: dict[str, object] = {
-        "report_version": "1.0.0",
-        "status": "development_only",
-        "reason_codes": reason_codes,
-        "family_name": spec.family_name,
-        "family_spec_hash": family_spec_hash,
-        "capture_root_hash": str(manifest["capture_root_hash"]),
-        "dataset_root_hash": str(manifest["dataset_root_hash"]),
-        "hedge_capture_root_hash": str(manifest["hedge_capture_root_hash"]),
-        "hedge_dataset_root_hash": str(manifest["hedge_dataset_root_hash"]),
-        "split_manifest_hash": str(manifest["split_manifest_hash"]),
-        "manifest_hash": str(manifest["manifest_hash"]),
-        "fold_index": fold_index,
-        "fold_count": len(folds),
-        "train_sample_count": len(fold["train_ids"]),
-        "validation_sample_count": len(fold["validation_ids"]),
-        "test_sample_count": len(test_ids),
-        "train_membership_hash": content_sha256(list(fold["train_ids"])),
-        "validation_membership_hash": content_sha256(list(fold["validation_ids"])),
-        "test_membership_hash": content_sha256(test_ids),
-        "random_seed": spec.statistics.random_seed,
-        "block_length": spec.statistics.block_length,
-        "bootstrap_repetitions": spec.statistics.bootstrap_repetitions,
-        "skipped_sample_ids": skipped,
-        "warm_up_weeks": warm_up_weeks,
-        "code_hash": _code_hash(),
-        "candidates": candidates,
-    }
-    report_hash = content_sha256(material)
-    document = dict(material)
-    document["report_hash"] = report_hash
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = output_path.with_suffix(output_path.suffix + ".tmp")
-    temporary.write_bytes(canonical_json(document))
-    temporary.replace(output_path)
-    _register(spec, manifest, report_hash, registry_path)
-    return CarryFoldArtifact(output_path, report_hash, fold_index, episode_count, len(skipped))
+    return DecisionRun(
+        candidates=candidates,
+        skipped_sample_ids=skipped,
+        episode_count=episode_count,
+        reason_codes=reason_codes,
+        warm_up_weeks=warm_up_weeks,
+    )
 
 
 def _without_pairs(

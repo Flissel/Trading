@@ -38,12 +38,22 @@ from trading_bot.carry_config import (
     MEMBER_NAMES_V4,
     load_carry_family_spec,
 )
-from trading_bot.carry_fold_run import CarryFoldError, control_reference, run_carry_fold
+from trading_bot.carry_fold_run import (
+    FOLD_WARMED_REASON_CODE,
+    CarryFoldError,
+    DecisionRun,
+    control_reference,
+    evaluate_carry_decisions,
+    run_carry_fold,
+    warm_up_weeks_of,
+)
 from trading_bot.carry_signals import hurdle_minimum_trailing, random_pair_order
 from trading_bot.carry_universe import EligiblePair, PairUniverseSnapshot
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_fold_run import verify_panel_fold_report
+from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
+from trading_bot.panel_universe import build_contract_histories
 from trading_bot.registry import MetadataRegistry
 
 Workspace = tuple[Path, Path, Path, Path]  # root, perp capture, spot capture, config
@@ -1066,3 +1076,110 @@ def test_a_universe_too_small_week_empties_every_slot(
         assert _extras(document, name, "slot_releases") == [Decimal(0), Decimal(0)]
         assert _decimal(episodes[1]["gross_exposure"]) == Decimal("0.5")
         assert _decimal(episodes[1]["turnover"]) == Decimal("0.5")
+
+
+# --- the decision loop, run on its own ---------------------------------------
+
+
+def _decision_runner(
+    space: Workspace, fold_index: int = 0
+) -> Callable[[tuple[str, ...] | None], DecisionRun]:
+    """Load one fold's bars, funding and decisions as `run_carry_fold` does,
+    and hand back a caller that evaluates them for a choice of candidates.
+
+    The holdout runner will load the same way and call the same function with
+    its own decisions, so a full run and a filtered one are compared here over
+    one set of inputs, with nothing between them but `candidate_names`.
+    """
+    root, perp, spot, config_path = space
+    spec, _ = load_carry_family_spec(config_path)
+    fold = next(
+        item
+        for item in json.loads((root / "manifest.json").read_text(encoding="utf-8"))["folds"]
+        if item["fold_index"] == fold_index
+    )
+    test_end_ns = int(fold["test_end_ns"])
+    perp_histories = build_contract_histories(
+        load_panel_bars(perp / "dataset", available_before_ns=test_end_ns + 1)
+    )
+    spot_histories = build_contract_histories(
+        load_panel_bars(spot / "dataset", available_before_ns=test_end_ns + 1)
+    )
+    leg_histories = {f"perp:{cid}": history for cid, history in perp_histories.items()}
+    leg_histories.update({f"spot:{cid}": history for cid, history in spot_histories.items()})
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
+    for event in load_funding_events(perp / "dataset"):
+        leg_key = f"perp:{event.contract_id}"
+        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
+    decisions = sorted(int(str(value).split(":")[1]) for value in fold["test_ids"])
+
+    def evaluate(candidate_names: tuple[str, ...] | None) -> DecisionRun:
+        return evaluate_carry_decisions(
+            spec,
+            perp_histories=perp_histories, spot_histories=spot_histories,
+            leg_histories=leg_histories, funding_by_leg=funding_by_leg,
+            decisions=decisions, candidate_names=candidate_names,
+        )
+
+    return evaluate
+
+
+def _run_names(run: DecisionRun) -> list[str]:
+    return [str(record["candidate_name"]) for record in run.candidates]
+
+
+def _assert_records_match(filtered: DecisionRun, full: DecisionRun) -> None:
+    """Every filtered record is the full run's record for that candidate."""
+    by_name = {str(record["candidate_name"]): record for record in full.candidates}
+    for record in filtered.candidates:
+        assert record == by_name[str(record["candidate_name"])], record["candidate_name"]
+
+
+def test_a_filtered_slot_run_is_the_full_run_s_records_for_those_candidates(
+    v4_workspace: Workspace,
+) -> None:
+    """A holdout read runs one member and the two controls it is compared
+    against, not the whole family -- and the three records it gets back are
+    field for field the ones the same decisions produce for every candidate,
+    so restricting the candidates cannot move a number."""
+    space = v4_workspace
+    spec, _ = load_carry_family_spec(space[3])
+    evaluate = _decision_runner(space)
+    full = evaluate(None)
+    wanted = ("carry_s10_l4w_h26w_exit", "no_trade", "random_pairs")
+    filtered = evaluate(wanted)
+    assert _run_names(full) == list(MEMBER_NAMES_V4 + CONTROL_NAMES)
+    assert _run_names(filtered) == list(wanted)
+    # declaration order, whatever order the caller asked in
+    assert _run_names(evaluate(tuple(reversed(wanted)))) == list(wanted)
+    _assert_records_match(filtered, full)
+    assert filtered.skipped_sample_ids == full.skipped_sample_ids
+    assert filtered.episode_count == full.episode_count
+    assert filtered.reason_codes == full.reason_codes == ["FOLD_FINAL_EXIT_COST_UNCHARGED"]
+    assert filtered.warm_up_weeks == full.warm_up_weeks == warm_up_weeks_of(spec) == 0
+
+
+def test_a_filtered_cohort_run_warms_the_same_book_as_the_full_run(
+    workspace: Workspace,
+) -> None:
+    """The warm-up is per candidate, so a filtered run warms exactly the
+    cohorts its candidates need: v1's twelve warm-up Sundays leave the
+    filtered records digit for digit where the full run leaves them."""
+    spec, _ = load_carry_family_spec(workspace[3])
+    evaluate = _decision_runner(workspace)
+    full = evaluate(None)
+    wanted = ("carry_l1w_h4w", "all_pairs_ew")
+    filtered = evaluate(wanted)
+    assert _run_names(filtered) == list(wanted)
+    _assert_records_match(filtered, full)
+    assert filtered.warm_up_weeks == full.warm_up_weeks == warm_up_weeks_of(spec) == 12
+    assert filtered.reason_codes == full.reason_codes
+    assert filtered.reason_codes[0] == FOLD_WARMED_REASON_CODE
+
+
+def test_an_undeclared_candidate_name_is_refused(v4_workspace: Workspace) -> None:
+    """Fail closed: a name the declaration does not carry is a caller error,
+    not a silently empty book."""
+    evaluate = _decision_runner(v4_workspace)
+    with pytest.raises(CarryFoldError):
+        evaluate(("carry_s10_l4w_h26w_exit", "carry_l4w_h26w_exit"))
