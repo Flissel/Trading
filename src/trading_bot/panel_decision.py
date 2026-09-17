@@ -409,6 +409,35 @@ def build_panel_decision(
     )
 
 
+def concentration_shares(
+    *,
+    base_total: Decimal,
+    fold_base_totals: tuple[Decimal, ...],
+    contract_totals: dict[str, Decimal],
+    base_returns: tuple[Decimal, ...],
+) -> dict[str, Decimal]:
+    """The three shares spec section 8.2's concentration limit is applied to.
+
+    Each is one contributor's share of the base total: the largest fold, the
+    largest contract (a pair, for a carry family) and the largest single
+    episode. Empty when the base total is not positive -- a share of a zero or
+    negative total states nothing, and a member whose base total is not
+    positive has already failed on that count.
+
+    Extracted so the pooled decision and the single-use holdout read (protocol
+    16.2) apply one rule rather than two copies of it. The holdout read passes
+    `fold_base_totals=()`, having exactly one window rather than nine, and
+    reads only the contract and episode shares.
+    """
+    if base_total <= 0:
+        return {}
+    return {
+        "largest_fold_share": max(fold_base_totals, default=Decimal(0)) / base_total,
+        "largest_contract_share": max(contract_totals.values(), default=Decimal(0)) / base_total,
+        "largest_episode_share": max(base_returns, default=Decimal(0)) / base_total,
+    }
+
+
 def _register_artifact(registry_path: Path, *, output_path: Path, report_hash: str) -> None:
     artifact_id = uuid5(NAMESPACE_URL, f"panel_decision:{report_hash}")
     with MetadataRegistry(registry_path) as registry:
@@ -804,21 +833,16 @@ def _member_record(
     if q_value is not None and q_value > spec.statistics.false_discovery_gate:
         economic.append("MULTIPLE_TESTING_GATE_NOT_MET")
 
-    shares: dict[str, Decimal] = {}
-    if pooled.base_total > 0:
-        limit = spec.statistics.concentration_limit
-        shares = {
-            "largest_fold_share": max(pooled.fold_base_totals, default=Decimal(0))
-            / pooled.base_total,
-            "largest_contract_share": max(
-                pooled.contract_totals.values(), default=Decimal(0)
-            )
-            / pooled.base_total,
-            "largest_episode_share": max(pooled.base_returns, default=Decimal(0))
-            / pooled.base_total,
-        }
-        if any(value > limit for value in shares.values()):
-            economic.append("CONCENTRATION_LIMIT_EXCEEDED")
+    # Empty for a non-positive base total, exactly as before the shares moved
+    # into `concentration_shares`, so `any` over it stays False there too.
+    shares = concentration_shares(
+        base_total=pooled.base_total,
+        fold_base_totals=pooled.fold_base_totals,
+        contract_totals=pooled.contract_totals,
+        base_returns=pooled.base_returns,
+    )
+    if any(value > spec.statistics.concentration_limit for value in shares.values()):
+        economic.append("CONCENTRATION_LIMIT_EXCEEDED")
     if pooled.base_total <= strongest_base:
         economic.append("BASE_CONTROL_DOMINANCE_NOT_MET")
     if pooled.adverse_total <= strongest_adverse:

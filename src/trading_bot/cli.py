@@ -22,6 +22,7 @@ from trading_bot.binance_cost_journal import (
     run_journal,
 )
 from trading_bot.carry_fold_run import run_carry_fold
+from trading_bot.carry_holdout_run import run_carry_holdout
 from trading_bot.carry_measured_costs import (
     DEFAULT_BASE_DECLARATION,
     MeasuredCostError,
@@ -141,6 +142,18 @@ def main(arguments: list[str] | None = None) -> int:
     carry_fold.add_argument("--output", type=Path, required=True)
     carry_fold.add_argument("--registry", type=Path, required=True)
     carry_fold.add_argument("--fold-index", type=int, required=True)
+    carry_holdout = commands.add_parser("carry-holdout")
+    carry_holdout.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    carry_holdout.add_argument("--capture", type=Path, required=True)
+    carry_holdout.add_argument("--hedge-capture", type=Path, required=True)
+    carry_holdout.add_argument("--original-capture", type=Path, required=True)
+    carry_holdout.add_argument("--original-hedge-capture", type=Path, required=True)
+    carry_holdout.add_argument("--manifest", type=Path, required=True)
+    carry_holdout.add_argument("--family-spec", type=Path, required=True)
+    carry_holdout.add_argument("--decision", type=Path, required=True)
+    carry_holdout.add_argument("--fold-report", type=Path, action="append", required=True)
+    carry_holdout.add_argument("--output", type=Path, required=True)
+    carry_holdout.add_argument("--registry", type=Path, required=True)
     carry_declare = commands.add_parser("carry-declare-measured")
     carry_declare.add_argument("--workspace-root", type=Path, default=Path.cwd())
     carry_declare.add_argument("--receipt", type=Path, required=True)
@@ -408,6 +421,8 @@ def main(arguments: list[str] | None = None) -> int:
             fold_index=parsed.fold_index,
         )
         return 0
+    if parsed.command == "carry-holdout":
+        return _carry_holdout(parsed)
     if parsed.command == "carry-declare-measured":
         return _carry_declare_measured(parsed)
     if parsed.command == "carry-verify-measured":
@@ -461,6 +476,48 @@ def main(arguments: list[str] | None = None) -> int:
     if parsed.command == "binance-cost-journal-status":
         return _binance_cost_journal_status(parsed)
     raise AssertionError("unreachable command")
+
+
+def _carry_holdout(parsed: argparse.Namespace) -> int:
+    """Open one carry family's final holdout, once (protocol 16.2).
+
+    Zero on either verdict: a failed holdout is a result the artifact records,
+    not a command failure. Every refusal -- a path outside the workspace, a
+    capture that is not a superset, a family whose holdout was already read --
+    raises, so a supervisor sees a non-zero exit and no artifact.
+    """
+    workspace: Path = parsed.workspace_root.resolve()
+    reports = tuple(path.resolve() for path in parsed.fold_report)
+    holdout_paths = (
+        parsed.capture.resolve(),
+        parsed.hedge_capture.resolve(),
+        parsed.original_capture.resolve(),
+        parsed.original_hedge_capture.resolve(),
+        parsed.manifest.resolve(),
+        parsed.family_spec.resolve(),
+        parsed.decision.resolve(),
+        parsed.output.resolve(),
+        parsed.registry.resolve(),
+        *reports,
+    )
+    if any(not path.is_relative_to(workspace) for path in holdout_paths):
+        raise ValueError("carry holdout paths must stay inside workspace")
+    artifact = run_carry_holdout(
+        holdout_paths[0],
+        holdout_paths[1],
+        original_perp_capture_root=holdout_paths[2],
+        original_spot_capture_root=holdout_paths[3],
+        manifest_path=holdout_paths[4],
+        family_spec_path=holdout_paths[5],
+        decision_path=holdout_paths[6],
+        fold_report_paths=reports,
+        output_path=holdout_paths[7],
+        registry_path=holdout_paths[8],
+    )
+    print(f"carry holdout written: {artifact.output_path}")
+    print(f"candidate: {artifact.candidate_name}")
+    print(f"verdict: {artifact.verdict}")
+    return 0
 
 
 def _carry_declare_measured(parsed: argparse.Namespace) -> int:

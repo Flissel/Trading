@@ -57,6 +57,16 @@ class CarryFoldError(RuntimeError):
     """Raised when a carry fold cannot be evaluated or published."""
 
 
+def carry_module_names() -> tuple[str, ...]:
+    """The module file names a carry fold report's `code_hash` covers.
+
+    Public so the holdout read (protocol 16.2) can hash the same evaluation
+    path this runner hashes plus the two modules only it uses, rather than
+    keeping a second, silently divergent list of the carry stack.
+    """
+    return _CARRY_MODULES
+
+
 def control_reference(spec: CarryFamilySpec) -> CarryMember:
     """The member whose lookback and hold the controls borrow (spec 3.3).
 
