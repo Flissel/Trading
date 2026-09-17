@@ -569,17 +569,38 @@ def test_the_read_is_single_use_per_family(chain: Chain) -> None:
     assert not (directory / "holdout-again.json").exists()
 
 
+def test_an_original_capture_the_manifest_was_not_built_on_refuses(chain: Chain) -> None:
+    """The lineage check alone cannot catch this, so the link check runs first.
+
+    The extended capture is a perfectly good superset base -- it is a superset
+    of itself -- but it is not the capture the manifest, and so the whole
+    family, was published from. Only its hash against the manifest says so.
+    """
+    directory = _case(chain, "link")
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(chain, directory, original_perp=chain.extended_perp)
+    assert str(error.value) == "manifest is not linked to the original capture (capture_root_hash)"
+    with pytest.raises(CarryHoldoutError) as hedge_error:
+        _read(chain, directory, original_spot=chain.extended_spot)
+    assert str(hedge_error.value) == (
+        "manifest is not linked to the original capture (hedge_capture_root_hash)"
+    )
+    assert not (directory / "holdout.json").exists()
+
+
 def test_an_extended_capture_that_is_not_a_superset_refuses_with_the_lineage_reasons(
     chain: Chain,
 ) -> None:
+    """The original spot capture stands in for the extended perpetual one.
+
+    Both originals are still the manifest's own captures, so the link check
+    passes and the lineage check is what refuses -- on a capture of the wrong
+    market, whose venue, market and every row disagree.
+    """
     directory = _case(chain, "lineage")
     with pytest.raises(CarryHoldoutError) as error:
-        _read(
-            chain, directory,
-            perp=chain.original_perp, spot=chain.original_spot,
-            original_perp=chain.extended_perp, original_spot=chain.extended_spot,
-        )
-    verified, reasons = verify_capture_superset(chain.extended_perp, chain.original_perp)
+        _read(chain, directory, perp=chain.original_spot)
+    verified, reasons = verify_capture_superset(chain.original_perp, chain.original_spot)
     assert verified is False and reasons
     assert all(reason in str(error.value) for reason in reasons)
 

@@ -254,13 +254,14 @@ def _verify_inputs(
 ) -> _VerifiedInputs:
     """Every check the read must pass before a single bar is loaded.
 
-    In order: both extended captures verify; each is a superset of its original
-    (spec section 2); the manifest verifies and was published under this
-    declaration; the decision's seal recomputes, it was made under this
-    declaration and it names exactly these fold reports, in order; every fold
-    report verifies; the family has no holdout artifact yet (spec section 6);
-    and the extended captures reach the calendar month the holdout's last
-    episode exits in. Nothing is written before all of them hold.
+    In order: both extended captures verify; the manifest verifies and was
+    published under this declaration; the originals handed in are the very
+    captures that manifest was published from; each extended capture is a
+    superset of its original (spec section 2); the decision's seal recomputes,
+    it was made under this declaration and it names exactly these fold reports,
+    in order; every fold report verifies; the family has no holdout artifact yet
+    (spec section 6); and the extended captures reach the calendar month the
+    holdout's last episode exits in. Nothing is written before all of them hold.
     """
     for root, label in ((perp_capture_root, "perpetual"), (spot_capture_root, "spot")):
         valid, errors = verify_panel_capture(root)
@@ -268,6 +269,31 @@ def _verify_inputs(
             raise CarryHoldoutError(
                 f"extended {label} capture verification failed: " + ",".join(errors)
             )
+
+    spec, family_spec_hash = load_carry_family_spec(family_spec_path)
+    if not verify_panel_manifest(manifest_path):
+        raise CarryHoldoutError("panel manifest verification failed")
+    manifest = _load_object(manifest_path)
+    if manifest.get("family_spec_hash") != family_spec_hash:
+        raise CarryHoldoutError("family declaration does not match the manifest")
+
+    # The lineage check below only proves the extended capture contains the
+    # original; it cannot tell whether that original is the capture the
+    # manifest -- and so the whole family -- was built on. A capture that is
+    # merely a subset of the extended one (the extended capture itself, say)
+    # would pass every superset row while binding the report to a lineage the
+    # decision never ran on, so the four links are required first, exactly as
+    # `carry_fold_run._require_link` requires them of a fold.
+    original_hashes = {
+        "capture_root_hash": _capture_root_hash(original_perp_capture_root),
+        "dataset_root_hash": _dataset_root_hash(original_perp_capture_root),
+        "hedge_capture_root_hash": _capture_root_hash(original_spot_capture_root),
+        "hedge_dataset_root_hash": _dataset_root_hash(original_spot_capture_root),
+    }
+    for key, expected in original_hashes.items():
+        if manifest.get(key) != expected:
+            raise CarryHoldoutError(f"manifest is not linked to the original capture ({key})")
+
     for original, extended, label in (
         (original_perp_capture_root, perp_capture_root, "perpetual"),
         (original_spot_capture_root, spot_capture_root, "spot"),
@@ -278,13 +304,6 @@ def _verify_inputs(
                 f"extended {label} capture is not a superset of the original: "
                 + ",".join(reasons)
             )
-
-    spec, family_spec_hash = load_carry_family_spec(family_spec_path)
-    if not verify_panel_manifest(manifest_path):
-        raise CarryHoldoutError("panel manifest verification failed")
-    manifest = _load_object(manifest_path)
-    if manifest.get("family_spec_hash") != family_spec_hash:
-        raise CarryHoldoutError("family declaration does not match the manifest")
 
     decision = _load_object(decision_path)
     decision_report_hash = _text(decision.get("report_hash"), "decision report_hash")
@@ -352,8 +371,8 @@ def _verify_inputs(
                 extended_spot.get("capture_root_hash"), "hedge capture_root_hash"
             ),
             "hedge_dataset_root_hash": _dataset_root_hash(spot_capture_root),
-            "original_capture_root_hash": _capture_root_hash(original_perp_capture_root),
-            "original_hedge_capture_root_hash": _capture_root_hash(original_spot_capture_root),
+            "original_capture_root_hash": original_hashes["capture_root_hash"],
+            "original_hedge_capture_root_hash": original_hashes["hedge_capture_root_hash"],
         },
     )
 
