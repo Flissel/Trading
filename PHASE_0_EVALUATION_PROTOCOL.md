@@ -285,3 +285,33 @@ numeric gate or parameter:
   particular it is biased toward admitting contracts a complete window
   would correctly exclude, since missing days concentrate on halted,
   dormant, and delisting-adjacent contracts.
+
+### 16.2 Final holdout read for panel families (2026-09-17, prospective)
+
+Fixes how section 2.3's single holdout read is executed for a panel or carry
+family. Binds every family whose holdout is unopened on 2026-09-17, which is
+every family; changes no numeric gate of sections 8 and 9.
+
+- The holdout is read with the original walk-forward manifest's
+  `final_holdout_ids` and calendar, never a re-derived one, on captures that
+  are verified supersets of the originals (every original source row present
+  with an identical raw hash).
+- The candidate is derived, not chosen: the eligible member with the highest
+  adverse total net return after subtracting its pooled adverse
+  `uncharged_final_exit_cost` (zero for cohort families), ties by declaration
+  order. Only the candidate and the two dominance controls are evaluated; the
+  other members' holdout is never read.
+- Confirmation requires, on the candidate's holdout episodes: base total > 0;
+  adverse total after the same subtraction >= 0; dominance over `no_trade`
+  and `random_pairs` in both scenarios; largest episode share and largest
+  contract or pair share <= 0.5; at most 4 of the 26 decisions skipped as
+  `UNIVERSE_TOO_SMALL`. No statistical test: the holdout confirms a sign and
+  a magnitude, it does not discover. The holdout's mean weekly net under both
+  scenarios, the fraction of positive weeks and its position relative to the
+  folds' bootstrap interval are reported, never gated.
+- The read is single-use per family: an immutable artifact and a registry
+  record of kind `holdout` keyed by the family; a second read refuses. A
+  failed holdout ends the family's generation.
+- A confirmation authorises shadow forecasts only (section 13). Paper needs
+  section 13's real-time requirements and a prospective definition of paper
+  episodes for weekly books, decided before paper starts.
