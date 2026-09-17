@@ -154,6 +154,7 @@ def main(arguments: list[str] | None = None) -> int:
     carry_holdout.add_argument("--fold-report", type=Path, action="append", required=True)
     carry_holdout.add_argument("--output", type=Path, required=True)
     carry_holdout.add_argument("--registry", type=Path, required=True)
+    carry_holdout.add_argument("--check-only", action="store_true")
     carry_declare = commands.add_parser("carry-declare-measured")
     carry_declare.add_argument("--workspace-root", type=Path, default=Path.cwd())
     carry_declare.add_argument("--receipt", type=Path, required=True)
@@ -485,6 +486,11 @@ def _carry_holdout(parsed: argparse.Namespace) -> int:
     not a command failure. Every refusal -- a path outside the workspace, a
     capture that is not a superset, a family whose holdout was already read --
     raises, so a supervisor sees a non-zero exit and no artifact.
+
+    `--check-only` is the dry run: the same checks, the same refusals, one line
+    naming the candidate the command derived, and no artifact. A holdout read
+    cannot be retried, so readiness is confirmed with this flag rather than by
+    running the read and finding out.
     """
     workspace: Path = parsed.workspace_root.resolve()
     reports = tuple(path.resolve() for path in parsed.fold_report)
@@ -513,7 +519,11 @@ def _carry_holdout(parsed: argparse.Namespace) -> int:
         fold_report_paths=reports,
         output_path=holdout_paths[7],
         registry_path=holdout_paths[8],
+        check_only=parsed.check_only,
     )
+    if parsed.check_only:
+        print(f"carry holdout check: candidate {artifact.candidate_name} ready")
+        return 0
     print(f"carry holdout written: {artifact.output_path}")
     print(f"candidate: {artifact.candidate_name}")
     print(f"verdict: {artifact.verdict}")

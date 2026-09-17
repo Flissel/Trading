@@ -8,7 +8,8 @@ extended captures it reads bars from are verified supersets of the originals
 the manifest was built on, evaluates only the candidate and the two dominance
 controls over the original manifest's `final_holdout_ids`, applies the fixed
 confirmation criteria and seals a single-use artifact whose registry record is
-keyed by the family alone -- so a second read of the same family refuses.
+keyed by the declaration alone -- so a second read of the same family refuses,
+on a republished walk-forward manifest as much as on the first one.
 
 Every refusal is a `CarryHoldoutError`: a holdout that cannot be read under
 these rules is not read at all, because a failed or spoiled read cannot be
@@ -27,6 +28,7 @@ from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.capture_lineage import verify_capture_superset
 from trading_bot.carry_config import CarryFamilySpec, load_carry_family_spec
 from trading_bot.carry_fold_run import (
+    CarryFoldError,
     DecisionRun,
     carry_module_names,
     evaluate_carry_decisions,
@@ -41,6 +43,10 @@ from trading_bot.registry import ArtifactRecord, MetadataRegistry
 
 DAY_NS = 86_400_000_000_000
 HOLDOUT_ARTIFACT_KIND = "holdout"
+# What a dry run (`check_only`) returns instead of a verdict: every input check
+# held, nothing was evaluated and nothing was written, so the family's one read
+# is still unspent.
+HOLDOUT_CHECKED_VERDICT = "checked"
 # Spec section 5.5: a holdout of 26 weekly decisions confirms nothing if a
 # sixth of it never happened, so more than four UNIVERSE_TOO_SMALL skips fail
 # the read rather than shrinking the window it is judged on.
@@ -59,10 +65,13 @@ DOMINANCE_CONTROL_NAMES: tuple[str, ...] = ("no_trade", "random_pairs")
 _FOLD_MANIFEST_LINKS: tuple[str, ...] = (
     "split_manifest_hash", "manifest_hash", "capture_root_hash", "hedge_capture_root_hash",
 )
-# The evaluation path the fold runner hashes, plus the two modules only a
-# holdout read runs through.
+# The evaluation path the fold runner hashes, plus the three modules only a
+# holdout read runs through. `panel_decision.py` is one of them because
+# `concentration_shares` decides two of the eight criteria: a change to it
+# moves a verdict, so it belongs in the hash the verdict is sealed under. The
+# fold runner's own list stays as it is -- the v1 fold-0 pin is hashed from it.
 _HOLDOUT_MODULES: tuple[str, ...] = (
-    *carry_module_names(), "carry_holdout_run.py", "capture_lineage.py",
+    *carry_module_names(), "carry_holdout_run.py", "capture_lineage.py", "panel_decision.py",
 )
 
 
@@ -72,8 +81,15 @@ class CarryHoldoutError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class CarryHoldoutArtifact:
+    """What a read published, or -- on a dry run -- what it would publish.
+
+    `report_hash` is `None` exactly when `verdict` is `HOLDOUT_CHECKED_VERDICT`:
+    a dry run evaluates nothing and writes nothing, so there is no document to
+    hash and `output_path` is the path the real read would write to.
+    """
+
     output_path: Path
-    report_hash: str
+    report_hash: str | None
     candidate_name: str
     verdict: str
 
@@ -144,6 +160,7 @@ def run_carry_holdout(
     fold_report_paths: tuple[Path, ...],
     output_path: Path,
     registry_path: Path,
+    check_only: bool = False,
 ) -> CarryHoldoutArtifact:
     """Open one carry family's final holdout, once (protocol 16.2).
 
@@ -151,6 +168,13 @@ def run_carry_holdout(
     bars and funding are read from; the calendar, the holdout membership and
     the family linkage all come from the original manifest and the original
     captures, which the extended ones must be verified supersets of.
+
+    `check_only` is the dry run: every input check runs, the candidate is
+    derived and the bars are loaded far enough to prove the last exit is
+    priced, and then the call stops -- nothing is evaluated, nothing is written
+    and no artifact is registered, so the declaration's one read is still
+    unspent. It is the only way to learn whether a read would refuse without
+    spending the read on finding out.
     """
     if output_path.exists():
         raise CarryHoldoutError("carry holdout report already exists and is immutable")
@@ -191,18 +215,41 @@ def run_carry_holdout(
         leg_histories[f"perp:{cid}"] = history
     for cid, history in spot_histories.items():
         leg_histories[f"spot:{cid}"] = history
+    # The month check proved the calendar; this proves the bar. A capture can
+    # reach the exit month and still hold no bar at the exit close itself -- a
+    # dump that ends mid-month, a repair that dropped its last day -- and every
+    # last holdout episode would then be force-closed at a stale price instead
+    # of exiting at its own, which is the one thing the extended capture exists
+    # to prevent.
+    _require_exit_bar(perp_histories, close_ns=last_exit_close_ns, label="perpetual")
+    _require_exit_bar(spot_histories, close_ns=last_exit_close_ns, label="spot")
+    if check_only:
+        return CarryHoldoutArtifact(
+            output_path=output_path,
+            report_hash=None,
+            candidate_name=candidate_name,
+            verdict=HOLDOUT_CHECKED_VERDICT,
+        )
+
     funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
     for event in load_funding_events(perp_capture_root / "dataset"):
         leg_key = f"perp:{event.contract_id}"
         funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
 
-    run = evaluate_carry_decisions(
-        spec,
-        perp_histories=perp_histories, spot_histories=spot_histories,
-        leg_histories=leg_histories, funding_by_leg=funding_by_leg,
-        decisions=decisions,
-        candidate_names=(candidate_name, *DOMINANCE_CONTROL_NAMES),
-    )
+    try:
+        run = evaluate_carry_decisions(
+            spec,
+            perp_histories=perp_histories, spot_histories=spot_histories,
+            leg_histories=leg_histories, funding_by_leg=funding_by_leg,
+            decisions=decisions,
+            candidate_names=(candidate_name, *DOMINANCE_CONTROL_NAMES),
+        )
+    except CarryFoldError as error:
+        # A holdout read refuses as a holdout read: a caller that fails closed
+        # on `CarryHoldoutError` -- which is every refusal in this module --
+        # would otherwise see the fold runner's own type for a declaration that
+        # does not carry the derived candidate or one of the two controls.
+        raise CarryHoldoutError(f"the holdout evaluation refused: {error}") from error
     confirmation = _confirmation(
         run,
         candidate_name=candidate_name,
@@ -272,15 +319,18 @@ def _verify_inputs(
 ) -> _VerifiedInputs:
     """Every check the read must pass before a single bar is loaded.
 
-    In order: both extended captures verify; the manifest verifies and was
-    published under this declaration; the originals handed in are the very
-    captures that manifest was published from; each extended capture is a
-    superset of its original (spec section 2); the decision's seal recomputes,
-    it was made under this declaration and on this manifest, and it names
-    exactly these fold reports, in order; every fold report verifies and was
-    itself run on this manifest; the family has no holdout artifact yet (spec
-    section 6); and the extended captures reach the calendar month the holdout's
-    last episode exits in. Nothing is written before all of them hold.
+    In order: both extended captures verify; both original captures verify --
+    they are evidence too, and everything below reads their manifests as
+    authority; this declaration has no holdout artifact yet, which is checked
+    before any manifest work because the key is the declaration alone (spec
+    section 6); the manifest verifies and was published under this declaration;
+    the originals handed in are the very captures that manifest was published
+    from; each extended capture is a superset of its original (spec section 2);
+    the decision's seal recomputes, it was made under this declaration and on
+    this manifest, and it names exactly these fold reports, in order; every fold
+    report verifies and was itself run on this manifest; and the extended
+    captures reach the calendar month the holdout's last episode exits in, in
+    every kind of data they carry. Nothing is written before all of them hold.
     """
     for root, label in ((perp_capture_root, "perpetual"), (spot_capture_root, "spot")):
         valid, errors = verify_panel_capture(root)
@@ -288,8 +338,35 @@ def _verify_inputs(
             raise CarryHoldoutError(
                 f"extended {label} capture verification failed: " + ",".join(errors)
             )
+    # The originals are not merely a lineage baseline: their manifests state
+    # the four hashes the manifest links are checked against, the rows the
+    # superset check compares and the two `original_*` hashes the artifact
+    # binds. An unverified original would let all three agree on bytes the
+    # capture itself no longer holds.
+    for root, label in (
+        (original_perp_capture_root, "perpetual"), (original_spot_capture_root, "spot")
+    ):
+        valid, errors = verify_panel_capture(root)
+        if not valid:
+            raise CarryHoldoutError(
+                f"original {label} capture verification failed: " + ",".join(errors)
+            )
 
     spec, family_spec_hash = load_carry_family_spec(family_spec_path)
+    # Spec section 6 under controller Ruling 9: the single-use key is the
+    # *declaration* -- the family's name and the hash of its spec -- and not the
+    # walk-forward manifest the read runs on. A capture repair republishes the
+    # same family on a new manifest, and a key that carried the manifest hash
+    # would hand that republished family a second holdout read, which is the
+    # one thing a single-use artifact exists to prevent. Checked here, before
+    # any manifest is read, because nothing in the key depends on one.
+    artifact_id = uuid5(
+        NAMESPACE_URL, f"{HOLDOUT_ARTIFACT_KIND}:{spec.family_name}:{family_spec_hash}"
+    )
+    with MetadataRegistry(registry_path) as registry:
+        if registry.get_artifact(artifact_id) is not None:
+            raise CarryHoldoutError("this family's holdout has already been read")
+
     if not verify_panel_manifest(manifest_path):
         raise CarryHoldoutError("panel manifest verification failed")
     manifest = _load_object(manifest_path)
@@ -361,12 +438,6 @@ def _verify_inputs(
                     f"fold report {path.name} is not linked to this manifest ({key})"
                 )
 
-    family_id = uuid5(NAMESPACE_URL, f"{split_manifest_hash}:{spec.family_name}")
-    artifact_id = uuid5(family_id, HOLDOUT_ARTIFACT_KIND)
-    with MetadataRegistry(registry_path) as registry:
-        if registry.get_artifact(artifact_id) is not None:
-            raise CarryHoldoutError("this family's holdout has already been read")
-
     holdout_ids = tuple(
         _text(value, "final_holdout_ids entry")
         for value in _sequence(manifest.get("final_holdout_ids"), "final_holdout_ids")
@@ -381,9 +452,7 @@ def _verify_inputs(
     extended_perp = _load_object(perp_capture_root / "capture-manifest.json")
     extended_spot = _load_object(spot_capture_root / "capture-manifest.json")
     for capture_manifest in (extended_perp, extended_spot):
-        covered = _coverage_month(capture_manifest)
-        if covered is None or covered < exit_month:
-            raise CarryHoldoutError("extended capture does not cover the holdout's last exit")
+        _require_coverage(capture_manifest, exit_month=exit_month)
 
     return _VerifiedInputs(
         spec=spec,
@@ -412,23 +481,62 @@ def _verify_inputs(
     )
 
 
+def _require_coverage(capture_manifest: dict[str, object], *, exit_month: str) -> None:
+    """Refuse a capture that does not reach the holdout's last exit month."""
+    covered = _coverage_month(capture_manifest)
+    if covered is None or covered < exit_month:
+        raise CarryHoldoutError("extended capture does not cover the holdout's last exit")
+
+
+def _require_exit_bar(
+    histories: dict[str, ContractHistory], *, close_ns: int, label: str
+) -> None:
+    """Refuse a capture that holds no bar at the holdout's last exit close.
+
+    One bar in one contract is enough to prove the day is there: the capture
+    is a single dump per symbol and month, so a market that priced the exit
+    close for any of its contracts priced it for the universe. What this
+    catches is the whole day missing -- and with it every last episode's exit.
+    """
+    if not any(close_ns in history.closes for history in histories.values()):
+        raise CarryHoldoutError(
+            f"extended capture holds no bar at the holdout's last exit close ({label})"
+        )
+
+
 def _coverage_month(capture_manifest: dict[str, object]) -> str | None:
-    """The latest calendar month (YYYY-MM) this capture covers, or `None`.
+    """The latest month (YYYY-MM) this capture covers in *every* kind, or `None`.
 
     Spec section 2: the holdout's last episode exits after the original capture
     ends, so the read refuses unless the extended capture reaches that month.
-    A capture built from an explicit month list states `months`; one built by
-    discovery -- which every production capture and every repair of one is --
-    states `months: null` and carries the per-symbol `discovered_months`
-    instead, so both are read and the latest month of either wins. YYYY-MM
-    sorts chronologically as text, so `max` is the calendar maximum.
+    A capture built by discovery -- which every production capture and every
+    repair of one is -- states `months: null` and carries the per-symbol
+    `discovered_months` (`symbol -> {kind -> [months]}`) instead. There the
+    month is taken per kind: the union over symbols, because one delisted
+    symbol's dump stopping early says nothing about the market, but never the
+    union over kinds, because the September klines and the September funding
+    dump arrive separately and a capture holding only the first would price the
+    last exit bar while leaving the final week's settlements unpaid. So each
+    kind's latest month is taken and the earliest of those is what the capture
+    covers; a kind no symbol carries a single month for is skipped (a spot
+    capture states the funding kind with an empty list). The explicit `months`
+    list is the fallback for a capture built without discovery, which fetches
+    one month set for every kind it carries. YYYY-MM sorts chronologically as
+    text, so `max` and `min` are calendar extremes.
     """
-    months: set[str] = set()
     discovered = capture_manifest.get("discovered_months")
     if isinstance(discovered, dict):
+        by_kind: dict[str, set[str]] = {}
         for value in discovered.values():
-            months |= _month_strings(value)
-    months |= _month_strings(capture_manifest.get("months"))
+            if isinstance(value, dict):
+                for kind, months_of_kind in value.items():
+                    if isinstance(kind, str):
+                        by_kind.setdefault(kind, set()).update(_month_strings(months_of_kind))
+            else:
+                by_kind.setdefault("", set()).update(_month_strings(value))
+        reached = [max(months) for months in by_kind.values() if months]
+        return min(reached) if reached else None
+    months = _month_strings(capture_manifest.get("months"))
     return max(months) if months else None
 
 
@@ -460,8 +568,10 @@ def _confirmation(
     concentration share above the limit; and at most four decisions skipped.
     No statistical test is applied -- 26 weeks confirm a sign and a magnitude,
     they do not discover -- so the mean weekly net under both scenarios, the
-    positive-week fraction and the holdout mean's position relative to the
-    folds' bootstrap lower bound are reported beside the verdict, never gated.
+    positive-week fraction, the pooled forced-close count and whether the
+    holdout's base mean is at or above the decision's bootstrap lower bound for
+    this candidate (a one-sided comparison, not an interval) are reported
+    beside the verdict, never gated.
     """
     records = {
         _text(record.get("candidate_name"), "candidate_name"): record
@@ -546,6 +656,15 @@ def _confirmation(
             if count
             else Decimal(0)
         ),
+        # Pooled over the candidate's holdout base episodes. A verdict cannot
+        # show how much of the window the book was carried out of rather than
+        # exited from, and a holdout whose episodes force-closed is a holdout
+        # read on data that ran out under it -- reported, never gated, because
+        # the coverage checks are what refuse that case.
+        "candidate_forced_close_count": sum(
+            _count(episode.get("forced_close_count"), "forced_close_count")
+            for episode in base_episodes
+        ),
         "decision_base_mean_net_return": (
             _decimal(decision_member["base_mean_net_return"], "base_mean_net_return")
             if decision_member.get("base_mean_net_return") is not None
@@ -587,7 +706,12 @@ def _seal(material: dict[str, object], output_path: Path) -> str:
 def _register(
     artifact_id: UUID, *, output_path: Path, report_hash: str, registry_path: Path
 ) -> None:
-    """Record the single-use artifact, keyed by the family alone (spec 6)."""
+    """Record the single-use artifact, keyed by the declaration alone (spec 6).
+
+    The id is `uuid5(NAMESPACE_URL, "holdout:<family name>:<family spec hash>")`,
+    which carries nothing of the walk-forward manifest: a republished manifest
+    for the same declaration finds the same record and refuses.
+    """
     with MetadataRegistry(registry_path) as registry:
         registry.register_artifact(
             ArtifactRecord(
@@ -696,6 +820,12 @@ def _mappings(value: object, what: str) -> list[dict[str, object]]:
 def _sequence(value: object, what: str) -> list[object]:
     if not isinstance(value, list):
         raise CarryHoldoutError(f"{what} must be a list")
+    return value
+
+
+def _count(value: object, what: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CarryHoldoutError(f"{what} is not a count: {value!r}")
     return value
 
 

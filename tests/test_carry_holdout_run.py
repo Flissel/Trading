@@ -12,6 +12,7 @@ spec section 2 exists for.
 """
 
 import json
+import shutil
 from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal
@@ -31,14 +32,25 @@ from tests.test_panel_fold_run import (
 )
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.capture_lineage import verify_capture_superset
-from trading_bot.carry_fold_run import run_carry_fold
+from trading_bot.carry_fold_run import (
+    CarryFoldError,
+    DecisionRun,
+    carry_module_names,
+    run_carry_fold,
+)
 from trading_bot.carry_holdout_run import (
+    _HOLDOUT_MODULES,
     CONCENTRATION_LIMIT,
+    DAY_NS,
     HOLDOUT_ARTIFACT_KIND,
+    HOLDOUT_CHECKED_VERDICT,
     MAX_SKIPPED_HOLDOUT_DECISIONS,
     CarryHoldoutArtifact,
     CarryHoldoutError,
+    _confirmation,
     _coverage_month,
+    _require_coverage,
+    _require_exit_bar,
     derive_candidate,
     run_carry_holdout,
 )
@@ -47,6 +59,7 @@ from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_p
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_fold_run import verify_panel_fold_report
 from trading_bot.panel_samples import publish_panel_walk_forward
+from trading_bot.panel_universe import ContractHistory
 from trading_bot.registry import ArtifactRecord, MetadataRegistry, RegistryConflictError
 
 # The eighth month the extended captures add. `kline_csv`/`funding_csv` read the
@@ -270,9 +283,11 @@ def _read(
     spot: Path | None = None,
     original_perp: Path | None = None,
     original_spot: Path | None = None,
+    manifest: Path | None = None,
     decision: Path | None = None,
     fold_reports: tuple[Path, ...] | None = None,
     output_name: str = "holdout.json",
+    check_only: bool = False,
 ) -> CarryHoldoutArtifact:
     return run_carry_holdout(
         perp if perp is not None else chain.extended_perp,
@@ -283,12 +298,13 @@ def _read(
         original_spot_capture_root=(
             original_spot if original_spot is not None else chain.original_spot
         ),
-        manifest_path=chain.manifest,
+        manifest_path=manifest if manifest is not None else chain.manifest,
         family_spec_path=chain.config,
         decision_path=decision if decision is not None else chain.decision,
         fold_report_paths=fold_reports if fold_reports is not None else chain.fold_reports,
         output_path=directory / output_name,
         registry_path=directory / "registry.sqlite3",
+        check_only=check_only,
     )
 
 
@@ -365,18 +381,218 @@ def test_coverage_month_reads_a_discovered_capture_and_a_declared_one() -> None:
     A capture built from an explicit month list states `months`; one built by
     discovery (and every repair of one) states `months: null` and carries the
     per-symbol `discovered_months` instead, so the latest covered month has to
-    be read off whichever of the two the manifest actually has.
+    be read off whichever of the two the manifest actually has. Within
+    `discovered_months` the month is taken *per kind*: the union over symbols,
+    but never over kinds, because a kline dump that reaches the exit month
+    while the funding dump stops earlier leaves the last week's funding
+    unsettled.
     """
     assert _coverage_month({"months": ["2020-06", "2020-07"]}) == "2020-07"
     discovered: dict[str, object] = {
         "months": None,
         "discovered_months": {
-            "AAAUSDT": {"klines": ["2026-08", "2026-09"], "fundingRate": ["2026-08"]},
+            "AAAUSDT": {"klines": ["2026-08", "2026-09"], "fundingRate": ["2026-09"]},
             "BBBUSDT": {"klines": ["2026-07"], "fundingRate": ["2026-07"]},
         },
     }
     assert _coverage_month(discovered) == "2026-09"
+    # A spot capture states the funding kind with no months at all; a kind
+    # nothing was discovered for is not a kind the capture falls short in.
+    spot: dict[str, object] = {
+        "months": None,
+        "discovered_months": {"AAAUSDT": {"klines": ["2026-09"], "fundingRate": []}},
+    }
+    assert _coverage_month(spot) == "2026-09"
     assert _coverage_month({"months": None}) is None
+
+
+def test_a_capture_whose_funding_stops_before_its_klines_does_not_cover_the_exit() -> None:
+    """The union across kinds is what a coverage check may not take.
+
+    The September klines are there, so the last exit bar is priced; the
+    September funding dump is not, so the last week's settlements are missing
+    and the episode would be paid as if funding had stopped. The month is
+    therefore the earliest of the per-kind months, and the read refuses.
+    """
+    lagging: dict[str, object] = {
+        "months": None,
+        "discovered_months": {
+            "AAAUSDT": {"klines": ["2026-08", "2026-09"], "fundingRate": ["2026-08"]},
+            "BBBUSDT": {"klines": ["2026-09"], "fundingRate": ["2026-08"]},
+        },
+    }
+    assert _coverage_month(lagging) == "2026-08"
+    with pytest.raises(CarryHoldoutError) as error:
+        _require_coverage(lagging, exit_month="2026-09")
+    assert str(error.value) == "extended capture does not cover the holdout's last exit"
+    # The same capture covers an exit one month earlier.
+    _require_coverage(lagging, exit_month="2026-08")
+
+
+def test_a_capture_with_no_bar_at_the_last_exit_close_refuses() -> None:
+    """Spec section 2, at the level the month check cannot see.
+
+    A capture can reach the exit month and still hold no bar at the exit close
+    itself -- a dump that ends mid-month, a repair that dropped the last day --
+    and every last holdout episode would then force-close instead of exiting at
+    its price. The month is the calendar check; this is the bar check.
+    """
+    close_ns = 1_596_412_799_999_000_000
+    histories = {
+        "AAAUSDT": ContractHistory(
+            contract_id="AAAUSDT", instrument_id="AAAUSDT",
+            closes={close_ns: Decimal("10")}, quote_volumes={close_ns: Decimal("1")},
+            close_times=(close_ns,),
+        )
+    }
+    _require_exit_bar(histories, close_ns=close_ns, label="perpetual")
+    with pytest.raises(CarryHoldoutError) as error:
+        _require_exit_bar(histories, close_ns=close_ns + DAY_NS, label="perpetual")
+    assert str(error.value) == (
+        "extended capture holds no bar at the holdout's last exit close (perpetual)"
+    )
+    with pytest.raises(CarryHoldoutError) as empty:
+        _require_exit_bar({}, close_ns=close_ns, label="spot")
+    assert str(empty.value) == (
+        "extended capture holds no bar at the holdout's last exit close (spot)"
+    )
+
+
+def test_the_holdout_code_hash_covers_panel_decision_and_the_fold_hash_does_not() -> None:
+    """`concentration_shares` decides two of the eight criteria (spec 5.4).
+
+    A change to it moves a holdout verdict, so the holdout's `code_hash` has to
+    cover it. The fold runner's list is untouched -- the v1 fold-0 pin is
+    hashed from it, and the fold gates reach the same helper through
+    `panel_decision`'s own sealed artifact rather than through this one.
+    """
+    assert "panel_decision.py" in _HOLDOUT_MODULES
+    assert "panel_decision.py" not in carry_module_names()
+    assert set(carry_module_names()) < set(_HOLDOUT_MODULES)
+
+
+# --- the confirmation itself ------------------------------------------------
+
+CONFIRMING_MEMBER = "winner"
+CONFIRMING_DECISION_MEMBER: dict[str, object] = {
+    "candidate_name": CONFIRMING_MEMBER,
+    "base_mean_net_return": "0.002",
+    "base_bootstrap_lower": "-0.001",
+}
+
+
+def _confirming_run(*, skipped: int = 0) -> DecisionRun:
+    """A synthetic holdout run that satisfies every one of the eight criteria.
+
+    Four episodes of an equal 0.01, each spread evenly over four pairs, so both
+    concentration shares are 0.25; an adverse total that still clears zero
+    after the exit the slot book never paid; and both dominance controls below
+    the candidate in the scenario each is compared in. `forced_close_count`
+    rises 0, 1, 2, 3 so the pooled count the report carries is a number no
+    single episode has.
+    """
+    episodes: list[dict[str, object]] = [
+        {
+            "sample_id": f"BINANCE:{index}:w1",
+            "net_return": "0.01",
+            "forced_close_count": index,
+            "contract_net_contributions": [
+                ["AAAUSDT/AAAUSDT", "0.0025"],
+                ["BBBUSDT/BBBUSDT", "0.0025"],
+                ["CCCUSDT/CCCUSDT", "0.0025"],
+                ["DDDUSDT/DDDUSDT", "0.0025"],
+            ],
+        }
+        for index in range(4)
+    ]
+    candidates: list[dict[str, object]] = [
+        {
+            "candidate_name": CONFIRMING_MEMBER,
+            "base": {"total_net_return": "0.04", "episodes": episodes},
+            "adverse": {
+                "total_net_return": "0.02",
+                "uncharged_final_exit_cost": "0.01",
+                "episodes": [{"net_return": "0.005"} for _ in range(4)],
+            },
+        },
+        {
+            "candidate_name": "no_trade",
+            "base": {"total_net_return": "0", "episodes": []},
+            "adverse": {"total_net_return": "0", "episodes": []},
+        },
+        {
+            "candidate_name": "random_pairs",
+            "base": {"total_net_return": "0.001", "episodes": []},
+            "adverse": {"total_net_return": "0.005", "episodes": []},
+        },
+    ]
+    return DecisionRun(
+        candidates=candidates,
+        skipped_sample_ids=[f"BINANCE:{index}:w1" for index in range(skipped)],
+        episode_count=4,
+        reason_codes=[],
+        warm_up_weeks=0,
+    )
+
+
+def test_a_run_that_meets_every_criterion_is_holdout_confirmed() -> None:
+    """The confirming verdict itself, which no fixture run reaches (spec 5)."""
+    confirmation = _confirmation(
+        _confirming_run(),
+        candidate_name=CONFIRMING_MEMBER,
+        decision_member=CONFIRMING_DECISION_MEMBER,
+    )
+    criteria = _dict(confirmation["criteria"])
+    assert all(
+        criteria[gate] is True
+        for gate in (
+            "base_total_positive",
+            "adverse_after_uncharged_exit_non_negative",
+            "base_dominates_no_trade",
+            "base_dominates_random_pairs",
+            "adverse_dominates_random_pairs",
+            "largest_episode_share_within_limit",
+            "largest_pair_share_within_limit",
+            "skipped_decisions_within_limit",
+        )
+    )
+    assert criteria["largest_episode_share"] == Decimal("0.25")
+    assert criteria["largest_pair_share"] == Decimal("0.25")
+    assert confirmation["verdict"] == "holdout_confirmed"
+    assert confirmation["adverse_total_after_uncharged_exit"] == Decimal("0.01")
+
+    reported = _dict(confirmation["reported"])
+    assert reported["base_mean_weekly_net_return"] == Decimal("0.01")
+    assert reported["adverse_mean_weekly_net_return"] == Decimal("0.005")
+    assert reported["positive_week_fraction"] == Decimal(1)
+    assert reported["base_mean_at_or_above_decision_bootstrap_lower"] is True
+    # Pooled over the candidate's own holdout episodes, not per episode.
+    assert reported["candidate_forced_close_count"] == 6
+
+
+def test_the_skip_cap_is_the_boundary_the_spec_names() -> None:
+    """Spec 5.5: four skipped decisions still confirm, a fifth does not."""
+    assert MAX_SKIPPED_HOLDOUT_DECISIONS == 4
+    at_the_cap = _confirmation(
+        _confirming_run(skipped=MAX_SKIPPED_HOLDOUT_DECISIONS),
+        candidate_name=CONFIRMING_MEMBER,
+        decision_member=CONFIRMING_DECISION_MEMBER,
+    )
+    assert _dict(at_the_cap["criteria"])["skipped_decision_count"] == 4
+    assert _dict(at_the_cap["criteria"])["skipped_decisions_within_limit"] is True
+    assert at_the_cap["verdict"] == "holdout_confirmed"
+
+    over_the_cap = _confirmation(
+        _confirming_run(skipped=MAX_SKIPPED_HOLDOUT_DECISIONS + 1),
+        candidate_name=CONFIRMING_MEMBER,
+        decision_member=CONFIRMING_DECISION_MEMBER,
+    )
+    over_criteria = _dict(over_the_cap["criteria"])
+    assert over_criteria["skipped_decision_count"] == 5
+    assert over_criteria["skipped_decisions_within_limit"] is False
+    # Nothing else moved: the fifth skip alone is what failed the read.
+    assert over_criteria["base_total_positive"] is True
+    assert over_the_cap["verdict"] == "holdout_failed"
 
 
 # --- the read itself --------------------------------------------------------
@@ -455,10 +671,17 @@ def test_the_holdout_report_carries_the_fold_schema_plus_the_confirmation(
         "base_mean_weekly_net_return",
         "adverse_mean_weekly_net_return",
         "positive_week_fraction",
+        "candidate_forced_close_count",
         "decision_base_mean_net_return",
         "decision_base_bootstrap_lower",
         "base_mean_at_or_above_decision_bootstrap_lower",
     }
+    # Pooled over the candidate's own holdout base episodes: what a verdict
+    # cannot show on its own is how much of the window the book was carried out
+    # of rather than exited from.
+    assert reported["candidate_forced_close_count"] == sum(
+        int(str(item["forced_close_count"])) for item in episodes
+    )
     assert reported["decision_base_mean_net_return"] == DECISION_BASE_MEAN
     assert reported["decision_base_bootstrap_lower"] == DECISION_BOOTSTRAP_LOWER
     base_total = _decimal(_dict(_candidate(document, WINNING_MEMBER)["base"])["total_net_return"])
@@ -554,16 +777,22 @@ def test_the_verdict_is_the_conjunction_of_the_reports_own_criteria(chain: Chain
     assert artifact.verdict == confirmation["verdict"]
 
 
-def test_the_read_is_single_use_per_family(chain: Chain) -> None:
-    """Spec section 6: the artifact is immutable and the family is recorded."""
+def test_the_read_is_single_use_per_declaration(chain: Chain) -> None:
+    """Spec section 6: the artifact is immutable and the declaration is recorded.
+
+    The key is the family's *declaration* -- its name and spec hash -- and not
+    the walk-forward manifest the read ran on, so a republished manifest cannot
+    reopen a holdout the declaration has already spent.
+    """
     directory = _case(chain, "single-use")
     artifact = _read(chain, directory)
     manifest = _document(chain.manifest)
-    family_id = uuid5(
-        NAMESPACE_URL, f"{manifest['split_manifest_hash']}:{manifest['family_name']}"
+    artifact_id = uuid5(
+        NAMESPACE_URL,
+        f"{HOLDOUT_ARTIFACT_KIND}:{manifest['family_name']}:{manifest['family_spec_hash']}",
     )
     with MetadataRegistry(directory / "registry.sqlite3") as registry:
-        record = registry.get_artifact(uuid5(family_id, HOLDOUT_ARTIFACT_KIND))
+        record = registry.get_artifact(artifact_id)
     assert record is not None
     assert record.kind == HOLDOUT_ARTIFACT_KIND
     assert record.content_hash == artifact.report_hash
@@ -574,6 +803,82 @@ def test_the_read_is_single_use_per_family(chain: Chain) -> None:
     with pytest.raises(CarryHoldoutError):
         _read(chain, directory, output_name="holdout-again.json")
     assert not (directory / "holdout-again.json").exists()
+
+
+def test_a_republished_manifest_cannot_reopen_the_same_declarations_holdout(
+    chain: Chain,
+) -> None:
+    """Controller Ruling 9: the single-use key is per declaration.
+
+    A capture repair republishes the same family on a new walk-forward with its
+    own split manifest hash. Were the holdout artifact keyed by that hash, the
+    repair would hand the family a second holdout read -- the one thing spec
+    section 6 exists to prevent. The second manifest here is a real one, built
+    by `publish_panel_walk_forward` from the extended captures, so it differs
+    from the first in exactly the way a repaired one would.
+    """
+    directory = _case(chain, "republished")
+    _read(chain, directory)
+    republished = directory / "republished-manifest.json"
+    spec, spec_hash = load_family_spec(chain.config)
+    publish_panel_walk_forward(
+        chain.extended_perp, output_path=republished, spec=spec,
+        family_spec_hash=spec_hash, hedge_capture_root=chain.extended_spot,
+    )
+    assert _document(republished)["family_spec_hash"] == _document(chain.manifest)[
+        "family_spec_hash"
+    ]
+    assert (
+        _document(republished)["split_manifest_hash"]
+        != _document(chain.manifest)["split_manifest_hash"]
+    )
+
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(
+            chain, directory, manifest=republished, output_name="holdout-republished.json"
+        )
+    assert str(error.value) == "this family's holdout has already been read"
+    assert not (directory / "holdout-republished.json").exists()
+
+    # And it is the spent read that refuses, not anything the second manifest
+    # trips on its own: the same call against an unspent registry gets further.
+    fresh = _case(chain, "republished-fresh")
+    with pytest.raises(CarryHoldoutError) as unspent:
+        _read(chain, fresh, manifest=republished)
+    assert str(unspent.value) != "this family's holdout has already been read"
+
+
+def test_an_original_capture_that_does_not_verify_refuses(chain: Chain) -> None:
+    """The originals are evidence too, so they are verified like the extended ones.
+
+    Everything downstream reads the original capture manifest as authority: the
+    four manifest links, the superset rows, the two `original_*` hashes the
+    artifact binds. An original whose `sources` were edited without resealing
+    it states a lineage its own bytes contradict, and until now nothing in the
+    read looked.
+    """
+    directory = _case(chain, "original-verify")
+    tampered = directory / "original-perp"
+    if tampered.exists():
+        shutil.rmtree(tampered)
+    shutil.copytree(chain.original_perp, tampered)
+    manifest_path = tampered / "capture-manifest.json"
+    document = _document(manifest_path)
+    sources = _dicts(document["sources"])
+    sources[0]["raw_sha256"] = "0" * 64
+    document["sources"] = sources
+    manifest_path.write_bytes(canonical_json(document))
+    # The stated root hash is untouched, so the manifest's four capture links
+    # still match: only the capture's own verification can catch this.
+    assert document["capture_root_hash"] == _document(
+        chain.original_perp / "capture-manifest.json"
+    )["capture_root_hash"]
+
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(chain, directory, original_perp=tampered)
+    assert str(error.value).startswith("original perpetual capture verification failed:")
+    assert "CAPTURE_ROOT_HASH_MISMATCH" in str(error.value)
+    assert not (directory / "holdout.json").exists()
 
 
 def test_an_original_capture_the_manifest_was_not_built_on_refuses(chain: Chain) -> None:
@@ -750,8 +1055,70 @@ def test_a_decision_without_an_eligible_member_refuses(chain: Chain) -> None:
     assert not (directory / "holdout.json").exists()
 
 
+def test_an_evaluation_refusal_arrives_as_a_holdout_error(
+    chain: Chain, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every refusal of a holdout read is a `CarryHoldoutError`.
+
+    `evaluate_carry_decisions` refuses a candidate name the declaration does
+    not carry with a `CarryFoldError` of its own. A supervisor that catches the
+    holdout's error type -- which is what "every refusal is a
+    `CarryHoldoutError`" promises -- would let that one past as an unrelated
+    crash, so it is re-raised from the original instead.
+    """
+    directory = _case(chain, "fold-error")
+
+    def refuse(*args: object, **kwargs: object) -> DecisionRun:
+        raise CarryFoldError("simulated undeclared candidate")
+
+    monkeypatch.setattr("trading_bot.carry_holdout_run.evaluate_carry_decisions", refuse)
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(chain, directory)
+    assert isinstance(error.value.__cause__, CarryFoldError)
+    assert "simulated undeclared candidate" in str(error.value)
+    assert not (directory / "holdout.json").exists()
+
+
+def test_the_dry_run_checks_everything_and_spends_nothing(chain: Chain) -> None:
+    """Controller Ruling 10: readiness is confirmable without opening the holdout.
+
+    The read cannot be retried, so the one thing a caller needs before running
+    it is the answer to "would this refuse?" -- captures, lineage, links,
+    seals, the derived candidate and the two coverage checks -- without the
+    read itself happening. Nothing is evaluated, nothing is written and the
+    declaration stays unspent, which the real read straight afterwards proves.
+    """
+    directory = _case(chain, "check-only")
+    manifest = _document(chain.manifest)
+    artifact_id = uuid5(
+        NAMESPACE_URL,
+        f"{HOLDOUT_ARTIFACT_KIND}:{manifest['family_name']}:{manifest['family_spec_hash']}",
+    )
+    checked = _read(chain, directory, check_only=True)
+    assert checked.verdict == HOLDOUT_CHECKED_VERDICT
+    assert checked.candidate_name == WINNING_MEMBER
+    assert checked.report_hash is None
+    assert not (directory / "holdout.json").exists()
+    with MetadataRegistry(directory / "registry.sqlite3") as registry:
+        assert registry.get_artifact(artifact_id) is None
+
+    # A refusal is still a refusal in a dry run -- that is what it is for.
+    with pytest.raises(CarryHoldoutError) as error:
+        _read(
+            chain, directory, perp=chain.original_perp, spot=chain.original_spot,
+            check_only=True,
+        )
+    assert "extended capture does not cover the holdout" in str(error.value)
+
+    artifact = _read(chain, directory)
+    assert artifact.output_path.exists()
+    assert artifact.verdict == "holdout_failed"
+    with MetadataRegistry(directory / "registry.sqlite3") as registry:
+        assert registry.get_artifact(artifact_id) is not None
+
+
 def test_the_cli_reads_the_holdout_and_keeps_every_path_in_the_workspace(
-    chain: Chain,
+    chain: Chain, capsys: pytest.CaptureFixture[str]
 ) -> None:
     directory = _case(chain, "cli")
     arguments = [
@@ -766,6 +1133,15 @@ def test_the_cli_reads_the_holdout_and_keeps_every_path_in_the_workspace(
     ]
     for report in chain.fold_reports:
         arguments.extend(["--fold-report", str(report)])
+
+    # The dry run first: one line, the derived candidate, no artifact.
+    assert main([*arguments, "--check-only"]) == 0
+    printed = capsys.readouterr().out.strip().splitlines()
+    assert len(printed) == 1
+    assert WINNING_MEMBER in printed[0]
+    assert "ready" in printed[0]
+    assert not (directory / "holdout.json").exists()
+
     assert main(arguments) == 0
     document = _document(directory / "holdout.json")
     assert document["holdout"] is True
