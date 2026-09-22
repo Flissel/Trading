@@ -1,0 +1,2511 @@
+{
+  "spec_version": "1.0.0",
+  "family_name": "funding_carry_panel_v4_measured",
+  "hypothesis": "At a declared book of at most 10 000 USDT held in ten equal pair slots — long spot, short perpetual, orders of at most 500 USDT per leg at Binance's standard taker fees — a slot that is filled from the top decile of eligible pairs by trailing four-week funding, held for up to 13 or 26 weeks, refilled when it empties, and (two members) vacated when its pair's trailing one-week funding is non-positive, earns funding net of both legs' measured execution costs and basis drift, with positive expectancy under base costs and non-negative expectancy under adverse costs, without single-fold, single-pair or single-week concentration, after correction across four members. Execution costs are the slippage tiers measured by the Binance cost journal (receipt 0bf0a9b9e6436ca9c239c27a0cfc167b8840b9776fcb436da8b315ace66ad3b2) under the rule fixed in its design before any number existed.",
+  "perpetual_venue": "BINANCE_UM",
+  "spot_venue": "BINANCE_SPOT",
+  "holding_days": 7,
+  "members": [
+    {
+      "name": "carry_s10_l4w_h13w",
+      "lookback_weeks": 4,
+      "hold_weeks": 13,
+      "exit_on_negative_funding": false,
+      "hurdle_multiple": null,
+      "book": "slots"
+    },
+    {
+      "name": "carry_s10_l4w_h13w_exit",
+      "lookback_weeks": 4,
+      "hold_weeks": 13,
+      "exit_on_negative_funding": true,
+      "hurdle_multiple": null,
+      "book": "slots"
+    },
+    {
+      "name": "carry_s10_l4w_h26w",
+      "lookback_weeks": 4,
+      "hold_weeks": 26,
+      "exit_on_negative_funding": false,
+      "hurdle_multiple": null,
+      "book": "slots"
+    },
+    {
+      "name": "carry_s10_l4w_h26w_exit",
+      "lookback_weeks": 4,
+      "hold_weeks": 26,
+      "exit_on_negative_funding": true,
+      "hurdle_multiple": null,
+      "book": "slots"
+    }
+  ],
+  "controls": [
+    {
+      "name": "no_trade",
+      "kind": "no_trade"
+    },
+    {
+      "name": "random_pairs",
+      "kind": "random_pairs"
+    },
+    {
+      "name": "all_pairs_ew",
+      "kind": "all_pairs"
+    }
+  ],
+  "pairs": [
+    {
+      "perpetual": "0GUSDT",
+      "spot": "0GUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "1000CATUSDT",
+      "spot": "1000CATUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "1000CHEEMSUSDT",
+      "spot": "1000CHEEMSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "1000SATSUSDT",
+      "spot": "1000SATSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "1INCHUSDT",
+      "spot": "1INCHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "1MBABYDOGEUSDT",
+      "spot": "1MBABYDOGEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "2ZUSDT",
+      "spot": "2ZUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "A2ZUSDT",
+      "spot": "A2ZUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AAVEUSDT",
+      "spot": "AAVEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ACEUSDT",
+      "spot": "ACEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ACHUSDT",
+      "spot": "ACHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ACTUSDT",
+      "spot": "ACTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ACXUSDT",
+      "spot": "ACXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ADAUSDT",
+      "spot": "ADAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AERGOUSDT",
+      "spot": "AERGOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AEROUSDT",
+      "spot": "AEROUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AEVOUSDT",
+      "spot": "AEVOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AGIXUSDT",
+      "spot": "AGIXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AGLDUSDT",
+      "spot": "AGLDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AIGENSYNUSDT",
+      "spot": "AIGENSYNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AIUSDT",
+      "spot": "AIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AIXBTUSDT",
+      "spot": "AIXBTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AKROUSDT",
+      "spot": "AKROUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALGOUSDT",
+      "spot": "ALGOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALICEUSDT",
+      "spot": "ALICEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALLOUSDT",
+      "spot": "ALLOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALPACAUSDT",
+      "spot": "ALPACAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALPHAUSDT",
+      "spot": "ALPHAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALPINEUSDT",
+      "spot": "ALPINEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ALTUSDT",
+      "spot": "ALTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AMBUSDT",
+      "spot": "AMBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ANCUSDT",
+      "spot": "ANCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ANIMEUSDT",
+      "spot": "ANIMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ANKRUSDT",
+      "spot": "ANKRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ANTUSDT",
+      "spot": "ANTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "APEUSDT",
+      "spot": "APEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "API3USDT",
+      "spot": "API3USDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "APTUSDT",
+      "spot": "APTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ARBUSDT",
+      "spot": "ARBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ARKMUSDT",
+      "spot": "ARKMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ARKUSDT",
+      "spot": "ARKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ARPAUSDT",
+      "spot": "ARPAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ARUSDT",
+      "spot": "ARUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ASRUSDT",
+      "spot": "ASRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ASTERUSDT",
+      "spot": "ASTERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ASTRUSDT",
+      "spot": "ASTRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ATAUSDT",
+      "spot": "ATAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ATOMUSDT",
+      "spot": "ATOMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ATUSDT",
+      "spot": "ATUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AUCTIONUSDT",
+      "spot": "AUCTIONUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AUDIOUSDT",
+      "spot": "AUDIOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AUSDT",
+      "spot": "AUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AVAUSDT",
+      "spot": "AVAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AVAXUSDT",
+      "spot": "AVAXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AVNTUSDT",
+      "spot": "AVNTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AWEUSDT",
+      "spot": "AWEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AXLUSDT",
+      "spot": "AXLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "AXSUSDT",
+      "spot": "AXSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BABYUSDT",
+      "spot": "BABYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BADGERUSDT",
+      "spot": "BADGERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BAKEUSDT",
+      "spot": "BAKEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BALUSDT",
+      "spot": "BALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BANANAS31USDT",
+      "spot": "BANANAS31USDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BANANAUSDT",
+      "spot": "BANANAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BANDUSDT",
+      "spot": "BANDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BANKUSDT",
+      "spot": "BANKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BARDUSDT",
+      "spot": "BARDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BATUSDT",
+      "spot": "BATUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BBUSDT",
+      "spot": "BBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BCHUSDT",
+      "spot": "BCHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BEAMXUSDT",
+      "spot": "BEAMXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BELUSDT",
+      "spot": "BELUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BERAUSDT",
+      "spot": "BERAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BICOUSDT",
+      "spot": "BICOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BIGTIMEUSDT",
+      "spot": "BIGTIMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BIOUSDT",
+      "spot": "BIOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BLURUSDT",
+      "spot": "BLURUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BLZUSDT",
+      "spot": "BLZUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BMTUSDT",
+      "spot": "BMTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BNBUSDT",
+      "spot": "BNBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BNTUSDT",
+      "spot": "BNTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BNXUSDT",
+      "spot": "BNXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BOMEUSDT",
+      "spot": "BOMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BONDUSDT",
+      "spot": "BONDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BREVUSDT",
+      "spot": "BREVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BROCCOLI714USDT",
+      "spot": "BROCCOLI714USDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BSWUSDT",
+      "spot": "BSWUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BTCSTUSDT",
+      "spot": "BTCSTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BTCUSDT",
+      "spot": "BTCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BTSUSDT",
+      "spot": "BTSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BTTUSDT",
+      "spot": "BTTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "BZRXUSDT",
+      "spot": "BZRXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "C98USDT",
+      "spot": "C98USDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CAKEUSDT",
+      "spot": "CAKEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CATIUSDT",
+      "spot": "CATIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CELOUSDT",
+      "spot": "CELOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CELRUSDT",
+      "spot": "CELRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CETUSUSDT",
+      "spot": "CETUSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CFGUSDT",
+      "spot": "CFGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CFXUSDT",
+      "spot": "CFXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CGPTUSDT",
+      "spot": "CGPTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CHESSUSDT",
+      "spot": "CHESSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CHIPUSDT",
+      "spot": "CHIPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CHRUSDT",
+      "spot": "CHRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CHZUSDT",
+      "spot": "CHZUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CKBUSDT",
+      "spot": "CKBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COCOSUSDT",
+      "spot": "COCOSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COMBOUSDT",
+      "spot": "COMBOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COMPUSDT",
+      "spot": "COMPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COOKIEUSDT",
+      "spot": "COOKIEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COSUSDT",
+      "spot": "COSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COTIUSDT",
+      "spot": "COTIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "COWUSDT",
+      "spot": "COWUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CRVUSDT",
+      "spot": "CRVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CTKUSDT",
+      "spot": "CTKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CTSIUSDT",
+      "spot": "CTSIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CUSDT",
+      "spot": "CUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CVCUSDT",
+      "spot": "CVCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CVXUSDT",
+      "spot": "CVXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "CYBERUSDT",
+      "spot": "CYBERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DARUSDT",
+      "spot": "DARUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DASHUSDT",
+      "spot": "DASHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DEGOUSDT",
+      "spot": "DEGOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DENTUSDT",
+      "spot": "DENTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DEXEUSDT",
+      "spot": "DEXEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DFUSDT",
+      "spot": "DFUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DGBUSDT",
+      "spot": "DGBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DIAUSDT",
+      "spot": "DIAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DODOUSDT",
+      "spot": "DODOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DOGEUSDT",
+      "spot": "DOGEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DOGSUSDT",
+      "spot": "DOGSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DOLOUSDT",
+      "spot": "DOLOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DOTUSDT",
+      "spot": "DOTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DUSDT",
+      "spot": "DUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DUSKUSDT",
+      "spot": "DUSKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DYDXUSDT",
+      "spot": "DYDXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "DYMUSDT",
+      "spot": "DYMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EDENUSDT",
+      "spot": "EDENUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EDUUSDT",
+      "spot": "EDUUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EGLDUSDT",
+      "spot": "EGLDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EIGENUSDT",
+      "spot": "EIGENUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ENAUSDT",
+      "spot": "ENAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ENJUSDT",
+      "spot": "ENJUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ENSOUSDT",
+      "spot": "ENSOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ENSUSDT",
+      "spot": "ENSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EOSUSDT",
+      "spot": "EOSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EPICUSDT",
+      "spot": "EPICUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ERAUSDT",
+      "spot": "ERAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ESPUSDT",
+      "spot": "ESPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ETCUSDT",
+      "spot": "ETCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ETHFIUSDT",
+      "spot": "ETHFIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ETHUSDT",
+      "spot": "ETHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "EULUSDT",
+      "spot": "EULUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FETUSDT",
+      "spot": "FETUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FFUSDT",
+      "spot": "FFUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FIDAUSDT",
+      "spot": "FIDAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FILUSDT",
+      "spot": "FILUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FIOUSDT",
+      "spot": "FIOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FISUSDT",
+      "spot": "FISUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FLMUSDT",
+      "spot": "FLMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FLOWUSDT",
+      "spot": "FLOWUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FLUXUSDT",
+      "spot": "FLUXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FOGOUSDT",
+      "spot": "FOGOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FORMUSDT",
+      "spot": "FORMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FORTHUSDT",
+      "spot": "FORTHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FRAXUSDT",
+      "spot": "FRAXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FRONTUSDT",
+      "spot": "FRONTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FTMUSDT",
+      "spot": "FTMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FTTUSDT",
+      "spot": "FTTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FUNUSDT",
+      "spot": "FUNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FUSDT",
+      "spot": "FUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "FXSUSDT",
+      "spot": "FXSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GALAUSDT",
+      "spot": "GALAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GALUSDT",
+      "spot": "GALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GASUSDT",
+      "spot": "GASUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GENIUSUSDT",
+      "spot": "GENIUSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GHSTUSDT",
+      "spot": "GHSTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GIGGLEUSDT",
+      "spot": "GIGGLEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GLMRUSDT",
+      "spot": "GLMRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GLMUSDT",
+      "spot": "GLMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GMTUSDT",
+      "spot": "GMTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GMXUSDT",
+      "spot": "GMXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GPSUSDT",
+      "spot": "GPSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GRAMUSDT",
+      "spot": "GRAMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GRTUSDT",
+      "spot": "GRTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GTCUSDT",
+      "spot": "GTCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GUNUSDT",
+      "spot": "GUNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "GUSDT",
+      "spot": "GUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HAEDALUSDT",
+      "spot": "HAEDALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HBARUSDT",
+      "spot": "HBARUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HEIUSDT",
+      "spot": "HEIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HEMIUSDT",
+      "spot": "HEMIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HFTUSDT",
+      "spot": "HFTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HIFIUSDT",
+      "spot": "HIFIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HIGHUSDT",
+      "spot": "HIGHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HIVEUSDT",
+      "spot": "HIVEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HMSTRUSDT",
+      "spot": "HMSTRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HNTUSDT",
+      "spot": "HNTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HOLOUSDT",
+      "spot": "HOLOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HOMEUSDT",
+      "spot": "HOMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HOOKUSDT",
+      "spot": "HOOKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HOTUSDT",
+      "spot": "HOTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HUMAUSDT",
+      "spot": "HUMAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "HYPERUSDT",
+      "spot": "HYPERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ICPUSDT",
+      "spot": "ICPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ICXUSDT",
+      "spot": "ICXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IDEXUSDT",
+      "spot": "IDEXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IDUSDT",
+      "spot": "IDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ILVUSDT",
+      "spot": "ILVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IMXUSDT",
+      "spot": "IMXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "INITUSDT",
+      "spot": "INITUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "INJUSDT",
+      "spot": "INJUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IOSTUSDT",
+      "spot": "IOSTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IOTAUSDT",
+      "spot": "IOTAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IOTXUSDT",
+      "spot": "IOTXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "IOUSDT",
+      "spot": "IOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "JASMYUSDT",
+      "spot": "JASMYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "JOEUSDT",
+      "spot": "JOEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "JSTUSDT",
+      "spot": "JSTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "JTOUSDT",
+      "spot": "JTOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "JUPUSDT",
+      "spot": "JUPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KAIAUSDT",
+      "spot": "KAIAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KAITOUSDT",
+      "spot": "KAITOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KATUSDT",
+      "spot": "KATUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KAVAUSDT",
+      "spot": "KAVAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KDAUSDT",
+      "spot": "KDAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KEEPUSDT",
+      "spot": "KEEPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KERNELUSDT",
+      "spot": "KERNELUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KEYUSDT",
+      "spot": "KEYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KITEUSDT",
+      "spot": "KITEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KLAYUSDT",
+      "spot": "KLAYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KMNOUSDT",
+      "spot": "KMNOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KNCUSDT",
+      "spot": "KNCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "KSMUSDT",
+      "spot": "KSMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LAUSDT",
+      "spot": "LAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LAYERUSDT",
+      "spot": "LAYERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LDOUSDT",
+      "spot": "LDOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LENDUSDT",
+      "spot": "LENDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LEVERUSDT",
+      "spot": "LEVERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LINAUSDT",
+      "spot": "LINAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LINEAUSDT",
+      "spot": "LINEAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LINKUSDT",
+      "spot": "LINKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LISTAUSDT",
+      "spot": "LISTAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LITUSDT",
+      "spot": "LITUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LOKAUSDT",
+      "spot": "LOKAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LOOMUSDT",
+      "spot": "LOOMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LPTUSDT",
+      "spot": "LPTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LQTYUSDT",
+      "spot": "LQTYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LRCUSDT",
+      "spot": "LRCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LSKUSDT",
+      "spot": "LSKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LTCUSDT",
+      "spot": "LTCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LUMIAUSDT",
+      "spot": "LUMIAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "LUNAUSDT",
+      "spot": "LUNAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MAGICUSDT",
+      "spot": "MAGICUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MANAUSDT",
+      "spot": "MANAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MANTAUSDT",
+      "spot": "MANTAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MANTRAUSDT",
+      "spot": "MANTRAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MASKUSDT",
+      "spot": "MASKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MATICUSDT",
+      "spot": "MATICUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MAVUSDT",
+      "spot": "MAVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MBLUSDT",
+      "spot": "MBLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MBOXUSDT",
+      "spot": "MBOXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MDTUSDT",
+      "spot": "MDTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MEGAUSDT",
+      "spot": "MEGAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MEMEUSDT",
+      "spot": "MEMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "METISUSDT",
+      "spot": "METISUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "METUSDT",
+      "spot": "METUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MEUSDT",
+      "spot": "MEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MINAUSDT",
+      "spot": "MINAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MIRAUSDT",
+      "spot": "MIRAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MITOUSDT",
+      "spot": "MITOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MKRUSDT",
+      "spot": "MKRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MLNUSDT",
+      "spot": "MLNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MMTUSDT",
+      "spot": "MMTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MORPHOUSDT",
+      "spot": "MORPHOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MOVEUSDT",
+      "spot": "MOVEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MOVRUSDT",
+      "spot": "MOVRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MTLUSDT",
+      "spot": "MTLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "MUBARAKUSDT",
+      "spot": "MUBARAKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NEARUSDT",
+      "spot": "NEARUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NEIROUSDT",
+      "spot": "NEIROUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NEOUSDT",
+      "spot": "NEOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NEWTUSDT",
+      "spot": "NEWTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NFPUSDT",
+      "spot": "NFPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NIGHTUSDT",
+      "spot": "NIGHTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NILUSDT",
+      "spot": "NILUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NKNUSDT",
+      "spot": "NKNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NMRUSDT",
+      "spot": "NMRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NOMUSDT",
+      "spot": "NOMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NOTUSDT",
+      "spot": "NOTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NTRNUSDT",
+      "spot": "NTRNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NULSUSDT",
+      "spot": "NULSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NUUSDT",
+      "spot": "NUUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "NXPCUSDT",
+      "spot": "NXPCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OCEANUSDT",
+      "spot": "OCEANUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OGNUSDT",
+      "spot": "OGNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OGUSDT",
+      "spot": "OGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OMGUSDT",
+      "spot": "OMGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OMNIUSDT",
+      "spot": "OMNIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OMUSDT",
+      "spot": "OMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ONDOUSDT",
+      "spot": "ONDOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ONEUSDT",
+      "spot": "ONEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ONGUSDT",
+      "spot": "ONGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ONTUSDT",
+      "spot": "ONTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OPENUSDT",
+      "spot": "OPENUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OPGUSDT",
+      "spot": "OPGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OPNUSDT",
+      "spot": "OPNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OPUSDT",
+      "spot": "OPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ORCAUSDT",
+      "spot": "ORCAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ORDIUSDT",
+      "spot": "ORDIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "OXTUSDT",
+      "spot": "OXTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PARTIUSDT",
+      "spot": "PARTIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PAXGUSDT",
+      "spot": "PAXGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PENDLEUSDT",
+      "spot": "PENDLEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PENGUUSDT",
+      "spot": "PENGUUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PEOPLEUSDT",
+      "spot": "PEOPLEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PERPUSDT",
+      "spot": "PERPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PHAUSDT",
+      "spot": "PHAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PHBUSDT",
+      "spot": "PHBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PIXELUSDT",
+      "spot": "PIXELUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PLUMEUSDT",
+      "spot": "PLUMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PNUTUSDT",
+      "spot": "PNUTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "POLUSDT",
+      "spot": "POLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "POLYXUSDT",
+      "spot": "POLYXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PORTALUSDT",
+      "spot": "PORTALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "POWRUSDT",
+      "spot": "POWRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PROMUSDT",
+      "spot": "PROMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PROVEUSDT",
+      "spot": "PROVEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PUMPUSDT",
+      "spot": "PUMPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PUNDIXUSDT",
+      "spot": "PUNDIXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "PYTHUSDT",
+      "spot": "PYTHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "QNTUSDT",
+      "spot": "QNTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "QTUMUSDT",
+      "spot": "QTUMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "QUICKUSDT",
+      "spot": "QUICKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RADUSDT",
+      "spot": "RADUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RAREUSDT",
+      "spot": "RAREUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RAYUSDT",
+      "spot": "RAYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RDNTUSDT",
+      "spot": "RDNTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "REDUSDT",
+      "spot": "REDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "REEFUSDT",
+      "spot": "REEFUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "REIUSDT",
+      "spot": "REIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RENDERUSDT",
+      "spot": "RENDERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RENUSDT",
+      "spot": "RENUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RESOLVUSDT",
+      "spot": "RESOLVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "REUSDT",
+      "spot": "REUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "REZUSDT",
+      "spot": "REZUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RIFUSDT",
+      "spot": "RIFUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RLCUSDT",
+      "spot": "RLCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RNDRUSDT",
+      "spot": "RNDRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ROBOUSDT",
+      "spot": "ROBOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RONINUSDT",
+      "spot": "RONINUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ROSEUSDT",
+      "spot": "ROSEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RPLUSDT",
+      "spot": "RPLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RSRUSDT",
+      "spot": "RSRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RUNEUSDT",
+      "spot": "RUNEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "RVNUSDT",
+      "spot": "RVNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SAGAUSDT",
+      "spot": "SAGAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SAHARAUSDT",
+      "spot": "SAHARAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SANDUSDT",
+      "spot": "SANDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SANTOSUSDT",
+      "spot": "SANTOSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SAPIENUSDT",
+      "spot": "SAPIENUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SCRTUSDT",
+      "spot": "SCRTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SCRUSDT",
+      "spot": "SCRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SCUSDT",
+      "spot": "SCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SEIUSDT",
+      "spot": "SEIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SENTUSDT",
+      "spot": "SENTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SFPUSDT",
+      "spot": "SFPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SHELLUSDT",
+      "spot": "SHELLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SIGNUSDT",
+      "spot": "SIGNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SKLUSDT",
+      "spot": "SKLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SKYUSDT",
+      "spot": "SKYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SLPUSDT",
+      "spot": "SLPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SNTUSDT",
+      "spot": "SNTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SNXUSDT",
+      "spot": "SNXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SOLUSDT",
+      "spot": "SOLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SOLVUSDT",
+      "spot": "SOLVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SOMIUSDT",
+      "spot": "SOMIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SOPHUSDT",
+      "spot": "SOPHUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SPELLUSDT",
+      "spot": "SPELLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SPKUSDT",
+      "spot": "SPKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SRMUSDT",
+      "spot": "SRMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SSVUSDT",
+      "spot": "SSVUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STEEMUSDT",
+      "spot": "STEEMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STGUSDT",
+      "spot": "STGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STMXUSDT",
+      "spot": "STMXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STORJUSDT",
+      "spot": "STORJUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STOUSDT",
+      "spot": "STOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STPTUSDT",
+      "spot": "STPTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STRAXUSDT",
+      "spot": "STRAXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STRKUSDT",
+      "spot": "STRKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "STXUSDT",
+      "spot": "STXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SUIUSDT",
+      "spot": "SUIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SUNUSDT",
+      "spot": "SUNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SUPERUSDT",
+      "spot": "SUPERUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SUSDT",
+      "spot": "SUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SUSHIUSDT",
+      "spot": "SUSHIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SXPUSDT",
+      "spot": "SXPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SXTUSDT",
+      "spot": "SXTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SYNUSDT",
+      "spot": "SYNUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SYRUPUSDT",
+      "spot": "SYRUPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "SYSUSDT",
+      "spot": "SYSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TAOUSDT",
+      "spot": "TAOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "THETAUSDT",
+      "spot": "THETAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "THEUSDT",
+      "spot": "THEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TIAUSDT",
+      "spot": "TIAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TLMUSDT",
+      "spot": "TLMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TNSRUSDT",
+      "spot": "TNSRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TOMOUSDT",
+      "spot": "TOMOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TONUSDT",
+      "spot": "TONUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TOWNSUSDT",
+      "spot": "TOWNSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TRBUSDT",
+      "spot": "TRBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TREEUSDT",
+      "spot": "TREEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TROYUSDT",
+      "spot": "TROYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TRUMPUSDT",
+      "spot": "TRUMPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TRUUSDT",
+      "spot": "TRUUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TRXUSDT",
+      "spot": "TRXUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TSTUSDT",
+      "spot": "TSTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TURBOUSDT",
+      "spot": "TURBOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TURTLEUSDT",
+      "spot": "TURTLEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TUSDT",
+      "spot": "TUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TUTUSDT",
+      "spot": "TUTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "TWTUSDT",
+      "spot": "TWTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "UMAUSDT",
+      "spot": "UMAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "UNFIUSDT",
+      "spot": "UNFIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "UNIUSDT",
+      "spot": "UNIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "USDCUSDT",
+      "spot": "USDCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "USTCUSDT",
+      "spot": "USTCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "USUALUSDT",
+      "spot": "USUALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VANAUSDT",
+      "spot": "VANAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VANRYUSDT",
+      "spot": "VANRYUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VELODROMEUSDT",
+      "spot": "VELODROMEUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VETUSDT",
+      "spot": "VETUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VICUSDT",
+      "spot": "VICUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VIDTUSDT",
+      "spot": "VIDTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VIRTUALUSDT",
+      "spot": "VIRTUALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VOXELUSDT",
+      "spot": "VOXELUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "VTHOUSDT",
+      "spot": "VTHOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WALUSDT",
+      "spot": "WALUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WAVESUSDT",
+      "spot": "WAVESUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WAXPUSDT",
+      "spot": "WAXPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WCTUSDT",
+      "spot": "WCTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WIFUSDT",
+      "spot": "WIFUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WLDUSDT",
+      "spot": "WLDUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WLFIUSDT",
+      "spot": "WLFIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WOOUSDT",
+      "spot": "WOOUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "WUSDT",
+      "spot": "WUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XAIUSDT",
+      "spot": "XAIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XAUTUSDT",
+      "spot": "XAUTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XEMUSDT",
+      "spot": "XEMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XLMUSDT",
+      "spot": "XLMUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XMRUSDT",
+      "spot": "XMRUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XPLUSDT",
+      "spot": "XPLUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XRPUSDT",
+      "spot": "XRPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XTZUSDT",
+      "spot": "XTZUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XVGUSDT",
+      "spot": "XVGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "XVSUSDT",
+      "spot": "XVSUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "YBUSDT",
+      "spot": "YBUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "YFIIUSDT",
+      "spot": "YFIIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "YFIUSDT",
+      "spot": "YFIUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "YGGUSDT",
+      "spot": "YGGUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZAMAUSDT",
+      "spot": "ZAMAUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZBTUSDT",
+      "spot": "ZBTUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZECUSDT",
+      "spot": "ZECUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZENUSDT",
+      "spot": "ZENUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZILUSDT",
+      "spot": "ZILUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZKCUSDT",
+      "spot": "ZKCUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZKPUSDT",
+      "spot": "ZKPUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZKUSDT",
+      "spot": "ZKUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZROUSDT",
+      "spot": "ZROUSDT",
+      "multiplier": 1
+    },
+    {
+      "perpetual": "ZRXUSDT",
+      "spot": "ZRXUSDT",
+      "multiplier": 1
+    }
+  ],
+  "excluded_pairs": [
+    {
+      "perpetual": "1000BONKUSDT",
+      "spot": "BONKUSDT",
+      "multiplier": 1000
+    },
+    {
+      "perpetual": "1000BTTCUSDT",
+      "spot": "BTTCUSDT",
+      "multiplier": 1000
+    },
+    {
+      "perpetual": "1000FLOKIUSDT",
+      "spot": "FLOKIUSDT",
+      "multiplier": 1000
+    },
+    {
+      "perpetual": "1000LUNCUSDT",
+      "spot": "LUNCUSDT",
+      "multiplier": 1000
+    },
+    {
+      "perpetual": "1000PEPEUSDT",
+      "spot": "PEPEUSDT",
+      "multiplier": 1000
+    },
+    {
+      "perpetual": "1000SHIBUSDT",
+      "spot": "SHIBUSDT",
+      "multiplier": 1000
+    },
+    {
+      "perpetual": "1000XECUSDT",
+      "spot": "XECUSDT",
+      "multiplier": 1000
+    }
+  ],
+  "universe": {
+    "minimum_history_days": 91,
+    "liquidity_window_days": 30,
+    "minimum_median_quote_volume": "5000000",
+    "maximum_pairs": 100,
+    "minimum_pairs": 40,
+    "tier_one_rank_limit": 20
+  },
+  "selection": {
+    "decile_denominator": 10,
+    "minimum_selected": 8
+  },
+  "costs": {
+    "base": {
+      "name": "base",
+      "perpetual_fee_bps_per_side": "5",
+      "spot_fee_bps_per_side": "10",
+      "slippage_bps_per_side_tier_one": "1",
+      "slippage_bps_per_side_tier_two": "2",
+      "funding_receipt_multiplier": "1",
+      "funding_payment_multiplier": "1",
+      "forced_close_multiplier": "1"
+    },
+    "adverse": {
+      "name": "adverse",
+      "perpetual_fee_bps_per_side": "5",
+      "spot_fee_bps_per_side": "10",
+      "slippage_bps_per_side_tier_one": "1",
+      "slippage_bps_per_side_tier_two": "5",
+      "funding_receipt_multiplier": "0.75",
+      "funding_payment_multiplier": "2",
+      "forced_close_multiplier": "2"
+    }
+  },
+  "folds": {
+    "train_duration_ns": 31536000000000000,
+    "validation_duration_ns": 7862400000000000,
+    "test_duration_ns": 15724800000000000,
+    "step_ns": 15724800000000000,
+    "embargo_ns": 1209600000000000,
+    "holdout_duration_ns": 15724800000000000
+  },
+  "statistics": {
+    "block_length": 4,
+    "bootstrap_repetitions": 2000,
+    "random_seed": 17,
+    "confidence": "0.95",
+    "false_discovery_gate": "0.10",
+    "pooled_episode_floor": 200,
+    "concentration_limit": "0.5",
+    "positive_fold_numerator": 2,
+    "positive_fold_denominator": 3
+  },
+  "capital": {
+    "book_usdt": "10000",
+    "pair_slots": 10,
+    "per_leg_notional_usdt": "500",
+    "fee_tier": "standard_taker_no_bnb"
+  },
+  "cost_evidence": {
+    "receipt_hash": "0bf0a9b9e6436ca9c239c27a0cfc167b8840b9776fcb436da8b315ace66ad3b2",
+    "journal_spec_hash": "5ee4f0f7efaa0ae1db572b54bf35e968ad3556db5d3b5d11e097be521455e730",
+    "base_notional": "500",
+    "adverse_notional": "5000",
+    "rule": "a capital-declared family sets `slippage_bps_per_side_tier_<t>` in its base table to `tier_p50_of_p50` of the *worse leg* at the smallest ladder notional that is at least its per-leg order notional and in its adverse table to `tier_p50_of_p90` at ten times that notional, rounded **up** to the next whole basis point, and cites the receipt hash together with its declared capital."
+  }
+}
