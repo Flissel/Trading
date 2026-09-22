@@ -65,6 +65,16 @@ itself is governed by `docs/superpowers/specs/2026-09-17-holdout-read-design.md`
 - [ ] Report readiness to the user with the four capture root hashes. **Stop.** The read
   (the same command without `--check-only`) runs only on the user's explicit go, once.
 
+## Automation (added 2026-09-22, on the user's go to prepare the read)
+
+Tasks 1 to 5 are implemented by the detached watcher
+`C:/Users/User/.trading-jobs/holdout-capture-extension.ps1` (log
+`holdout-capture-extension.log`, Startup launcher `holdout-capture-extension.cmd`, helpers
+`holdout-extension-symbols.py` and `holdout-extension-lineage.py` beside it). It polls the
+three September dump URLs every six hours, then runs the captures (resumable, retried),
+the repairs, the superset checks and the dry run, and ends with `READY`, `REFUSED` or
+`STOP` in the log. It never runs the read itself. Started 2026-09-22 21:53 local.
+
 ## After the plan
 
 Only on that go: run the read, write `P1_33_HOLDOUT_<date>.md` with the verdict, the
