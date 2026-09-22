@@ -6,6 +6,7 @@ two months registered additively in `tests.shadow_fixtures`.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from pathlib import Path
@@ -25,9 +26,11 @@ from tests.shadow_fixtures import (
     funding_rest_json,
 )
 from tests.test_panel_fold_run import MONTHS, SYMBOLS, kline_csv, zip_bytes
+from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.capture_lineage import verify_capture_superset
 from trading_bot.panel_capture import (
     PanelPayload,
+    PanelSourceAbsent,
     build_kline_zip_url,
     capture_panel,
     parse_kline_zip,
@@ -135,6 +138,27 @@ def _rows(capture_root: Path, kind: str) -> list[dict[str, object]]:
     return [entry for entry in sources if entry["kind"] == kind]
 
 
+def _quality(capture_root: Path) -> dict[str, dict[str, object]]:
+    document = json.loads(
+        (capture_root / "dataset" / "quality-report.json").read_text(encoding="utf-8")
+    )
+    return {str(item["instrument_id"]): item for item in document["instruments"]}
+
+
+def _reseal(capture_root: Path, mutate: Callable[[dict[str, object]], None]) -> None:
+    """Rewrite a capture's manifest after `mutate`, so it still verifies.
+
+    A hand-edited manifest that no longer matches its own seal would be
+    refused by the verification step long before the field under test is
+    read, so the seal is recomputed over the mutated material.
+    """
+    material = {k: v for k, v in _manifest(capture_root).items() if k != "capture_root_hash"}
+    mutate(material)
+    document = dict(material)
+    document["capture_root_hash"] = content_sha256(material)
+    (capture_root / "capture-manifest.json").write_bytes(canonical_json(document))
+
+
 def _daily_urls(fetch: ShadowFetch) -> list[str]:
     return [url for url in fetch.urls if "/daily/klines/" in url]
 
@@ -158,6 +182,7 @@ def test_a_shadow_capture_extends_a_verified_base_through_the_sunday(tmp_path: P
     assert manifest["previous_capture_root_hash"] is None
     assert manifest["tail_through"] == FIRST_TAIL_SUNDAY
     assert manifest["reconciliation"] == {"compared_rows": 0, "mismatches": []}
+    assert manifest["stale_symbols"] == {"klines": {}, "fundingRate": {}}
     assert manifest["months"] is None
     assert manifest["symbols"] == list(SYMBOLS)
     assert manifest["venue"] == "BINANCE_UM"
@@ -368,6 +393,7 @@ def test_a_spot_shadow_capture_never_asks_for_funding(tmp_path: Path) -> None:
     assert not any("fundingRate" in url for url in fetch.urls)
     assert _rows(artifact.capture_root, FUNDING_REST_KIND) == []
     assert _manifest(artifact.capture_root)["venue"] == "BINANCE_SPOT"
+    assert _manifest(artifact.capture_root)["stale_symbols"] == {"klines": {}}
     assert len(_rows(artifact.capture_root, DAILY_TAIL_KIND)) == 2 * len(SYMBOLS)
 
 
@@ -552,3 +578,229 @@ def test_a_response_that_is_not_an_array_refuses() -> None:
         parse_funding_rest(payload, symbol=_SYMBOL, start_time_ms=0, end_time_ms=1)
 
     assert "array" in str(error.value)
+
+
+# --- the base does not cover the same month for every symbol -----------------
+#
+# On the real bases most symbols reach the furthest month and the rest are
+# behind by a month (publication lag) or by years (delistings, funding dumps
+# the venue never wrote). A single cutoff over all of them would skip whole
+# months for everything that is not at the front, so the tail is planned per
+# symbol and per bucket.
+
+_LAGGING_SYMBOL = SYMBOLS[3]
+_STALE_SYMBOL = SYMBOLS[4]
+_FUNDING_AHEAD_SYMBOL = SYMBOLS[1]
+
+
+def test_a_symbol_one_month_behind_starts_its_tail_a_month_earlier(tmp_path: Path) -> None:
+    base = _base_capture(
+        tmp_path,
+        fetch=ShadowFetch(absent_months=frozenset({(_LAGGING_SYMBOL, "2020-07", "klines")})),
+    )
+
+    artifact = _shadow(tmp_path, base, fetch=ShadowFetch())
+
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+    tail_rows = _rows(artifact.capture_root, DAILY_TAIL_KIND)
+    lagging = [row for row in tail_rows if row["symbol"] == _LAGGING_SYMBOL]
+    # All of July, which its own monthly dump never carried, plus the two
+    # tail days every symbol gets.
+    assert len(lagging) == 33
+    assert min(str(row["month"]) for row in lagging) == "2020-07-01"
+    # Nobody else moved, and a one-month lag is not staleness.
+    assert len([row for row in tail_rows if row["symbol"] == _SYMBOL]) == 2
+    assert _manifest(artifact.capture_root)["stale_symbols"] == {"klines": {}, "fundingRate": {}}
+    # Its funding dump is not behind, so its REST window is everyone's.
+    assert {
+        str(row["month"])
+        for row in _rows(artifact.capture_root, FUNDING_REST_KIND)
+        if row["symbol"] == _LAGGING_SYMBOL
+    } == {f"{FIRST_TAIL_DATE}_{FIRST_TAIL_SUNDAY}"}
+    assert _quality(artifact.capture_root)[_LAGGING_SYMBOL]["missing_days"] == 0
+
+
+def test_a_symbol_further_behind_is_declared_stale_and_starts_at_the_furthest_day(
+    tmp_path: Path,
+) -> None:
+    base = _base_capture(
+        tmp_path,
+        fetch=ShadowFetch(
+            absent_months=frozenset(
+                {(_STALE_SYMBOL, "2020-06", "klines"), (_STALE_SYMBOL, "2020-07", "klines")}
+            )
+        ),
+    )
+
+    artifact = _shadow(tmp_path, base, fetch=ShadowFetch())
+
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+    assert _manifest(artifact.capture_root)["stale_symbols"] == {
+        "klines": {_STALE_SYMBOL: "2020-05"},
+        "fundingRate": {},
+    }
+    stale_rows = [
+        row
+        for row in _rows(artifact.capture_root, DAILY_TAIL_KIND)
+        if row["symbol"] == _STALE_SYMBOL
+    ]
+    assert {str(row["month"]) for row in stale_rows} == {FIRST_TAIL_DATE, FIRST_TAIL_SUNDAY}
+
+
+def test_a_funding_month_ahead_of_the_klines_months_does_not_move_the_klines_cutoff(
+    tmp_path: Path,
+) -> None:
+    absent = {(symbol, "2020-08", "klines") for symbol in SYMBOLS} | {
+        (symbol, "2020-08", "fundingRate")
+        for symbol in SYMBOLS
+        if symbol != _FUNDING_AHEAD_SYMBOL
+    }
+    base = _base_capture(
+        tmp_path, months=(*MONTHS, "2020-08"), fetch=ShadowFetch(absent_months=frozenset(absent))
+    )
+
+    artifact = _shadow(tmp_path, base, fetch=ShadowFetch())
+
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+    # Every symbol's klines stop at 2020-07, so the daily tail starts on
+    # 2020-08-01 for all of them -- the one 2020-08 funding dump did not drag
+    # the klines cutoff forward past the tail.
+    tail_rows = _rows(artifact.capture_root, DAILY_TAIL_KIND)
+    assert len(tail_rows) == 2 * len(SYMBOLS)
+    assert {str(row["month"]) for row in tail_rows} == {FIRST_TAIL_DATE, FIRST_TAIL_SUNDAY}
+    # And in the other direction: the symbol whose funding already covers
+    # 2020-08 needs no REST window at all, while the eleven a month behind
+    # get theirs from the day after their own last funding month.
+    rest_rows = _rows(artifact.capture_root, FUNDING_REST_KIND)
+    assert {str(row["symbol"]) for row in rest_rows} == set(SYMBOLS) - {_FUNDING_AHEAD_SYMBOL}
+    assert {str(row["month"]) for row in rest_rows} == {f"{FIRST_TAIL_DATE}_{FIRST_TAIL_SUNDAY}"}
+    assert _manifest(artifact.capture_root)["stale_symbols"] == {"klines": {}, "fundingRate": {}}
+
+
+def test_a_symbol_without_a_saturday_bar_never_waits_for_its_sunday(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+    fetch = ShadowFetch(
+        absent_dates=frozenset({(_SYMBOL, FIRST_TAIL_DATE), (_SYMBOL, FIRST_TAIL_SUNDAY)})
+    )
+    clock = FakeClock()
+
+    artifact = _shadow(tmp_path, base, fetch=fetch, clock=clock)
+
+    # No Saturday bar means the symbol was not trading, so a missing Sunday
+    # dump is an absence like any other and nothing waits for it.
+    assert clock.slept == []
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+    assert {
+        (str(row["month"]), str(row["status"]))
+        for row in _rows(artifact.capture_root, DAILY_TAIL_KIND)
+        if row["symbol"] == _SYMBOL
+    } == {(FIRST_TAIL_DATE, "absent"), (FIRST_TAIL_SUNDAY, "absent")}
+
+
+def test_a_funding_answer_at_the_row_limit_refuses(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+
+    with pytest.raises(ShadowCaptureError) as error:
+        _shadow(tmp_path, base, fetch=ShadowFetch(pad_settlements_to=1000))
+
+    assert "may be truncated" in str(error.value)
+
+
+def test_an_already_written_raw_payload_path_refuses(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+    occupied = tmp_path / "shadow" / "raw" / _SYMBOL / "klines-2020-01.zip"
+    occupied.parent.mkdir(parents=True)
+    occupied.write_bytes(b"someone was here first")
+
+    with pytest.raises(ShadowCaptureError) as error:
+        _shadow(tmp_path, base, fetch=ShadowFetch())
+
+    assert "already written" in str(error.value)
+
+
+def test_a_present_row_without_received_time_ns_refuses(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+
+    def drop_the_timestamp(material: dict[str, object]) -> None:
+        sources = material["sources"]
+        assert isinstance(sources, list)
+        row = next(entry for entry in sources if entry.get("status") == "present")
+        del row["received_time_ns"]
+
+    _reseal(base, drop_the_timestamp)
+    assert verify_panel_capture(base) == (True, ())
+
+    with pytest.raises(ShadowCaptureError) as error:
+        _shadow(tmp_path, base, fetch=ShadowFetch())
+
+    assert "has no received_time_ns" in str(error.value)
+
+
+def test_a_funding_request_that_fails_refuses_as_a_shadow_error(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+    inner = ShadowFetch()
+
+    def fetch(url: str) -> PanelPayload:
+        if "/fapi/v1/fundingRate" in url:
+            raise PanelSourceAbsent("404: no funding history")
+        return inner.fetch(url)
+
+    with pytest.raises(ShadowCaptureError) as error:
+        build_shadow_capture(
+            workspace_root=tmp_path,
+            base_capture_root=base,
+            output_directory=tmp_path / "shadow",
+            reserve_bytes=0,
+            tail_through=FIRST_TAIL_SUNDAY,
+            market="um",
+            fetch=fetch,
+            clock=FakeClock().time_ns,
+        )
+
+    assert "could not be fetched" in str(error.value)
+
+
+def test_a_funding_url_for_an_impossible_symbol_refuses_as_a_shadow_error() -> None:
+    with pytest.raises(ShadowCaptureError) as error:
+        build_funding_rest_url("btcusdt", start_time_ms=0, end_time_ms=1)
+
+    assert "btcusdt" in str(error.value)
+
+
+def test_a_settlement_spacing_below_an_hour_refuses() -> None:
+    with pytest.raises(ShadowCaptureError) as error:
+        parse_funding_rest(
+            _rest_payload([_settlement(0), _settlement(60_000)]),
+            symbol=_SYMBOL,
+            start_time_ms=0,
+            end_time_ms=3_600_000,
+        )
+
+    assert "less than an hour" in str(error.value)
+
+
+def test_a_settlement_spacing_off_a_whole_hour_refuses() -> None:
+    hour_ms = 3_600_000
+    with pytest.raises(ShadowCaptureError) as error:
+        parse_funding_rest(
+            _rest_payload([_settlement(0), _settlement(8 * hour_ms + 120_000)]),
+            symbol=_SYMBOL,
+            start_time_ms=0,
+            end_time_ms=24 * hour_ms,
+        )
+
+    assert "not a whole number of hours" in str(error.value)
+
+
+def test_a_settlement_a_few_seconds_early_still_measures_eight_hours() -> None:
+    hour_ms = 3_600_000
+    rows = parse_funding_rest(
+        # Thirty seconds short of eight hours -- floor division would have
+        # called this a seven-hour funding interval.
+        _rest_payload([_settlement(0), _settlement(8 * hour_ms - 30_000)]),
+        symbol=_SYMBOL,
+        start_time_ms=0,
+        end_time_ms=24 * hour_ms,
+    )
+
+    assert [row.funding_interval_hours for row in rows] == [8, 8]

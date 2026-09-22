@@ -16,7 +16,14 @@ hardlinked (or copied) and their manifest rows carried verbatim, so their
 `raw_sha256` is by construction the base's own. Reconciliation of a daily-tail
 bar against the monthly dump that later covers it is a separate step; this
 builder records an empty `reconciliation` block and drops the previous week's
-rows whose month the base now covers.
+rows whose month the base now covers for that symbol.
+
+A real base does not cover the same month for every symbol: delisted
+contracts stop years early and funding dumps lag klines. The tail therefore
+starts per symbol and per source bucket -- a symbol one month behind the
+furthest one is simply lagging and its tail starts a month earlier, while a
+symbol further behind is named in the manifest's `stale_symbols` rather than
+having years of daily dumps refetched every week.
 """
 
 import hashlib
@@ -38,6 +45,7 @@ from trading_bot.panel_capture import (
     _DAILY_FILL_KIND,
     _MONTH_PATTERN,
     _VENUE,
+    PanelCaptureError,
     PanelFetch,
     PanelPayload,
     PanelSourceAbsent,
@@ -79,6 +87,10 @@ _FUNDING_REST_LIMIT = 1000
 # hours. With one row there is no spacing to read it off, and a weekly tail
 # window that holds a single settlement is the normal, not the odd, case.
 _DEFAULT_FUNDING_INTERVAL_HOURS = 8
+# How far a measured settlement spacing may sit off a whole hour before it
+# stops being a funding interval: a minute, which is far more than venue
+# jitter and far less than the smallest real interval.
+_FUNDING_INTERVAL_TOLERANCE_MS = 60_000
 _MILLISECONDS_PER_HOUR = 3_600_000
 _MILLISECONDS_PER_DAY = 86_400_000
 _NANOSECONDS_PER_MILLISECOND = 1_000_000
@@ -107,7 +119,6 @@ def build_funding_rest_url(symbol: str, *, start_time_ms: int, end_time_ms: int)
     weekly tail holds at most a few dozen, so one request always covers the
     whole span and no pagination cursor has to be trusted.
     """
-    _validate_symbol(symbol)
     if start_time_ms < 0 or end_time_ms < start_time_ms:
         raise ShadowCaptureError(
             f"invalid funding window for {symbol}: {start_time_ms}..{end_time_ms}"
@@ -116,7 +127,14 @@ def build_funding_rest_url(symbol: str, *, start_time_ms: int, end_time_ms: int)
         f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}"
         f"&startTime={start_time_ms}&endTime={end_time_ms}&limit={_FUNDING_REST_LIMIT}"
     )
-    _validate_panel_url(url)
+    try:
+        # `panel_capture` owns both checks; its refusals are re-raised as this
+        # module's own so that everything this module's surface raises is a
+        # `ShadowCaptureError`.
+        _validate_symbol(symbol)
+        _validate_panel_url(url)
+    except PanelCaptureError as error:
+        raise ShadowCaptureError(f"invalid funding request for {symbol}: {error}") from error
     return url
 
 
@@ -146,6 +164,14 @@ def parse_funding_rest(
         raise ShadowCaptureError(f"funding REST answer for {symbol} is unreadable") from error
     if not isinstance(document, list):
         raise ShadowCaptureError(f"funding REST answer for {symbol} is not a JSON array")
+    if len(document) >= _FUNDING_REST_LIMIT:
+        # At the row limit the venue may have cut the window short, and a
+        # silently short funding history is a wrong funding total, not a gap
+        # anything downstream would notice.
+        raise ShadowCaptureError(
+            f"funding REST answer for {symbol} over {start_time_ms}..{end_time_ms} reached "
+            f"the {_FUNDING_REST_LIMIT}-row limit and may be truncated"
+        )
     rates: dict[int, Decimal] = {}
     for entry in document:
         calc_time_ms, rate = _funding_rest_settlement(entry, symbol=symbol)
@@ -160,7 +186,7 @@ def parse_funding_rest(
             venue=venue,
             instrument_id=symbol,
             calc_time_ns=calc_time_ms * _NANOSECONDS_PER_MILLISECOND,
-            funding_interval_hours=_funding_interval_hours(inside, index),
+            funding_interval_hours=_funding_interval_hours(inside, index, symbol=symbol),
             rate=rates[calc_time_ms],
         )
         for index, calc_time_ms in enumerate(inside)
@@ -193,12 +219,35 @@ def _funding_rest_settlement(entry: object, *, symbol: str) -> tuple[int, Decima
     return calc_time_ms, rate
 
 
-def _funding_interval_hours(settlements: list[int], index: int) -> int:
+def _funding_interval_hours(settlements: list[int], index: int, *, symbol: str) -> int:
+    """The measured spacing around one settlement, in whole hours.
+
+    A funding interval is a whole number of hours by construction (eight on
+    most contracts, four on some), so the measured delta is rounded to the
+    nearest hour rather than floored -- a settlement a few seconds late must
+    not turn an eight-hour interval into seven. Anything that is not within a
+    minute of a whole positive hour is not a funding interval at all, and is
+    refused rather than recorded as an approximation the accounting would
+    then multiply through.
+    """
     if len(settlements) == 1:
         return _DEFAULT_FUNDING_INTERVAL_HOURS
     if index + 1 < len(settlements):
-        return (settlements[index + 1] - settlements[index]) // _MILLISECONDS_PER_HOUR
-    return (settlements[index] - settlements[index - 1]) // _MILLISECONDS_PER_HOUR
+        delta_ms = settlements[index + 1] - settlements[index]
+    else:
+        delta_ms = settlements[index] - settlements[index - 1]
+    hours = (delta_ms + _MILLISECONDS_PER_HOUR // 2) // _MILLISECONDS_PER_HOUR
+    if hours <= 0:
+        raise ShadowCaptureError(
+            f"funding settlements for {symbol} are {delta_ms} ms apart, less than an hour"
+        )
+    drift_ms = abs(delta_ms - hours * _MILLISECONDS_PER_HOUR)
+    if drift_ms > _FUNDING_INTERVAL_TOLERANCE_MS:
+        raise ShadowCaptureError(
+            f"funding settlements for {symbol} are {delta_ms} ms apart, "
+            f"not a whole number of hours"
+        )
+    return hours
 
 
 def build_shadow_capture(
@@ -242,13 +291,39 @@ def build_shadow_capture(
     symbols = tuple(_string_list(base_manifest, "symbols"))
     base_sources = _source_entries(base_manifest, label="base")
 
-    last_base_month = _last_covered_month(base_sources)
-    first_tail_day = _first_day_after_month(last_base_month)
-    if tail_day < first_tail_day:
+    covered = _covered_months(base_sources)
+    klines_month = _furthest_month(covered["klines"])
+    if klines_month is None:
+        raise ShadowCaptureError("base capture covers no whole month to extend")
+    # A base with klines but no funding dump at all still gets a funding tail:
+    # every symbol is then a stale one and the window starts where the klines
+    # tail starts.
+    funding_month = _furthest_month(covered["fundingRate"]) or klines_month
+    if tail_day < _first_day_after_month(klines_month):
         raise ShadowCaptureError(
             f"tail_through {tail_through} does not reach past the base capture's "
-            f"last month {last_base_month}"
+            f"last month {klines_month}"
         )
+    daily_start: dict[str, date_type] = {}
+    rest_start: dict[str, date_type] = {}
+    stale_symbols: dict[str, dict[str, object]] = {"klines": {}}
+    if market == "um":
+        stale_symbols["fundingRate"] = {}
+    for symbol in symbols:
+        own_klines_month = covered["klines"].get(symbol)
+        daily_start[symbol], klines_stale = _bucket_tail_start(
+            own_klines_month, furthest_month=klines_month
+        )
+        if klines_stale:
+            stale_symbols["klines"][symbol] = own_klines_month
+        if market != "um":
+            continue
+        own_funding_month = covered["fundingRate"].get(symbol)
+        rest_start[symbol], funding_stale = _bucket_tail_start(
+            own_funding_month, furthest_month=funding_month
+        )
+        if funding_stale:
+            stale_symbols["fundingRate"][symbol] = own_funding_month
 
     workspace = workspace_root.resolve()
     target = output_directory.resolve()
@@ -289,11 +364,16 @@ def build_shadow_capture(
             kind = str(entry.get("kind"))
             if kind not in (DAILY_TAIL_KIND, FUNDING_REST_KIND):
                 continue
+            symbol = str(entry.get("symbol"))
             span_start, span_end = _row_span(kind, str(entry.get("month")))
-            if _month_of(span_start) <= last_base_month:
-                # The base's own monthly dump now covers this row's month.
-                # Comparing the two is Task 2's reconciliation; until it
-                # exists the monthly dump simply wins and the row is dropped.
+            bucket = "klines" if kind == DAILY_TAIL_KIND else "fundingRate"
+            own_month = covered[bucket].get(symbol)
+            if own_month is not None and _month_of(span_start) <= own_month:
+                # The base's own monthly dump now covers this row's month --
+                # for this symbol, which is what matters when symbols cover
+                # different months. Comparing the two is Task 2's
+                # reconciliation; until it exists the monthly dump simply
+                # wins and the row is dropped.
                 continue
             _carry_source(
                 entry,
@@ -305,7 +385,6 @@ def build_shadow_capture(
                 funding=funding,
                 open_times=open_times,
             )
-            symbol = str(entry.get("symbol"))
             reached = carried_tail_day if kind == DAILY_TAIL_KIND else carried_rest_day
             reached[symbol] = max(span_end, reached.get(symbol, span_end))
 
@@ -313,7 +392,7 @@ def build_shadow_capture(
     for symbol in symbols:
         _fetch_daily_tail(
             symbol=symbol,
-            first_day=_next_day_or(carried_tail_day.get(symbol), first_tail_day),
+            first_day=_next_day_or(carried_tail_day.get(symbol), daily_start[symbol]),
             tail_day=tail_day,
             market=market,
             venue=venue,
@@ -332,7 +411,7 @@ def build_shadow_capture(
             continue
         _fetch_funding_window(
             symbol=symbol,
-            first_day=_next_day_or(carried_rest_day.get(symbol), first_tail_day),
+            first_day=_next_day_or(carried_rest_day.get(symbol), rest_start[symbol]),
             tail_day=tail_day,
             venue=venue,
             fetch=fetch,
@@ -349,7 +428,6 @@ def build_shadow_capture(
             str(item["raw_sha256"]) for item in sources if item.get("status") == "present"
         ),
     )
-    reconciliation: dict[str, object] = {"compared_rows": 0, "mismatches": []}
     material: dict[str, object] = {
         "capture_version": _CAPTURE_VERSION,
         "market": market,
@@ -367,7 +445,8 @@ def build_shadow_capture(
             else None
         ),
         "tail_through": tail_through,
-        "reconciliation": reconciliation,
+        "stale_symbols": stale_symbols,
+        "reconciliation": _empty_reconciliation(),
     }
     capture_root_hash = content_sha256(material)
     document = dict(material)
@@ -378,9 +457,10 @@ def build_shadow_capture(
         capture_root_hash=capture_root_hash,
         dataset_root_hash=dataset.root_hash,
         tail_through=tail_through,
-        # A copy: the manifest's own block is already sealed into
-        # `capture_root_hash` and must not be reachable through the artifact.
-        reconciliation=dict(reconciliation),
+        # Its own block, not the manifest's: that one is already sealed into
+        # `capture_root_hash`, and once Task 2 fills `mismatches` a shared
+        # (or shallow-copied) list would be reachable through the artifact.
+        reconciliation=_empty_reconciliation(),
     )
 
 
@@ -482,9 +562,18 @@ def _fetch_funding_window(
         return
     start_time_ms = _day_start_ms(first_day)
     end_time_ms = _day_end_ms(tail_day)
+    window = f"{first_day.isoformat()}_{tail_day.isoformat()}"
     url = build_funding_rest_url(symbol, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
-    payload = fetch(url)
-    _validate_panel_url(payload.url)
+    try:
+        payload = fetch(url)
+        _validate_panel_url(payload.url)
+    except PanelCaptureError as error:
+        # Including a 404: unlike a daily dump, whose absence is a normal
+        # fact about a contract, the funding endpoint answers an empty array
+        # for a window with no settlements. A refusal here is a real failure.
+        raise ShadowCaptureError(
+            f"funding history for {symbol} over {window} could not be fetched: {error}"
+        ) from error
     rows = parse_funding_rest(
         payload,
         symbol=symbol,
@@ -492,7 +581,6 @@ def _fetch_funding_window(
         end_time_ms=end_time_ms,
         venue=venue,
     )
-    window = f"{first_day.isoformat()}_{tail_day.isoformat()}"
     relative = f"raw/{symbol}/{FUNDING_REST_KIND}-{window}.json"
     path = target / relative
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -569,13 +657,13 @@ def _carry_source(
     _copy_raw_payload(
         source_root=source_root,
         target=target,
-        relative=str(entry["raw_relative_path"]),
-        expected_sha256=str(entry["raw_sha256"]),
+        relative=_present_row_text(entry, "raw_relative_path"),
+        expected_sha256=_present_row_text(entry, "raw_sha256"),
     )
     new_candles, new_funding = _rows_from_source(entry, capture_root=target, venue=venue)
     candles.extend(new_candles)
     funding.extend(new_funding)
-    open_times.setdefault(str(entry["symbol"]), set()).update(
+    open_times.setdefault(str(entry.get("symbol")), set()).update(
         row.open_time_ns for row in new_candles
     )
 
@@ -592,11 +680,25 @@ def _copy_raw_payload(
     """
     source = source_root / relative
     destination = target / relative
+    if destination.exists():
+        # Spec section 6: nothing is written under `raw/` twice. Overwriting
+        # would hide a manifest that carries one path under two rows.
+        raise ShadowCaptureError(f"raw payload path is already written: {relative}")
+    if not source.is_file():
+        raise ShadowCaptureError(f"source raw payload is missing: {relative}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         os.link(source, destination)
     except OSError:
-        shutil.copyfile(source, destination)
+        # The source is present and the target absent, so the only thing left
+        # for `os.link` to fail on is the filesystem itself -- a different
+        # volume, a link-count limit, a share without links.
+        try:
+            shutil.copyfile(source, destination)
+        except OSError as copy_error:
+            raise ShadowCaptureError(
+                f"raw payload could not be linked or copied: {relative}"
+            ) from copy_error
     if hashlib.sha256(destination.read_bytes()).hexdigest() != expected_sha256:
         raise ShadowCaptureError(f"copied raw payload hash mismatch: {relative}")
 
@@ -605,12 +707,12 @@ def _rows_from_source(
     entry: dict[str, Any], *, capture_root: Path, venue: str
 ) -> tuple[tuple[PanelCandleRow, ...], tuple[PanelFundingRow, ...]]:
     """Re-derive one present source row's candle and funding rows."""
-    symbol = str(entry["symbol"])
-    kind = str(entry["kind"])
+    symbol = str(entry.get("symbol"))
+    kind = str(entry.get("kind"))
     payload = PanelPayload(
-        url=str(entry["url"]),
-        raw_bytes=(capture_root / str(entry["raw_relative_path"])).read_bytes(),
-        received_time_ns=int(entry["received_time_ns"]),
+        url=_present_row_text(entry, "url"),
+        raw_bytes=(capture_root / _present_row_text(entry, "raw_relative_path")).read_bytes(),
+        received_time_ns=_present_row_received_time_ns(entry),
     )
     if kind in ("klines", _DAILY_FILL_KIND, DAILY_TAIL_KIND):
         return parse_kline_zip(payload, symbol=symbol, venue=venue), ()
@@ -687,17 +789,59 @@ def _rest_window_days(month_field: str) -> tuple[date_type, date_type]:
     return _parse_date(start_text), _parse_date(end_text)
 
 
-def _last_covered_month(entries: list[dict[str, Any]]) -> str:
-    """The last whole month the base capture covers from the monthly dumps."""
-    months = sorted(
-        str(entry.get("month"))
-        for entry in entries
-        if str(entry.get("kind")) in _MONTHLY_KINDS
-        and _MONTH_PATTERN.match(str(entry.get("month"))) is not None
-    )
-    if not months:
-        raise ShadowCaptureError("base capture covers no whole month to extend")
-    return months[-1]
+def _covered_months(entries: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    """Per bucket and symbol, the last whole month the base actually carries.
+
+    Only `present` rows count: an `absent` month is one the venue never
+    published for that symbol, so the symbol is not covered for it. The two
+    buckets are kept apart because they run at different speeds -- a symbol
+    can have klines for a month whose funding dump was never written, and a
+    delisted symbol's last klines month is years behind the panel's furthest
+    one. A single maximum over all of it would silently skip whole months for
+    everything that is not at the front.
+    """
+    covered: dict[str, dict[str, str]] = {kind: {} for kind in _MONTHLY_KINDS}
+    for entry in entries:
+        kind = str(entry.get("kind"))
+        if kind not in _MONTHLY_KINDS or entry.get("status") != "present":
+            continue
+        month = str(entry.get("month"))
+        if _MONTH_PATTERN.match(month) is None:
+            continue
+        symbol = str(entry.get("symbol"))
+        if month > covered[kind].get(symbol, ""):
+            covered[kind][symbol] = month
+    return covered
+
+
+def _furthest_month(covered: dict[str, str]) -> str | None:
+    """The furthest month any symbol reaches in one bucket."""
+    return max(covered.values()) if covered else None
+
+
+def _bucket_tail_start(own_month: str | None, *, furthest_month: str) -> tuple[date_type, bool]:
+    """Where one symbol's tail starts in one bucket, and whether it is stale.
+
+    Three cases, and the middle one is why this is not a single cutoff:
+
+    - the symbol reaches the furthest month: its tail starts the day after
+      that month, the ordinary case;
+    - it is exactly one month behind: Binance publishes a month's dump days
+      into the next month, so this is publication lag, not a gone contract.
+      Its tail starts the day after *its own* last month -- at most 31 extra
+      daily dumps and the same single REST window;
+    - it is further behind, or has no month in this bucket at all: a delisting
+      or a funding dump the venue never wrote. Refetching years of daily dumps
+      for every such symbol every week is not a weekly job, so the tail starts
+      at the furthest month's day and the gap is declared in the manifest's
+      `stale_symbols` instead of being silently skipped.
+    """
+    furthest_start = _first_day_after_month(furthest_month)
+    if own_month == furthest_month:
+        return furthest_start, False
+    if own_month is not None and _month_of(_first_day_after_month(own_month)) == furthest_month:
+        return _first_day_after_month(own_month), False
+    return furthest_start, True
 
 
 def _verified_manifest(capture_root: Path, *, label: str) -> dict[str, Any]:
@@ -729,6 +873,40 @@ def _source_entries(manifest: dict[str, Any], *, label: str) -> list[dict[str, A
             raise ShadowCaptureError(f"{label} capture manifest is malformed")
         entries.append(item)
     return entries
+
+
+def _empty_reconciliation() -> dict[str, object]:
+    """A fresh, unshared reconciliation block -- Task 2 fills `mismatches`."""
+    return {"compared_rows": 0, "mismatches": []}
+
+
+def _present_row_name(entry: dict[str, Any]) -> str:
+    return f"{entry.get('kind')}:{entry.get('symbol')}:{entry.get('month')}"
+
+
+def _present_row_text(entry: dict[str, Any], key: str) -> str:
+    """One string field a `present` source row must carry.
+
+    A row a capture recorded as present but that lacks its url, path or
+    digest is a malformed manifest, and it must say so rather than raise a
+    bare `KeyError` out of the middle of a copy.
+    """
+    value = entry.get(key)
+    if not isinstance(value, str) or not value:
+        raise ShadowCaptureError(
+            f"present source row {_present_row_name(entry)} has no {key}"
+        )
+    return value
+
+
+def _present_row_received_time_ns(entry: dict[str, Any]) -> int:
+    value = entry.get("received_time_ns")
+    # `isinstance(True, int)` is true and a bool is never a timestamp.
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ShadowCaptureError(
+            f"present source row {_present_row_name(entry)} has no received_time_ns"
+        )
+    return value
 
 
 def _string_list(manifest: dict[str, Any], key: str) -> list[str]:

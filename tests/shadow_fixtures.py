@@ -43,6 +43,7 @@ ALL_MONTHS = (*MONTHS, *TAIL_MONTHS)
 # 2020-01-01, a Wednesday, and `panel_samples` calls a day a Sunday when its
 # epoch day number leaves remainder 3 modulo 7. 2020-08-01 is a Saturday and
 # 2020-08-02 the first Sunday after the base capture's last month.
+HOUR_MS = 3_600_000
 FIRST_TAIL_DATE = "2020-08-01"
 FIRST_TAIL_SUNDAY = "2020-08-02"
 SECOND_TAIL_SUNDAY = "2020-08-09"
@@ -125,18 +126,22 @@ class ShadowFetch:
 
     Every request is recorded in `urls`, so a test can assert what was *not*
     asked for -- that a spot capture never reaches for funding, or that a
-    carried tail date is never refetched. The hooks are the four failures the
-    builder has to survive: a date that is absent for good, a date that only
-    appears after some hours (the Sunday wait), a response that repeats a
-    settlement, and a response that carries settlements outside the window it
-    was asked for.
+    carried tail date is never refetched. The hooks are the failures the
+    builder has to survive: a monthly dump a symbol never got (the lagging
+    and delisted contracts a real base is full of), a date that is absent for
+    good, a date that only appears after some hours (the Sunday wait), a
+    dump that carries the wrong day, a response that repeats a settlement,
+    a response that carries settlements outside the window it was asked for,
+    and a response long enough to have been truncated.
     """
 
+    absent_months: frozenset[tuple[str, str, str]] = frozenset()
     absent_dates: frozenset[tuple[str, str]] = frozenset()
     appears_after_attempts: dict[tuple[str, str], int] = field(default_factory=dict)
     wrong_day_dates: frozenset[tuple[str, str]] = frozenset()
     duplicate_settlement: bool = False
     settlements_outside_window: bool = False
+    pad_settlements_to: int = 0
     urls: list[str] = field(default_factory=list)
     attempts: dict[tuple[str, str], int] = field(default_factory=dict)
 
@@ -154,10 +159,21 @@ class ShadowFetch:
         start_ms = int(query["startTime"][0])
         end_ms = int(query["endTime"][0])
         rows = funding_rest_rows(symbol, start_ms, end_ms)
+        rate = funding_rate(symbol)
+        while len(rows) < self.pad_settlements_to:
+            # Past the window's end, so the padding cannot be mistaken for a
+            # settlement: it is there to make the answer long, nothing else.
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "fundingTime": end_ms + len(rows) * HOUR_MS + HOUR_MS,
+                    "fundingRate": rate,
+                    "markPrice": "100.00000000",
+                }
+            )
         if self.duplicate_settlement and rows:
             rows.append(dict(rows[0]))
         if self.settlements_outside_window:
-            rate = funding_rate(symbol)
             for outside_ms in (start_ms - 1, end_ms + 1):
                 rows.append(
                     {
@@ -192,6 +208,9 @@ class ShadowFetch:
     def _monthly(self, url: str) -> PanelPayload:
         symbol = next(item for item in SYMBOLS if f"/{item}/" in url or f"/{item}-" in url)
         month = next(item for item in ALL_MONTHS if item in url)
+        kind = "fundingRate" if "fundingRate" in url else "klines"
+        if (symbol, month, kind) in self.absent_months:
+            raise PanelSourceAbsent(f"404: no {kind} dump for {symbol} {month}")
         if "fundingRate" in url:
             return _payload(url, "f.csv", funding_csv(symbol, month))
         if "/data/spot/" in url:
