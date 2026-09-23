@@ -3,6 +3,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
@@ -20,15 +21,15 @@ from tests.test_binance_cost_journal import (
     urlopen_returning,
     write_journal_directory,
 )
+from trading_bot import binance_measurement_journal
 from trading_bot.binance_cost_journal import (
     SAMPLE_INTERVAL_SECONDS,
+    TIER_MINIMUM_CONTRIBUTORS,
     ZERO_HASH,
     BinanceCostJournalError,
     BinanceCostJournalTransportError,
     InstrumentObservation,
-    TierStatistics,
     _instrument_statistics,
-    _tier_statistics,
     public_binance_json_array_fetcher,
     public_binance_json_fetcher,
 )
@@ -43,6 +44,7 @@ from trading_bot.binance_measurement_journal import (
     BinanceMeasurementJournalSpecError,
     MeasurementChainHead,
     _segment_paths,
+    _tier_floor_count,
     _verified_chain,
     _verified_tail,
     book_rows,
@@ -1758,7 +1760,7 @@ def decimal_or_none(value: object) -> str | None:
     return None if value is None else str(value)
 
 
-def test_a_snapshot_s_cost_blocks_are_v1_s_arithmetic_over_the_window(
+def test_a_snapshot_s_cost_instruments_are_v1_s_arithmetic_over_the_window(
     tmp_path: Path,
 ) -> None:
     journal = scripted_journal(tmp_path)
@@ -1798,26 +1800,247 @@ def test_a_snapshot_s_cost_blocks_are_v1_s_arithmetic_over_the_window(
     # The window, not the journal: ten rounds were sampled and six are read.
     assert [item.observation_count for item in statistics] == [6, 6]
     assert [item.slippage["500"]["count"] for item in statistics] == [6, 6]
-    expected_tiers = {
-        f"{tier}:{market}": tier_block(
-            _tier_statistics(statistics, tier=tier, market=market, keys=keys), keys=keys
-        )
-        for tier in (1, 2)
-        for market in ("spot", "um")
+    # Six rounds is under the floor, so the two declared instruments are
+    # counted and no median is taken over them (ruling 14).
+    assert document["tier_floor_count"] == 100
+    withheld = {
+        key: {"contributing_count": 0, "p50_of_p50": None, "p50_of_p90": None} for key in keys
     }
-    assert document["cost_tiers"] == expected_tiers
+    assert document["cost_tiers"] == {
+        "1:spot": {"instrument_count": 1, "slippage": withheld},
+        "1:um": {"instrument_count": 1, "slippage": withheld},
+        "2:spot": {"instrument_count": 0, "slippage": withheld},
+        "2:um": {"instrument_count": 0, "slippage": withheld},
+    }
 
 
-def tier_block(item: TierStatistics, *, keys: Sequence[str]) -> dict[str, object]:
+def at(document: Mapping[str, object], *keys: str) -> object:
+    """The value a path of keys reaches in a snapshot document."""
+    value: object = document
+    for key in keys:
+        assert isinstance(value, dict)
+        value = value[key]
+    return value
+
+
+def test_the_window_tier_floor_is_half_the_window_and_never_below_a_hundred() -> None:
+    """A week of rounds clears the hundred; an afternoon of them does not."""
+    assert [_tier_floor_count(rounds) for rounds in (0, 1, 8, 200, 201, 400, 9_914)] == [
+        100,
+        100,
+        100,
+        100,
+        100,
+        200,
+        4_957,
+    ]
+
+
+# Five spot legs of tier one, so a tier median has members to be taken over.
+TIER_SYMBOLS = ("AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT", "EEEUSDT")
+# The level distance from the mid, in basis points, per symbol: with one deep
+# level a side the slippage per side *is* that distance, at every notional.
+TIER_DISTANCES = {"AAAUSDT": 1, "BBBUSDT": 2, "CCCUSDT": 3, "DDDUSDT": 4, "EEEUSDT": 50}
+TIER_ROUNDS = 8
+# EEEUSDT is unreachable for the first five rounds, so it is measured three
+# times in an eight-round window and stays under the floor.
+TIER_DARK_ROUNDS = 5
+
+
+def tier_instrument_document(symbol: str) -> dict[str, object]:
     return {
-        "instrument_count": item.instrument_count,
+        "instrument_id": f"spot:{symbol}",
+        "market": "spot",
+        "symbol": symbol,
+        "pair_symbol": symbol,
+        "tier": 1,
+        "depth_url": f"https://api.binance.com/api/v3/depth?symbol={symbol}&limit=500",
+        "premium_index_url": None,
+    }
+
+
+class TieredVenue:
+    """A depth fetcher whose book is one deep level a side, per symbol.
+
+    One level that fills every notional costs the walk the same at all three,
+    so an instrument's slippage per side is exactly its level's distance from
+    the mid of 100 in basis points. The last round of the window widens every
+    distance tenfold, so a member's p90 over the window is not its p50; and a
+    symbol named in `dark` is unreachable for its first rounds, which is how
+    an instrument stays under the window floor while still being measured.
+    """
+
+    def __init__(
+        self, *, distances: Mapping[str, int], dark: Mapping[str, int], rounds: int
+    ) -> None:
+        self.distances = dict(distances)
+        self.dark = dict(dark)
+        self.rounds = rounds
+        self.calls: dict[str, int] = dict.fromkeys(distances, 0)
+
+    def __call__(self, url: str) -> Mapping[str, object]:
+        symbol = parse_qs(urlsplit(url).query)["symbol"][0]
+        index = self.calls[symbol]
+        self.calls[symbol] = index + 1
+        if index < self.dark.get(symbol, 0):
+            raise ConnectionError(f"{symbol} is unreachable")
+        widened = 10 if index == self.rounds - 1 else 1
+        offset = Decimal(self.distances[symbol] * widened) / Decimal(100)
+        return {
+            "lastUpdateId": 1,
+            "bids": [[str(Decimal(100) - offset), "1000"]],
+            "asks": [[str(Decimal(100) + offset), "1000"]],
+        }
+
+
+def tiered_journal(tmp_path: Path) -> Path:
+    """Eight rounds over five tier-one spot legs, one of them mostly dark."""
+    cost_journal = tmp_path / "cost-journal"
+    write_journal_directory(
+        cost_journal, instruments=[tier_instrument_document(s) for s in TIER_SYMBOLS]
+    )
+    journal = tmp_path / "measurement"
+    create_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        run_id="binance-measurement-v1",
+        cost_journal_root=cost_journal,
+    )
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=TIER_ROUNDS,
+        fetcher=TieredVenue(
+            distances=TIER_DISTANCES,
+            dark={"EEEUSDT": TIER_DARK_ROUNDS},
+            rounds=TIER_ROUNDS,
+        ),
+        array_fetcher=SnapshotVenue(),
+        clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    return journal
+
+
+def test_a_snapshot_s_tier_medians_are_taken_over_the_members_that_cleared_the_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling 14: a window floor, not the receipt's eligibility, admits a member."""
+    monkeypatch.setattr(binance_measurement_journal, "_TIER_FLOOR_MINIMUM", 4)
+    journal = tiered_journal(tmp_path)
+    stamps = stamps_of(journal)
+    document = read_document(
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "snapshot.json",
+            reserve_bytes=0,
+            window_start_ns=stamps[0],
+            window_end_ns=stamps[-1],
+        )
+    )
+    assert document["rounds"] == TIER_ROUNDS
+    # max(4, 8 // 2) with the minimum lowered for the fixture.
+    assert document["tier_floor_count"] == 4
+    # Seven rounds at the symbol's own distance and one at ten times it, so
+    # the p50 is the distance and the p90 is ten times it.
+    assert [
+        at(document, "cost_instruments", f"spot:{symbol}", "observation_count")
+        for symbol in TIER_SYMBOLS
+    ] == [8, 8, 8, 8, 3]
+    assert [
+        at(document, "cost_instruments", f"spot:{symbol}", "slippage", "500")
+        for symbol in TIER_SYMBOLS
+    ] == [
+        {"count": 8, "p50": "1.000000", "p90": "10.000000"},
+        {"count": 8, "p50": "2.000000", "p90": "20.000000"},
+        {"count": 8, "p50": "3.000000", "p90": "30.000000"},
+        {"count": 8, "p50": "4.000000", "p90": "40.000000"},
+        # Measured three times, so it is under the floor - and still recorded.
+        {"count": 3, "p50": "50.000000", "p90": "500.000000"},
+    ]
+    # Four contributors, so the median is reported: `_quantile` takes the
+    # ceil(4 * 0.5) - 1 = index 1 of [1, 2, 3, 4] and of [10, 20, 30, 40].
+    # EEEUSDT would move both (index 2 of five values) if it were admitted.
+    assert at(document, "cost_tiers", "1:spot") == {
+        # Every declared leg of the tier, not only the admitted ones.
+        "instrument_count": 5,
         "slippage": {
             key: {
-                "contributing_count": item.slippage[key]["contributing_count"],
-                "p50_of_p50": decimal_or_none(item.slippage[key]["p50_of_p50"]),
-                "p50_of_p90": decimal_or_none(item.slippage[key]["p50_of_p90"]),
+                "contributing_count": 4,
+                "p50_of_p50": "2.000000",
+                "p50_of_p90": "20.000000",
             }
-            for key in keys
+            for key in ("500", "5000", "50000")
+        },
+    }
+    assert at(document, "cost_tiers", "1:um", "instrument_count") == 0
+    # One member short of the floor is one member short of a median.
+    monkeypatch.setattr(binance_measurement_journal, "_TIER_FLOOR_MINIMUM", 9)
+    second = read_document(
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "second.json",
+            reserve_bytes=0,
+            window_start_ns=stamps[0],
+            window_end_ns=stamps[-1],
+        )
+    )
+    assert second["tier_floor_count"] == 9
+    assert at(second, "cost_tiers", "1:spot", "slippage", "500") == {
+        "contributing_count": 0,
+        "p50_of_p50": None,
+        "p50_of_p90": None,
+    }
+
+
+def test_a_tier_median_needs_four_contributors_however_many_cleared_the_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """v1's withholding rule is kept: three instruments wearing a tier's name are not one."""
+    assert TIER_MINIMUM_CONTRIBUTORS == 4
+    monkeypatch.setattr(binance_measurement_journal, "_TIER_FLOOR_MINIMUM", 4)
+    cost_journal = tmp_path / "cost-journal"
+    write_journal_directory(
+        cost_journal, instruments=[tier_instrument_document(s) for s in TIER_SYMBOLS[:3]]
+    )
+    journal = tmp_path / "measurement"
+    create_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        run_id="binance-measurement-v1",
+        cost_journal_root=cost_journal,
+    )
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=TIER_ROUNDS,
+        fetcher=TieredVenue(distances=TIER_DISTANCES, dark={}, rounds=TIER_ROUNDS),
+        array_fetcher=SnapshotVenue(),
+        clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    stamps = stamps_of(journal)
+    document = read_document(
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "snapshot.json",
+            reserve_bytes=0,
+            window_start_ns=stamps[0],
+            window_end_ns=stamps[-1],
+        )
+    )
+    assert at(document, "cost_tiers", "1:spot") == {
+        "instrument_count": 3,
+        "slippage": {
+            key: {"contributing_count": 3, "p50_of_p50": None, "p50_of_p90": None}
+            for key in ("500", "5000", "50000")
         },
     }
 

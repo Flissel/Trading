@@ -40,6 +40,7 @@ from trading_bot.binance_cost_journal import (
     _BPS_QUANTUM,
     _IDENTIFIER,
     _MAX_REASON_CHARACTERS,
+    _P50,
     _RECEIPT_MARKETS,
     _RECEIPT_TIERS,
     _SEGMENT_NAME,
@@ -48,11 +49,13 @@ from trading_bot.binance_cost_journal import (
     CHAIN_HEAD_NAME,
     JOURNAL_SPEC_NAME,
     SEGMENT_DIRECTORY_NAME,
+    TIER_MINIMUM_CONTRIBUTORS,
     ZERO_HASH,
     BinanceCostJournalError,
     BinanceCostJournalTransportError,
     Fetcher,
     InstrumentObservation,
+    InstrumentStatistics,
     JournalInstrument,
     _authorize,
     _failure_reason,
@@ -62,12 +65,12 @@ from trading_bot.binance_cost_journal import (
     _notional_keys,
     _observe,
     _publish,
+    _quantile,
     _quantised,
     _read_object,
     _release_journal_lock,
     _remaining_interval,
     _throttle_seconds,
-    _tier_statistics,
     _validated_hex,
     load_journal_spec,
 )
@@ -122,6 +125,11 @@ _SHARE_QUANTUM = Decimal("0.000001")
 # Binance publishes funding rates to eight places; a mean of them is
 # recorded at the precision the venue quotes.
 _FUNDING_RATE_QUANTUM = Decimal("0.00000001")
+# Ruling 14: a snapshot's tier medians are taken over a window of rounds,
+# not over a finished journal, so the floor a member must clear is the
+# window's own - half its rounds, and never fewer than this many, because
+# the median of a pair measured three times is not a tier's cost.
+_TIER_FLOOR_MINIMUM = 100
 
 
 class BinanceMeasurementJournalError(RuntimeError):
@@ -1605,14 +1613,21 @@ def snapshot_measurement_journal(
     that carried the symbol: ``premium_rounds`` and ``book_rounds`` say how
     many those were, and they differ where one endpoint listed a symbol and
     the other did not. A symbol no round in the window carried is absent from
-    the map rather than present with zeroes. The cost blocks are v1's
-    arithmetic over the window's measured observations, per instrument and per
-    (tier, market); the tier medians keep v1's two rules, which were written
-    for a finished 11 000-round journal - a member must be *eligible* (10 000
-    measured rounds spanning seven days) and a notional needs
-    ``TIER_MINIMUM_CONTRIBUTORS`` of them - so a window shorter than that
-    reports counts of zero and no median, which is the honest reading and not
-    a defect of this snapshot.
+    the map rather than present with zeroes.
+
+    The cost blocks are v1's arithmetic over the window's measured
+    observations. Per instrument they are ``_instrument_statistics``
+    unchanged. Per (tier, market) the medians are v1's quantile rule over a
+    *window* floor (ruling 14): a member contributes at a notional when it
+    filled that notional in ``tier_floor_count`` of the window's rounds -
+    recorded at the document's top level - and a notional with fewer than
+    ``TIER_MINIMUM_CONTRIBUTORS`` contributors reports the count and no
+    median. Spec 5 asks a weekly snapshot for the fifteen pairs' tier medians
+    for the week, and v1's own admission rule is the receipt's (10 000
+    measured rounds spanning seven days), which no window of a week can clear.
+    None of this touches a declared cost table: the carry family's tiers stay
+    the v1 receipt's and this reading is the paper phase's cost monitor beside
+    them.
     """
     root = _authorize(workspace_root, journal_root, reserve_bytes)
     # The output is authorised like the journal is - inside the workspace, on
@@ -1634,7 +1649,8 @@ def snapshot_measurement_journal(
         window_start_ns=window_start_ns,
         window_end_ns=window_end_ns,
     )
-    instruments, tiers = _cost_blocks(spec, segments)
+    floor_count = _tier_floor_count(len(segments))
+    instruments, tiers = _cost_blocks(spec, segments, floor_count=floor_count)
     material: dict[str, object] = {
         "version": MEASUREMENT_SNAPSHOT_VERSION,
         "spec_hash": spec_hash,
@@ -1655,6 +1671,9 @@ def snapshot_measurement_journal(
         "spot": _spot_block(_rows_by_symbol(segment.spot_book for segment in segments)),
         "cost_instruments": instruments,
         "cost_tiers": tiers,
+        # Sealed with the medians it admitted, so a reader of the document can
+        # tell a withheld median from an absent measurement (ruling 14).
+        "tier_floor_count": floor_count,
     }
     _publish(output, {**material, "content_hash": content_sha256(material)})
     return output
@@ -1887,17 +1906,22 @@ def _spot_block(book: Mapping[str, list[BookRow]]) -> dict[str, object]:
 
 
 def _cost_blocks(
-    spec: BinanceMeasurementJournalSpec, segments: Sequence[MeasurementSegment]
+    spec: BinanceMeasurementJournalSpec,
+    segments: Sequence[MeasurementSegment],
+    *,
+    floor_count: int,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """The window's cost instruments and cost tiers, on v1's arithmetic.
 
-    ``_instrument_statistics`` and ``_tier_statistics`` are the cost journal's
-    own, called here over the window's measured observations rather than a
-    finished journal's: the slippage tiers stay continuous across the two
-    streams because they are computed by the same code, not by the same recipe
-    written twice. Only the fields spec 5 asks a snapshot for are carried over
-    - the eligibility window, the reason codes and the p99 belong to the v1
-    receipt, which is the declaration's authority and stays it.
+    ``_instrument_statistics`` is the cost journal's own, called here over the
+    window's measured observations rather than a finished journal's: the
+    slippage numbers stay continuous across the two streams because they are
+    computed by the same code, not by the same recipe written twice. Only the
+    fields spec 5 asks a snapshot for are carried over - the eligibility
+    window, the reason codes and the p99 belong to the v1 receipt, which is
+    the declaration's authority and stays it. The tier medians are
+    ``_window_tier_block``, which mirrors v1's arithmetic over a window floor
+    instead of the receipt's eligibility (ruling 14).
     """
     keys = _notional_keys(spec.notionals)
     measured = _measured_depth(segments)
@@ -1922,24 +1946,73 @@ def _cost_blocks(
         }
         for instrument, item in zip(spec.instruments, statistics, strict=True)
     }
-    tiers: dict[str, object] = {}
-    for tier in _RECEIPT_TIERS:
-        for market in _RECEIPT_MARKETS:
-            item = _tier_statistics(statistics, tier=tier, market=market, keys=keys)
-            tiers[f"{tier}:{market}"] = {
-                "instrument_count": item.instrument_count,
-                "slippage": {key: _tier_notional(item.slippage[key]) for key in keys},
-            }
+    tiers: dict[str, object] = {
+        f"{tier}:{market}": _window_tier_block(
+            statistics, tier=tier, market=market, keys=keys, floor_count=floor_count
+        )
+        for tier in _RECEIPT_TIERS
+        for market in _RECEIPT_MARKETS
+    }
     return instruments, tiers
 
 
-def _tier_notional(entry: Mapping[str, Decimal | int | None]) -> dict[str, object]:
-    """One tier notional as the document records it: the count and the two medians."""
-    return {
-        "contributing_count": _counted(entry["contributing_count"]),
-        "p50_of_p50": _recorded(_measured_quantile(entry["p50_of_p50"])),
-        "p50_of_p90": _recorded(_measured_quantile(entry["p50_of_p90"])),
-    }
+def _tier_floor_count(rounds: int) -> int:
+    """How many rounds an instrument must have filled a notional in to carry its tier.
+
+    Half the window, and never fewer than ``_TIER_FLOOR_MINIMUM``: half keeps
+    a pair that went dark for most of the week out of the week's median, and
+    the floor keeps a short window from publishing a median of three
+    measurements at all.
+    """
+    return max(_TIER_FLOOR_MINIMUM, rounds // 2)
+
+
+def _window_tier_block(
+    statistics: Sequence[InstrumentStatistics],
+    *,
+    tier: int,
+    market: str,
+    keys: Sequence[str],
+    floor_count: int,
+) -> dict[str, object]:
+    """One (tier, market)'s medians over a window (ruling 14).
+
+    This mirrors v1's ``_tier_statistics`` arithmetic deliberately and does
+    not call it: the same ``_quantile`` at 0.5 over the members' p50s and
+    p90s, the same withholding below ``TIER_MINIMUM_CONTRIBUTORS``
+    contributors, and the same per-notional contributor count. It differs in
+    the one thing that cannot be reused - which members are admitted. v1 admits
+    the *eligible* ones, and eligibility is the receipt's floor: 10 000
+    measured rounds spanning seven days, declared for a finished 11 000-round
+    journal. A week of this stream is 9 914 rounds, so that floor is never met
+    and spec 5's "the fifteen pairs' tier medians for the week" would be
+    permanently null. A window admits a member at a notional when it filled
+    that notional in ``floor_count`` of the window's rounds instead.
+
+    ``instrument_count`` is every *declared* instrument of this tier and
+    market, so a reader can put it beside ``contributing_count`` and see how
+    many of them the window actually admitted.
+    """
+    members = [item for item in statistics if item.tier == tier and item.market == market]
+    slippage: dict[str, object] = {}
+    for key in keys:
+        fifties: list[Decimal] = []
+        nineties: list[Decimal] = []
+        for item in members:
+            entry = item.slippage[key]
+            fifty = _measured_quantile(entry["p50"])
+            ninety = _measured_quantile(entry["p90"])
+            if _counted(entry["count"]) < floor_count or fifty is None or ninety is None:
+                continue
+            fifties.append(fifty)
+            nineties.append(ninety)
+        reported = len(fifties) >= TIER_MINIMUM_CONTRIBUTORS
+        slippage[key] = {
+            "contributing_count": len(fifties),
+            "p50_of_p50": _recorded(_quantile(fifties, _P50) if reported else None),
+            "p50_of_p90": _recorded(_quantile(nineties, _P50) if reported else None),
+        }
+    return {"instrument_count": len(members), "slippage": slippage}
 
 
 def _measured_depth(
