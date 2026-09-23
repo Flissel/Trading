@@ -825,6 +825,8 @@ def run_measurement_journal(
     try:
         return _run_locked_measurement_journal(
             root,
+            workspace_root=workspace_root,
+            reserve_bytes=reserve_bytes,
             spec=spec,
             spec_hash=spec_hash,
             rounds=rounds,
@@ -840,6 +842,8 @@ def run_measurement_journal(
 def _run_locked_measurement_journal(
     root: Path,
     *,
+    workspace_root: Path,
+    reserve_bytes: int,
     spec: BinanceMeasurementJournalSpec,
     spec_hash: str,
     rounds: int | None,
@@ -848,8 +852,18 @@ def _run_locked_measurement_journal(
     clock: Callable[[], int],
     sleep: Callable[[float], None],
 ) -> MeasurementChainHead:
-    """``run_measurement_journal``'s body, under the journal's write lock."""
+    """``run_measurement_journal``'s body, under the journal's write lock.
+
+    The storage authorisation is run again whenever a round opens a new UTC
+    day (ruling 24). A permanent stream writes about 75 MB a day for as long
+    as it is left running, and the reserve was last checked when the run
+    started -- which on a stream that has been up since the autumn is a fact
+    about a disk that no longer exists. Re-checked at the day change, a
+    crossed reserve is a named ``StorageReserveError`` the supervisor retries
+    rather than an ENOSPC in the middle of a publish.
+    """
     head = _resumed_head(root, spec_hash=spec_hash)
+    authorized_day: str | None = None
     # `None` before the first round of a run that starts a journal: that one
     # round alone waits for nothing.
     cadence: Decimal | None = Decimal(spec.sample_interval_seconds) if head is not None else None
@@ -868,6 +882,12 @@ def _run_locked_measurement_journal(
             array_fetcher=array_fetcher,
             clock=clock,
         )
+        day = _segment_day(segment.received_time_ns)
+        if authorized_day is None:
+            authorized_day = day
+        elif day != authorized_day:
+            _authorize(workspace_root, root, reserve_bytes)
+            authorized_day = day
         head = _publish_segment(root, segment=segment, spec_hash=spec_hash)
         written += 1
         cadence = _remaining_interval(
@@ -1059,7 +1079,7 @@ def _resumed_head(root: Path, *, spec_hash: str) -> MeasurementChainHead | None:
 
 
 def _verified_chain(
-    journal_root: Path, *, spec_hash: str
+    journal_root: Path, *, spec_hash: str, since_day: str | None = None
 ) -> tuple[bool, tuple[str, ...], MeasurementChainHead | None]:
     """Recompute every segment's hash, every chain link and the chain head.
 
@@ -1070,7 +1090,9 @@ def _verified_chain(
     capture. An empty journal - a spec and no segment yet - is valid and
     implies no head. The third member is the head the segments on disk imply.
     """
-    return _judged(journal_root, _walked_segments(journal_root, spec_hash=spec_hash))
+    return _judged(
+        journal_root, _walked_segments(journal_root, spec_hash=spec_hash, since_day=since_day)
+    )
 
 
 def _verified_tail(
@@ -1115,15 +1137,54 @@ def _judged(
     return not reasons, reasons, walk.implied_head
 
 
-def _walked_segments(journal_root: Path, *, spec_hash: str) -> _ChainWalk:
-    """Walk every segment in sequence order, checking each against its place."""
+def _walked_segments(
+    journal_root: Path, *, spec_hash: str, since_day: str | None = None
+) -> _ChainWalk:
+    """Walk every segment in sequence order, checking each against its place.
+
+    ``since_day`` bounds the *reading* and nothing else (ruling 24): the
+    listing still covers every day directory, so a foreign name, a duplicated
+    sequence or a deleted segment anywhere is caught either by the layout
+    check or by the segment count the chain head is judged against, and only
+    the days from that one on are opened. The window is anchored, exactly as
+    the restart's tail walk anchors: its first segment's predecessor is
+    outside the reading and is taken as given.
+    """
     try:
         paths = _listed_segments(journal_root)
     except _SegmentLayoutError as error:
         return _ChainWalk((error.reason,), None, False)
     if paths is None:
         return _ChainWalk(("SEGMENT_DIRECTORY_MISSING",), None, False)
-    return _walked(paths, journal_root=journal_root, spec_hash=spec_hash, total=len(paths))
+    if since_day is None:
+        return _walked(paths, journal_root=journal_root, spec_hash=spec_hash, total=len(paths))
+    window = _since_day_window(paths, since_day)
+    if not window:
+        # Nothing was written on or after that day. On a daily check of a
+        # permanent stream that is the alarm, not a pass -- and there is no
+        # segment to judge the chain head against either.
+        return _ChainWalk((f"JOURNAL_SINCE_DAY_EMPTY:{since_day}",), None, False)
+    return _walked(
+        window,
+        journal_root=journal_root,
+        spec_hash=spec_hash,
+        total=len(paths),
+        anchored=True,
+    )
+
+
+def _since_day_window(paths: list[Path], since_day: str) -> list[Path]:
+    """The segments from one day directory on, as a contiguous sequence suffix.
+
+    Cut rather than filtered, for the reason ``_tail_window`` is cut: the day
+    directories are not guaranteed to be monotone in sequence order, and a
+    walk can only be anchored on a run.
+    """
+    cut = 0
+    for index, path in enumerate(paths):
+        if path.parent.name < since_day:
+            cut = index + 1
+    return paths[cut:]
 
 
 def _walked_tail(journal_root: Path, *, spec_hash: str) -> _ChainWalk:
@@ -1507,14 +1568,24 @@ def _report_repair(reason: str) -> None:
     print(f"binance measurement journal repair: {reason}", file=sys.stderr)
 
 
-def verify_measurement_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
-    """Walk the whole chain from ``ZERO_HASH`` and report what is wrong with it.
+def verify_measurement_journal(
+    journal_root: Path, *, since_day: str | None = None
+) -> tuple[bool, tuple[str, ...]]:
+    """Walk the chain from ``ZERO_HASH`` and report what is wrong with it.
 
     This is the only reading that ever covers the history. A restart verifies
     the tail alone (ruling 13), so corruption older than the two newest day
-    directories sits unnoticed until this runs: the daily liveness check is
-    where it belongs, beside the newest-segment-age check that says the stream
-    is alive at all.
+    directories sits unnoticed until this runs.
+
+    ``since_day`` (``YYYY-MM-DD``, a day directory's own name) bounds it to
+    the days from that one on, anchored like the tail walk, while the layout
+    listing still covers everything (ruling 24). The whole walk grows by
+    1,440 segments every day the stream stays alive, so running it unbounded
+    every day costs more every day: the daily liveness check runs it with
+    ``--since-day <today-2>``, beside the newest-segment-age check that says
+    the stream is alive at all, and the weekly Monday chain runs the whole
+    thing. A day the journal never reached is ``JOURNAL_SINCE_DAY_EMPTY``,
+    not a pass.
 
     It never raises. A journal whose declaration cannot be read at all - no
     spec, an unparseable one, one that does not match its own recorded hash -
@@ -1526,7 +1597,7 @@ def verify_measurement_journal(journal_root: Path) -> tuple[bool, tuple[str, ...
         _, spec_hash = load_measurement_journal_spec(journal_root)
     except BinanceMeasurementJournalSpecError:
         return False, ("JOURNAL_SPEC_UNVERIFIED",)
-    ok, reasons, _ = _verified_chain(journal_root, spec_hash=spec_hash)
+    ok, reasons, _ = _verified_chain(journal_root, spec_hash=spec_hash, since_day=since_day)
     return ok, reasons
 
 

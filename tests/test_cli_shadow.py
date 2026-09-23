@@ -414,6 +414,37 @@ def test_the_cli_verifies_the_whole_chain_and_names_what_broke_it(
     assert "verify: " in capsys.readouterr().out
 
 
+def test_the_cli_bounds_the_daily_verification_with_a_day(
+    tmp_path: Path, running_journal: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Ruling 24: `--since-day` is what the daily liveness check runs."""
+    day = segment_paths(running_journal)[0].parent.name
+    bounded = [
+        "binance-measurement-journal-verify", "--workspace-root", str(tmp_path),
+        "--journal", str(running_journal), "--since-day", day,
+    ]
+    assert main(bounded) == 0
+    assert capsys.readouterr().out == "verify: ok\n"
+    rewrite_segment(segment_paths(running_journal)[2], sequence=99)
+    assert main(bounded) == 1
+    assert "verify: " in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("day", ["2026-9-23", "2026-09-23T00:00:00Z", "yesterday", ""])
+def test_the_cli_refuses_a_verification_day_that_is_not_a_utc_day(
+    tmp_path: Path, running_journal: Path, day: str
+) -> None:
+    assert (
+        main(
+            [
+                "binance-measurement-journal-verify", "--workspace-root", str(tmp_path),
+                "--journal", str(running_journal), "--since-day", day,
+            ]
+        )
+        == 2
+    )
+
+
 def test_the_cli_seals_a_window_of_the_measurement_journal(
     tmp_path: Path, running_journal: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

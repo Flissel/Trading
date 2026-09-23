@@ -270,6 +270,9 @@ def main(arguments: list[str] | None = None) -> int:
     measurement_verify = commands.add_parser("binance-measurement-journal-verify")
     measurement_verify.add_argument("--workspace-root", type=Path, default=Path.cwd())
     measurement_verify.add_argument("--journal", type=Path, required=True)
+    measurement_verify.add_argument(
+        "--since-day", default=None, help="bound the walk to this UTC day on (YYYY-MM-DD)"
+    )
     measurement_snapshot = commands.add_parser("binance-measurement-journal-snapshot")
     measurement_snapshot.add_argument("--workspace-root", type=Path, default=Path.cwd())
     measurement_snapshot.add_argument("--journal", type=Path, required=True)
@@ -929,15 +932,22 @@ def _binance_measurement_journal_verify(parsed: argparse.Namespace) -> int:
 
     The daily liveness check runs this and not `status`: a restart verifies
     the tail alone (ruling 13), so corruption older than the two newest day
-    directories sits unnoticed until the whole chain is walked. The walk never
+    directories sits unnoticed until the chain is walked. It runs it with
+    `--since-day <today-2>`, which bounds the reading to those days while the
+    layout listing still covers the whole journal (ruling 24); the weekly
+    Monday chain runs it without one, over the whole history. The walk never
     raises -- an unreadable spec is a reason like any other -- so the only
-    refusal here is a path outside the workspace.
+    refusals here are a path outside the workspace and a day that is not one.
     """
     workspace: Path = parsed.workspace_root.resolve()
     journal: Path = parsed.journal.resolve()
     if _outside(workspace, journal):
         return _journal_failure("binance measurement journal paths must stay inside workspace", 2)
-    verified, reasons = verify_measurement_journal(journal)
+    try:
+        since_day = None if parsed.since_day is None else _utc_day(parsed.since_day)
+    except ValueError as error:
+        return _journal_failure(str(error), 2)
+    verified, reasons = verify_measurement_journal(journal, since_day=since_day)
     print(f"verify: {'ok' if verified else ','.join(reasons)}")
     return 0 if verified else 1
 
@@ -992,6 +1002,28 @@ def _print_measurement_status(status: MeasurementStatus, *, last: int) -> None:
         print(f"excluded_total {endpoint}: {excluded}")
     print(f"depth_failure_rate: {status.depth_failure_rate}")
     print(f"verify: {'ok' if status.verify_ok else ','.join(status.verify_reasons)}")
+
+
+def _utc_day(value: str) -> str:
+    """A `YYYY-MM-DD` UTC day, spelled the way a day directory names itself.
+
+    One spelling only, for the reason a snapshot window has one: a day read
+    loosely bounds the verification somewhere other than where the operator
+    asked, and a walk that quietly checked the wrong days reports a healthy
+    journal without having looked at it.
+    """
+    try:
+        day = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        raise ValueError(
+            f"a verification day is a UTC day (YYYY-MM-DD), not {value!r}"
+        ) from None
+    if day.strftime("%Y-%m-%d") != value:
+        # `strptime` reads `2026-9-23` as the twenty-third; the day
+        # directories are zero-padded and a string comparison against an
+        # unpadded day would bound the walk at the wrong place entirely.
+        raise ValueError(f"a verification day is a UTC day (YYYY-MM-DD), not {value!r}")
+    return value
 
 
 def _utc_stamp_ns(value: str) -> int:

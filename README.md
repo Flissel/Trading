@@ -558,6 +558,9 @@ wird.
 uv run trading-research binance-measurement-journal-create --journal data/measurement-journals/binance-measurement-v2 --run-id binance-measurement-v2 --cost-journal data/cost-journals/binance-carry-v1
 uv run trading-research binance-measurement-journal-run --journal data/measurement-journals/binance-measurement-v2
 uv run trading-research binance-measurement-journal-status --journal data/measurement-journals/binance-measurement-v2 --last 60
+# täglich, neben dem Altersblick auf das neueste Segment:
+uv run trading-research binance-measurement-journal-verify --journal data/measurement-journals/binance-measurement-v2 --since-day <heute-2>
+# wöchentlich in der Montagskette, über die ganze Kette:
 uv run trading-research binance-measurement-journal-verify --journal data/measurement-journals/binance-measurement-v2
 uv run trading-research binance-measurement-journal-snapshot --journal data/measurement-journals/binance-measurement-v2 --output artifacts/cost/binance-measurement-v2-<S>.json --window-start <S-6>T00:00:00Z --window-end <S>T23:59:59Z
 ```
@@ -568,13 +571,25 @@ dieselben Beine unter einer Ableitung. `run` hält wie v1 eine exklusive Sperre,
 Startup-Launcher neu gestartet (Exit 1) und prüft beim Resume nur den Schwanz; Exit 2
 heißt gestoppt. Ohne `--rounds` läuft es, bis der Prozess beendet wird. `status` ist nur
 lesend und liefert das Lebenszeichen `newest_age_seconds` neben Fehlerrate und
-ausgeschlossenen Symbolen je Endpunkt. `verify` prüft die **ganze** Kette ab `ZERO_HASH` —
-der tägliche Liveness-Check ruft ihn auf, weil ein Neustart nur den Schwanz prüft — und
-endet mit 0 oder 1. `snapshot` versiegelt ein beidseitig geschlossenes Fenster
+ausgeschlossenen Symbolen je Endpunkt. `verify` läuft in zwei Takten, weil ein Neustart nur
+den Schwanz prüft: täglich mit `--since-day <heute-2>`, das nur die Tagesverzeichnisse ab
+diesem Tag öffnet — die Namensliste deckt trotzdem das ganze Journal ab, eine gelöschte oder
+fremde Datei dahinter fällt also weiterhin auf —, und wöchentlich in der Montagskette ohne
+Flag über die **ganze** Kette ab `ZERO_HASH`. `--since-day` nimmt genau `YYYY-MM-DD`, alles
+andere wird abgewiesen; ein Tag, seit dem nichts geschrieben wurde, ist
+`JOURNAL_SINCE_DAY_EMPTY` und damit auf dem Tages-Check genau der gewünschte Alarm. Beide
+enden mit 0 oder 1. `snapshot` versiegelt ein beidseitig geschlossenes Fenster
 (`--window-start`/`--window-end` als ISO-8601-UTC-Stempel `YYYY-MM-DDTHH:MM:SSZ`, alles
 andere wird abgewiesen) zu einer unveränderlichen Quittung, die das Wochenartefakt per Hash
 zitiert. Ein Snapshot ändert **keine** erklärte Kostentabelle: die Tiers der Familie
 bleiben die der v1-Quittung, der Messstrom ist der Kostenmonitor der Papierphase daneben.
+
+Platzbedarf: bei 61 s Takt, rund 490 USDT-Perpetuals und 450 USDT-Spot-Paaren schreibt der
+Strom etwa **75 MB pro Tag**, also rund **27,5 GB im Jahr**. Gelöscht wird hier nichts — die
+Segmente sind unveränderliche Evidenz, und ob und wie archiviert wird, ist eine spätere
+Entscheidung. Die Reserve-Prüfung der Storage-Policy läuft deshalb nicht nur beim Start,
+sondern noch einmal bei jedem UTC-Tageswechsel: ein unterschrittener Freiraum ist dann ein
+benannter `StorageReserveError` mit Exit 1 statt eines ENOSPC mitten im Schreiben.
 
 Nirgends in diesem Pfad existiert eine Order, ein API-Key oder ein Ausführungsadapter.
 

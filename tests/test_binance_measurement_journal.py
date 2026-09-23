@@ -6,6 +6,7 @@ import weakref
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
+from typing import ClassVar
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -24,7 +25,7 @@ from tests.test_binance_cost_journal import (
     urlopen_returning,
     write_journal_directory,
 )
-from trading_bot import binance_measurement_journal
+from trading_bot import binance_cost_journal, binance_measurement_journal
 from trading_bot.binance_cost_journal import (
     SAMPLE_INTERVAL_SECONDS,
     TIER_MINIMUM_CONTRIBUTORS,
@@ -63,6 +64,7 @@ from trading_bot.binance_measurement_journal import (
 )
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.depth_adapters import DepthPayloadError
+from trading_bot.storage import StoragePolicy, StorageReserveError
 
 
 def premium_payload() -> list[object]:
@@ -1541,6 +1543,125 @@ def test_a_segment_moved_to_another_day_directory_is_named_by_verification(
         False,
         ("SEGMENT_DAY_MISMATCH:1970-01-01/0000000003.json",),
     )
+
+
+def test_verify_since_a_day_walks_only_the_days_from_that_day_on(tmp_path: Path) -> None:
+    """Ruling 24: the daily check is bounded, the weekly one is the whole chain.
+
+    The full walk grows by 1,440 segments a day for as long as the stream
+    lives, so running it every day costs more every day; `--since-day` bounds
+    it to the days a daily check is actually about, anchored exactly as the
+    restart's tail walk anchors.
+    """
+    journal = three_day_journal(tmp_path)
+    names = relative_names(journal)
+    unseal(segment_paths(journal)[0])
+
+    assert verify_measurement_journal(journal) == (
+        False,
+        (f"SEGMENT_HASH_MISMATCH:{names[0]}",),
+    )
+    # That day is not opened at all, so its edit is the weekly walk's to find.
+    assert verify_measurement_journal(journal, since_day="2026-09-24") == (True, ())
+
+    unseal(segment_paths(journal)[2])
+    assert verify_measurement_journal(journal, since_day="2026-09-24") == (
+        False,
+        (f"SEGMENT_HASH_MISMATCH:{names[2]}",),
+    )
+
+
+def test_verify_since_a_day_still_lists_the_whole_journal(tmp_path: Path) -> None:
+    """The listing is the cheap half and covers every day, opened or not."""
+    journal = three_day_journal(tmp_path)
+    (journal / "segments" / "2026-09-23" / "notes.txt").write_text("x", encoding="utf-8")
+
+    assert verify_measurement_journal(journal, since_day="2026-09-25") == (
+        False,
+        ("SEGMENT_LAYOUT:2026-09-23/notes.txt",),
+    )
+
+
+def test_verify_since_a_day_names_a_segment_deleted_behind_its_window(
+    tmp_path: Path,
+) -> None:
+    """The count the listing gives the chain head is what catches it."""
+    journal = three_day_journal(tmp_path)
+    segment_paths(journal)[0].unlink()
+
+    assert verify_measurement_journal(journal, since_day="2026-09-25") == (
+        False,
+        ("CHAIN_HEAD_MISMATCH:segment_count",),
+    )
+
+
+def test_verify_since_a_day_the_journal_never_reached_says_so(tmp_path: Path) -> None:
+    """A day the stream wrote nothing on or after is the daily check's alarm,
+    not a pass: there is no segment to judge the chain head against."""
+    journal = three_day_journal(tmp_path)
+
+    assert verify_measurement_journal(journal, since_day="2026-09-26") == (
+        False,
+        ("JOURNAL_SINCE_DAY_EMPTY:2026-09-26",),
+    )
+
+
+class RefusingAfterOneAuthorization(StoragePolicy):
+    """A storage policy that authorizes once and then finds the reserve crossed."""
+
+    calls: ClassVar[list[Path]] = []
+
+    def authorize(
+        self,
+        *,
+        target: Path,
+        temporary_directory: Path | None = None,
+        free_bytes: int,
+        worst_case_required_bytes: int,
+    ) -> Path:
+        RefusingAfterOneAuthorization.calls.append(target)
+        if len(RefusingAfterOneAuthorization.calls) > 1:
+            raise StorageReserveError("job would cross the configured storage reserve")
+        return super().authorize(
+            target=target,
+            temporary_directory=temporary_directory,
+            free_bytes=free_bytes,
+            worst_case_required_bytes=worst_case_required_bytes,
+        )
+
+
+def test_the_run_loop_re_authorizes_storage_at_each_utc_day_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling 24: the reserve is checked again on every new day of rounds.
+
+    A permanent stream writes about 75 MB a day for as long as it is left
+    running, and the reserve was checked once, when the run started. Months
+    later the free space that was fine then is not, and the first the run
+    would hear of it is an ENOSPC inside a publish. Re-checked once per UTC
+    day, it is a named `StorageReserveError` instead - the one refusal the
+    supervisor retries.
+    """
+    journal = measurement_journal(tmp_path)
+    RefusingAfterOneAuthorization.calls = []
+    monkeypatch.setattr(binance_cost_journal, "StoragePolicy", RefusingAfterOneAuthorization)
+
+    with pytest.raises(StorageReserveError):
+        run_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            reserve_bytes=0,
+            rounds=3,
+            fetcher=FakeVenue(),
+            array_fetcher=SnapshotVenue(),
+            clock=FakeClock(start=THREE_DAY_START_NS, step=SIX_HOURS_NS),
+            sleep=FakeSleep(),
+        )
+
+    # Once at start-up and once when the second day opened; the round that
+    # would have opened it is refused before it is published.
+    assert RefusingAfterOneAuthorization.calls == [journal.resolve()] * 2
+    assert relative_names(journal) == ["2026-09-23/0000000000.json"]
 
 
 def crossed_spot_payload() -> list[object]:
