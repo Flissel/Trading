@@ -30,6 +30,7 @@ from tests.test_panel_fold_run import MONTHS, SYMBOLS, kline_csv, zip_bytes
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.capture_lineage import verify_capture_superset
 from trading_bot.panel_capture import (
+    PanelCaptureError,
     PanelPayload,
     PanelSourceAbsent,
     build_kline_zip_url,
@@ -44,6 +45,7 @@ from trading_bot.shadow_capture import (
     FUNDING_REST_KIND,
     ShadowCaptureArtifact,
     ShadowCaptureError,
+    ShadowCaptureTransportError,
     build_funding_rest_url,
     build_shadow_capture,
     parse_funding_rest,
@@ -931,6 +933,81 @@ def test_an_already_written_raw_payload_path_refuses(tmp_path: Path) -> None:
         _shadow(tmp_path, base, fetch=ShadowFetch())
 
     assert "already written" in str(error.value)
+    # Ruling 21(c): the one case the unwinding cannot clear names its cure.
+    assert "delete" in str(error.value)
+    assert str(tmp_path / "shadow") in str(error.value)
+    # A directory this run did not create is never removed, whatever is in it.
+    assert occupied.read_bytes() == b"someone was here first"
+
+
+def test_a_transport_failure_is_retryable_and_unwinds_the_half_written_capture(
+    tmp_path: Path,
+) -> None:
+    """Ruling 21(a) and (b): a dropped transport is exit 1 and leaves nothing behind.
+
+    A non-404 failure of a daily dump used to escape as a bare
+    `PanelCaptureError` -- breaking this module's own contract and mapping to
+    exit 1 by accident -- while the output directory kept whatever the run had
+    copied into it, so every rerun hit the "already written" guard and the
+    week could never be captured at all.
+    """
+    base = _base_capture(tmp_path)
+    inner = ShadowFetch()
+    daily_attempts: list[str] = []
+
+    def drops_the_second_daily_dump(url: str) -> PanelPayload:
+        if "/daily/klines/" in url:
+            daily_attempts.append(url)
+            if len(daily_attempts) == 2:
+                raise PanelCaptureError("503: the dump host dropped the connection")
+        return inner.fetch(url)
+
+    with pytest.raises(ShadowCaptureTransportError) as error:
+        build_shadow_capture(
+            workspace_root=tmp_path,
+            base_capture_root=base,
+            output_directory=tmp_path / "shadow",
+            reserve_bytes=0,
+            tail_through=FIRST_TAIL_SUNDAY,
+            market="um",
+            fetch=drops_the_second_daily_dump,
+            clock=FakeClock().time_ns,
+        )
+
+    assert "503" in str(error.value)
+    assert isinstance(error.value.__cause__, PanelCaptureError)
+    # This run created the directory, so this run takes it away again.
+    assert not (tmp_path / "shadow").exists()
+
+    artifact = _shadow(tmp_path, base, fetch=ShadowFetch())
+    assert verify_panel_capture(artifact.capture_root) == (True, ())
+    assert artifact.tail_through == FIRST_TAIL_SUNDAY
+
+
+def test_a_funding_transport_failure_is_the_same_retryable_refusal(tmp_path: Path) -> None:
+    """Both fetch paths wear one exception, so the exit code cannot differ by path."""
+    base = _base_capture(tmp_path)
+    inner = ShadowFetch()
+
+    def drops_the_funding_window(url: str) -> PanelPayload:
+        if "/fapi/v1/fundingRate" in url:
+            raise PanelCaptureError("503: the REST host dropped the connection")
+        return inner.fetch(url)
+
+    with pytest.raises(ShadowCaptureTransportError) as error:
+        build_shadow_capture(
+            workspace_root=tmp_path,
+            base_capture_root=base,
+            output_directory=tmp_path / "shadow",
+            reserve_bytes=0,
+            tail_through=FIRST_TAIL_SUNDAY,
+            market="um",
+            fetch=drops_the_funding_window,
+            clock=FakeClock().time_ns,
+        )
+
+    assert "could not be fetched" in str(error.value)
+    assert not (tmp_path / "shadow").exists()
 
 
 # `raw_sha256` is not in this list: dropping it makes the base itself fail

@@ -43,7 +43,11 @@ from trading_bot.binance_measurement_journal import (
 )
 from trading_bot.carry_config import load_carry_family_spec
 from trading_bot.cli import main
-from trading_bot.panel_capture import verify_panel_capture
+from trading_bot.panel_capture import (
+    PanelCaptureError,
+    PanelPayload,
+    verify_panel_capture,
+)
 
 _RUN_ID = "binance-measurement-v2"
 
@@ -184,6 +188,42 @@ def test_the_cli_refuses_a_shadow_capture_it_cannot_build(
         )
         == 2
     )
+
+
+def test_the_cli_asks_for_another_attempt_after_a_dropped_transport(
+    book_captures: ShadowBookCaptures, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling 21(a): a transport failure is worth another attempt, so exit 1.
+
+    The same failure on the funding path already exited 1 by way of a wrapped
+    refusal; on the daily path it escaped as a bare `PanelCaptureError` and
+    exited 1 by accident, having left a half-written directory that blocked
+    every one of those attempts.
+    """
+    root = book_captures.root
+    inner = ShadowFetch()
+
+    class DroppingClient:
+        def fetch(self, url: str) -> PanelPayload:
+            if "/daily/klines/" in url:
+                raise PanelCaptureError("503: the dump host dropped the connection")
+            return inner.fetch(url)
+
+    monkeypatch.setattr(cli, "PanelZipClient", DroppingClient)
+    output = root / "cli-dropped-transport"
+    assert (
+        main(
+            [
+                "shadow-capture", "--workspace-root", str(root),
+                "--base-capture", str(book_captures.perp_base),
+                "--output", str(output),
+                "--tail-through", FIRST_TAIL_SUNDAY, "--market", "um",
+                "--reserve-bytes", "0",
+            ]
+        )
+        == 1
+    )
+    assert not output.exists()
 
 
 # --- the weekly book ----------------------------------------------------

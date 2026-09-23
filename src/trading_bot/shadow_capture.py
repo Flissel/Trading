@@ -135,6 +135,20 @@ class ShadowCaptureError(RuntimeError):
     """Raised when a weekly shadow capture fails closed."""
 
 
+class ShadowCaptureTransportError(ShadowCaptureError):
+    """Raised when a source could not be fetched at all (ruling 21).
+
+    The one failure here that another attempt may fix. Everything else this
+    module refuses with is a fact about the inputs -- a base of the wrong
+    market, a dump carrying the wrong day, a tail row that disagrees with the
+    monthly dump -- and a supervisor that retried those would hit the same
+    refusal every hour. A dropped connection, a 5xx and a dump host that has
+    not published an hour's file yet are the venue's weather, so they are
+    named apart and the CLI maps this subclass, and only this subclass, to the
+    exit code that asks for another attempt.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class ShadowCaptureArtifact:
     capture_root: Path
@@ -521,42 +535,33 @@ def build_shadow_capture(
                 mismatches=mismatches,
             )
 
-    target.mkdir(parents=True, exist_ok=True)
+    # Ruling 21(b): from here on the run writes under `target`, so from
+    # here on it owns what it half-wrote. A run interrupted before the
+    # manifest is published leaves a directory whose `raw/` already holds
+    # payloads, and the rerun a person starts then refuses on the very
+    # guard that keeps a published capture immutable -- for ever, with no
+    # cure named. So a directory *this* run created is removed again unless
+    # this run published the manifest. A directory that was already there
+    # is never touched: spec section 6's "nothing is written under raw/
+    # twice" is about a published capture, and the one case left names its
+    # own cure in `_copy_raw_payload`. The reconciliation refusal is
+    # written beside the directory, not inside it, so it survives this.
+    created = not target.exists()
+    published = False
+    try:
+        target.mkdir(parents=True, exist_ok=True)
 
-    sources: list[dict[str, object]] = []
-    candles: list[PanelCandleRow] = []
-    funding: list[PanelFundingRow] = []
-    # Per symbol, every bar open time the capture already holds -- the Sunday
-    # rule needs to know whether a symbol has a Saturday bar.
-    open_times: dict[str, set[int]] = {}
+        sources: list[dict[str, object]] = []
+        candles: list[PanelCandleRow] = []
+        funding: list[PanelFundingRow] = []
+        # Per symbol, every bar open time the capture already holds -- the Sunday
+        # rule needs to know whether a symbol has a Saturday bar.
+        open_times: dict[str, set[int]] = {}
 
-    for entry in base_sources:
-        _carry_source(
-            entry,
-            source_root=base_root,
-            target=target,
-            venue=venue,
-            sources=sources,
-            candles=candles,
-            funding=funding,
-            open_times=open_times,
-        )
-
-    # Per symbol and bucket, every calendar day a carried row already speaks
-    # for. A cursor ("the last day carried") cannot stand in for this: a week
-    # that corrects a symbol's start backwards -- because the base now covers
-    # a month it did not cover last week -- would have the older, later cursor
-    # win, and the days in between would never be fetched by any week.
-    carried_daily_days: dict[str, set[date_type]] = {}
-    carried_rest_days: dict[str, set[date_type]] = {}
-    if previous_root is not None:
-        for entry in carried_previous:
-            kind = str(entry.get("kind"))
-            symbol = str(entry.get("symbol"))
-            span_start, span_end = _row_span(kind, str(entry.get("month")))
+        for entry in base_sources:
             _carry_source(
                 entry,
-                source_root=previous_root,
+                source_root=base_root,
                 target=target,
                 venue=venue,
                 sources=sources,
@@ -564,89 +569,116 @@ def build_shadow_capture(
                 funding=funding,
                 open_times=open_times,
             )
-            reached = carried_daily_days if kind == DAILY_TAIL_KIND else carried_rest_days
-            # An `absent` carried row counts as covered: its day was asked for
-            # and the venue does not have it, and flipping it to present in a
-            # later week would break the lineage check against this one.
-            reached.setdefault(symbol, set()).update(_span_days(span_start, span_end))
 
-    deadline_ns = clock() + sunday_deadline_hours * _NANOSECONDS_PER_HOUR
-    for symbol in symbols:
-        _fetch_daily_tail(
-            symbol=symbol,
-            days=_uncovered_days(
-                first_day=daily_start[symbol],
-                tail_day=tail_day,
-                covered=carried_daily_days.get(symbol, frozenset()),
-            ),
-            tail_day=tail_day,
-            market=market,
-            venue=venue,
-            fetch=fetch,
-            clock=clock,
-            sleep=sleep,
-            deadline_ns=deadline_ns,
-            target=target,
-            sources=sources,
-            candles=candles,
-            open_times=open_times,
-        )
-        if market != "um":
-            # Funding exists only on the perpetual market, so a spot shadow
-            # capture never reaches for the funding endpoint at all.
-            continue
-        # One request per contiguous uncovered run -- ordinarily one, or two
-        # when a carried window sits inside this week's span.
-        for run_first, run_last in _contiguous_runs(
-            _uncovered_days(
-                first_day=rest_start[symbol],
-                tail_day=tail_day,
-                covered=carried_rest_days.get(symbol, frozenset()),
-            )
-        ):
-            _fetch_funding_window(
+        # Per symbol and bucket, every calendar day a carried row already speaks
+        # for. A cursor ("the last day carried") cannot stand in for this: a week
+        # that corrects a symbol's start backwards -- because the base now covers
+        # a month it did not cover last week -- would have the older, later cursor
+        # win, and the days in between would never be fetched by any week.
+        carried_daily_days: dict[str, set[date_type]] = {}
+        carried_rest_days: dict[str, set[date_type]] = {}
+        if previous_root is not None:
+            for entry in carried_previous:
+                kind = str(entry.get("kind"))
+                symbol = str(entry.get("symbol"))
+                span_start, span_end = _row_span(kind, str(entry.get("month")))
+                _carry_source(
+                    entry,
+                    source_root=previous_root,
+                    target=target,
+                    venue=venue,
+                    sources=sources,
+                    candles=candles,
+                    funding=funding,
+                    open_times=open_times,
+                )
+                reached = carried_daily_days if kind == DAILY_TAIL_KIND else carried_rest_days
+                # An `absent` carried row counts as covered: its day was asked for
+                # and the venue does not have it, and flipping it to present in a
+                # later week would break the lineage check against this one.
+                reached.setdefault(symbol, set()).update(_span_days(span_start, span_end))
+
+        deadline_ns = clock() + sunday_deadline_hours * _NANOSECONDS_PER_HOUR
+        for symbol in symbols:
+            _fetch_daily_tail(
                 symbol=symbol,
-                first_day=run_first,
-                last_day=run_last,
+                days=_uncovered_days(
+                    first_day=daily_start[symbol],
+                    tail_day=tail_day,
+                    covered=carried_daily_days.get(symbol, frozenset()),
+                ),
+                tail_day=tail_day,
+                market=market,
                 venue=venue,
                 fetch=fetch,
+                clock=clock,
+                sleep=sleep,
+                deadline_ns=deadline_ns,
                 target=target,
                 sources=sources,
-                funding=funding,
+                candles=candles,
+                open_times=open_times,
             )
+            if market != "um":
+                # Funding exists only on the perpetual market, so a spot shadow
+                # capture never reaches for the funding endpoint at all.
+                continue
+            # One request per contiguous uncovered run -- ordinarily one, or two
+            # when a carried window sits inside this week's span.
+            for run_first, run_last in _contiguous_runs(
+                _uncovered_days(
+                    first_day=rest_start[symbol],
+                    tail_day=tail_day,
+                    covered=carried_rest_days.get(symbol, frozenset()),
+                )
+            ):
+                _fetch_funding_window(
+                    symbol=symbol,
+                    first_day=run_first,
+                    last_day=run_last,
+                    venue=venue,
+                    fetch=fetch,
+                    target=target,
+                    sources=sources,
+                    funding=funding,
+                )
 
-    dataset = publish_panel_dataset(
-        tuple(candles),
-        tuple(funding),
-        output_directory=target / "dataset",
-        raw_source_hashes=tuple(
-            str(item["raw_sha256"]) for item in sources if item.get("status") == "present"
-        ),
-    )
-    material: dict[str, object] = {
-        "capture_version": _CAPTURE_VERSION,
-        "market": market,
-        "venue": venue,
-        "interval": "1d",
-        "symbols": list(symbols),
-        "months": None,
-        "sources": sources,
-        "dataset_root_hash": dataset.root_hash,
-        "discovered_months": _discovered_months(sources),
-        "base_capture_root_hash": str(base_manifest["capture_root_hash"]),
-        "previous_capture_root_hash": (
-            str(previous_manifest["capture_root_hash"])
-            if previous_manifest is not None
-            else None
-        ),
-        "tail_through": tail_through,
-        "stale_symbols": stale_symbols,
-        "reconciliation": _reconciliation_block(compared_rows),
-    }
-    capture_root_hash = content_sha256(material)
-    document = dict(material)
-    document["capture_root_hash"] = capture_root_hash
-    manifest_path.write_bytes(canonical_json(document))
+        dataset = publish_panel_dataset(
+            tuple(candles),
+            tuple(funding),
+            output_directory=target / "dataset",
+            raw_source_hashes=tuple(
+                str(item["raw_sha256"]) for item in sources if item.get("status") == "present"
+            ),
+        )
+        material: dict[str, object] = {
+            "capture_version": _CAPTURE_VERSION,
+            "market": market,
+            "venue": venue,
+            "interval": "1d",
+            "symbols": list(symbols),
+            "months": None,
+            "sources": sources,
+            "dataset_root_hash": dataset.root_hash,
+            "discovered_months": _discovered_months(sources),
+            "base_capture_root_hash": str(base_manifest["capture_root_hash"]),
+            "previous_capture_root_hash": (
+                str(previous_manifest["capture_root_hash"])
+                if previous_manifest is not None
+                else None
+            ),
+            "tail_through": tail_through,
+            "stale_symbols": stale_symbols,
+            "reconciliation": _reconciliation_block(compared_rows),
+        }
+        capture_root_hash = content_sha256(material)
+        document = dict(material)
+        document["capture_root_hash"] = capture_root_hash
+        manifest_path.write_bytes(canonical_json(document))
+        published = True
+    finally:
+        if created and not published:
+            shutil.rmtree(target, ignore_errors=True)
     return ShadowCaptureArtifact(
         capture_root=target,
         capture_root_hash=capture_root_hash,
@@ -759,14 +791,15 @@ def _fetch_funding_window(
     url = build_funding_rest_url(symbol, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
     try:
         payload = fetch(url)
-        _validate_panel_url(payload.url)
     except PanelCaptureError as error:
         # Including a 404: unlike a daily dump, whose absence is a normal
         # fact about a contract, the funding endpoint answers an empty array
-        # for a window with no settlements. A refusal here is a real failure.
-        raise ShadowCaptureError(
+        # for a window with no settlements. A refusal here is a real failure,
+        # and it is the same retryable one the daily path raises (ruling 21).
+        raise ShadowCaptureTransportError(
             f"funding history for {symbol} over {window} could not be fetched: {error}"
         ) from error
+    _validate_panel_url(payload.url)
     rows = parse_funding_rest(
         payload,
         symbol=symbol,
@@ -815,6 +848,13 @@ def _fetch_daily_dump(
             payload = fetch(url)
         except PanelSourceAbsent:
             payload = None
+        except PanelCaptureError as error:
+            # A 404 is an absence and is handled above; anything else the
+            # client raises here is a transport that failed after its own
+            # attempts, which is the one failure worth repeating (ruling 21).
+            raise ShadowCaptureTransportError(
+                f"the daily dump {url} could not be fetched: {error}"
+            ) from error
         if payload is not None:
             return payload
         if not waiting:
@@ -875,7 +915,16 @@ def _copy_raw_payload(
     if destination.exists():
         # Spec section 6: nothing is written under `raw/` twice. Overwriting
         # would hide a manifest that carries one path under two rows.
-        raise ShadowCaptureError(f"raw payload path is already written: {relative}")
+        #
+        # A run unwinds a directory it created itself (ruling 21(b)), so what
+        # is left here is a directory this run found already standing: a
+        # capture half-written by a run that was killed before the unwinding
+        # could happen, or something else's. Either way the cure is a person's
+        # and the refusal names it rather than leaving a rerun to guess.
+        raise ShadowCaptureError(
+            f"raw payload path is already written: {relative}; this directory holds a "
+            f"half-written capture from an interrupted run; delete {target} and rerun"
+        )
     if not source.is_file():
         raise ShadowCaptureError(f"source raw payload is missing: {relative}")
     destination.parent.mkdir(parents=True, exist_ok=True)

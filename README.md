@@ -513,6 +513,11 @@ uv run trading-research shadow-capture --base-capture <spot-basis> --output data
 uv run trading-research shadow-week --declaration configs/shadow-carry-v4.json --capture data/shadow/perp-<S> --hedge-capture data/shadow/spot-<S> --perp-base-capture <perp-basis> --spot-base-capture <spot-basis> --decision-sunday <S> --measurement-snapshot artifacts/cost/binance-measurement-v2-<S>.json
 ```
 
+Bricht eine Capture ab, bevor ihr Manifest geschrieben ist, räumt sie das selbst angelegte
+Ausgabeverzeichnis wieder weg — Exit 1 heißt hier „Transport weg, gleich noch einmal“ —, und
+steht doch eines da, weil ein Kill vor dem Aufräumen kam, nennt die Abweisung den Weg:
+Verzeichnis löschen und neu starten.
+
 `--perp-base-capture` und `--spot-base-capture` sind genau dann nötig, wenn die
 Wochen-Capture daneben eine Basis nennt (Ruling 17) — die Herkunftsprüfung braucht deren
 Manifest, das nur der Aufrufer hat. Das Buch des Sonntags `S` ist eine reine Funktion aus

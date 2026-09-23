@@ -51,7 +51,11 @@ from trading_bot.panel_fold_run import run_panel_fold
 from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
 from trading_bot.shadow_book import ShadowBookError, run_shadow_week
-from trading_bot.shadow_capture import ShadowCaptureError, build_shadow_capture
+from trading_bot.shadow_capture import (
+    ShadowCaptureError,
+    ShadowCaptureTransportError,
+    build_shadow_capture,
+)
 from trading_bot.shadow_config import ShadowDeclarationError
 from trading_bot.storage import StoragePolicy, StoragePolicyError, StorageReserveError
 from trading_bot.strategy import CostScenario
@@ -1033,8 +1037,12 @@ def _shadow_exit_code(error: Exception) -> int:
     worth another attempt -- a dump the venue has not published this hour, a
     round in which every request failed, a transport that dropped, and the
     free-space reserve, which is the one thing here that changes on its own.
+
+    `ShadowCaptureTransportError` is named here rather than left to the
+    fall-through (ruling 21(a)): it is a `ShadowCaptureError`, and every other
+    one of those is a fact about the inputs that stops the supervisor.
     """
-    if isinstance(error, StorageReserveError):
+    if isinstance(error, StorageReserveError | ShadowCaptureTransportError):
         return 1
     return 2 if isinstance(error, _SHADOW_REFUSALS) else 1
 
