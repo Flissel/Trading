@@ -17,6 +17,7 @@ from tests.carry_fixtures import build_captures, funding_rate
 from tests.shadow_fixtures import (
     FIRST_TAIL_DATE,
     FIRST_TAIL_SUNDAY,
+    HOUR_MS,
     SECOND_TAIL_SUNDAY,
     THIRD_TAIL_SUNDAY,
     ShadowFetch,
@@ -36,6 +37,7 @@ from trading_bot.panel_capture import (
     parse_kline_zip,
     verify_panel_capture,
 )
+from trading_bot.panel_dataset import DAY_NS, PanelCandleRow, PanelFundingRow
 from trading_bot.panel_reader import load_funding_events, load_panel_bars
 from trading_bot.shadow_capture import (
     DAILY_TAIL_KIND,
@@ -45,6 +47,7 @@ from trading_bot.shadow_capture import (
     build_funding_rest_url,
     build_shadow_capture,
     parse_funding_rest,
+    reconcile_tail_rows,
 )
 
 _SYMBOL = SYMBOLS[0]
@@ -434,6 +437,13 @@ def test_the_previous_weeks_tail_rows_are_carried_and_never_refetched(
     assert any(f"-1d-{SECOND_TAIL_SUNDAY}.zip" in url for url in _daily_urls(fetch))
 
 
+# Week 1 tails 2020-08-01 and 2020-08-02 and asks for one funding window over
+# the two, which holds the single settlement of 2020-08-01: three rows per
+# symbol that an advanced base then covers with its own 2020-08 monthly dumps,
+# and therefore three rows per symbol that every chain below reconciles.
+_DROPPED_ROWS = 3 * len(SYMBOLS)
+
+
 def test_previous_tail_rows_the_base_now_covers_are_dropped(tmp_path: Path) -> None:
     base = _base_capture(tmp_path)
     first = _shadow(tmp_path, base, fetch=ShadowFetch(), name="week-1")
@@ -462,6 +472,206 @@ def test_previous_tail_rows_the_base_now_covers_are_dropped(tmp_path: Path) -> N
     # September's six days for each symbol, the first of them the day after
     # the base's last month.
     assert len(_rows(second.capture_root, DAILY_TAIL_KIND)) == 6 * len(SYMBOLS)
+    # Dropped, but only after being compared: two daily bars and one
+    # settlement per symbol, all of them equal to the monthly dump's own row.
+    assert second.reconciliation == {"compared_rows": _DROPPED_ROWS, "mismatches": []}
+    assert _manifest(second.capture_root)["reconciliation"] == {
+        "compared_rows": _DROPPED_ROWS,
+        "mismatches": [],
+    }
+
+
+def _refusal(root: Path, name: str) -> dict[str, object]:
+    document: dict[str, object] = json.loads(
+        (root / f"{name}-reconciliation-refused.json").read_text(encoding="utf-8")
+    )
+    return document
+
+
+def _monthly_close(symbol: str, date: str) -> str:
+    """The close the monthly dump carries for `date`, as the record spells it."""
+    return str(Decimal(daily_kline_csv(symbol, date).splitlines()[1].split(",")[4]))
+
+
+def test_an_altered_tail_bar_refuses_and_leaves_a_readable_refusal(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+    altered = _shadow(
+        tmp_path,
+        base,
+        fetch=ShadowFetch(altered_closes={(_SYMBOL, FIRST_TAIL_DATE): "999.5"}),
+        name="week-1",
+    )
+    # The altered week is a perfectly sealed capture -- the daily dump it was
+    # built from said 999.5 and its manifest says so too. Only the monthly
+    # dump that arrives later disagrees.
+    assert verify_panel_capture(altered.capture_root) == (True, ())
+    advanced = _base_capture(tmp_path, months=(*MONTHS, "2020-08"))
+
+    with pytest.raises(ShadowCaptureError) as error:
+        _shadow(
+            tmp_path,
+            advanced,
+            fetch=ShadowFetch(),
+            tail_through=THIRD_TAIL_SUNDAY,
+            previous=altered.capture_root,
+            name="week-3",
+        )
+
+    assert str(error.value).startswith("RECONCILIATION_MISMATCH")
+    # Nothing was published and nothing was half-published: a rerun after the
+    # data problem is fixed must not trip over this week's leftovers.
+    assert not (tmp_path / "week-3").exists()
+
+    refusal = _refusal(tmp_path, "week-3")
+    assert refusal["base_capture_root_hash"] == _manifest(advanced)["capture_root_hash"]
+    assert refusal["previous_capture_root_hash"] == altered.capture_root_hash
+    assert refusal["compared_rows"] == _DROPPED_ROWS
+    assert refusal["mismatches"] == [
+        {
+            "kind": "candle",
+            "instrument_id": _SYMBOL,
+            "key": day_start_ms(FIRST_TAIL_DATE) * _NANOSECONDS_PER_MILLISECOND,
+            "field": "close",
+            "previous": "999.5",
+            "base": _monthly_close(_SYMBOL, FIRST_TAIL_DATE),
+        }
+    ]
+    sealed = {key: value for key, value in refusal.items() if key != "content_sha256"}
+    assert refusal["content_sha256"] == content_sha256(sealed)
+
+
+def test_a_previous_settlement_the_base_never_had_is_missing_in_base(tmp_path: Path) -> None:
+    base = _base_capture(tmp_path)
+    # Eight hours after the fixture's weekly settlement, so the answer's
+    # spacing is still a whole number of hours and week 1 builds cleanly.
+    extra_ms = day_start_ms(FIRST_TAIL_DATE) + 8 * HOUR_MS
+    first = _shadow(
+        tmp_path,
+        base,
+        fetch=ShadowFetch(extra_settlements={_SYMBOL: (extra_ms,)}),
+        name="week-1",
+    )
+    advanced = _base_capture(tmp_path, months=(*MONTHS, "2020-08"))
+
+    with pytest.raises(ShadowCaptureError) as error:
+        _shadow(
+            tmp_path,
+            advanced,
+            fetch=ShadowFetch(),
+            tail_through=THIRD_TAIL_SUNDAY,
+            previous=first.capture_root,
+            name="week-3",
+        )
+
+    assert str(error.value).startswith("RECONCILIATION_MISMATCH")
+    assert not (tmp_path / "week-3").exists()
+    refusal = _refusal(tmp_path, "week-3")
+    # The extra settlement is one more row to compare than the clean chain.
+    assert refusal["compared_rows"] == _DROPPED_ROWS + 1
+    assert refusal["mismatches"] == [
+        {
+            "kind": "missing_in_base",
+            "instrument_id": _SYMBOL,
+            "key": extra_ms * _NANOSECONDS_PER_MILLISECOND,
+            "field": "funding",
+            "previous": "present",
+            "base": "absent",
+        }
+    ]
+
+
+_RECONCILE_CANDLE = PanelCandleRow(
+    venue="BINANCE_UM",
+    instrument_id=_SYMBOL,
+    open_time_ns=DAY_NS,
+    close_time_ns=2 * DAY_NS - 1,
+    available_time_ns=2 * DAY_NS,
+    interval_ns=DAY_NS,
+    open=Decimal("100"),
+    high=Decimal("110"),
+    low=Decimal("90"),
+    close=Decimal("105"),
+    base_volume=Decimal("10"),
+    quote_volume=Decimal("1000"),
+    trade_count=7,
+    source_payload_hash="from-the-daily-dump",
+)
+_RECONCILE_FUNDING = PanelFundingRow(
+    venue="BINANCE_UM",
+    instrument_id=_SYMBOL,
+    calc_time_ns=DAY_NS,
+    funding_interval_hours=8,
+    rate=Decimal("0.0001"),
+)
+
+
+def test_reconcile_tail_rows_ignores_what_the_two_sources_cannot_share() -> None:
+    """The fields that differ by construction are not evidence of anything.
+
+    The payload hash is the dump's, the available time is derived from it,
+    the REST interval is read off the spacing while the monthly dump has its
+    own column, and `100.00` and `100` are the same price written twice.
+    """
+    compared, mismatches = reconcile_tail_rows(
+        previous_rows=(_RECONCILE_CANDLE, _RECONCILE_FUNDING),
+        base_rows=(
+            replace(
+                _RECONCILE_CANDLE,
+                source_payload_hash="from-the-monthly-dump",
+                available_time_ns=0,
+                open=Decimal("100.00"),
+            ),
+            replace(_RECONCILE_FUNDING, funding_interval_hours=4),
+        ),
+    )
+
+    assert (compared, mismatches) == (2, ())
+
+
+def test_reconcile_tail_rows_names_every_field_that_differs() -> None:
+    compared, mismatches = reconcile_tail_rows(
+        previous_rows=(_RECONCILE_CANDLE,),
+        base_rows=(replace(_RECONCILE_CANDLE, close=Decimal("106"), trade_count=8),),
+    )
+
+    assert compared == 1
+    assert mismatches == (
+        {
+            "kind": "candle",
+            "instrument_id": _SYMBOL,
+            "key": DAY_NS,
+            "field": "close",
+            "previous": "105",
+            "base": "106",
+        },
+        {
+            "kind": "candle",
+            "instrument_id": _SYMBOL,
+            "key": DAY_NS,
+            "field": "trade_count",
+            "previous": "7",
+            "base": "8",
+        },
+    )
+
+
+def test_reconcile_tail_rows_compares_a_settlement_on_its_rate() -> None:
+    compared, mismatches = reconcile_tail_rows(
+        previous_rows=(_RECONCILE_FUNDING,),
+        base_rows=(replace(_RECONCILE_FUNDING, rate=Decimal("0.0002")),),
+    )
+
+    assert compared == 1
+    assert mismatches == (
+        {
+            "kind": "funding",
+            "instrument_id": _SYMBOL,
+            "key": DAY_NS,
+            "field": "rate",
+            "previous": "0.0001",
+            "base": "0.0002",
+        },
+    )
 
 
 def test_build_funding_rest_url_is_the_documented_endpoint() -> None:
@@ -725,7 +935,7 @@ def test_an_already_written_raw_payload_path_refuses(tmp_path: Path) -> None:
 
 # `raw_sha256` is not in this list: dropping it makes the base itself fail
 # verification, which is a different refusal and already covered.
-@pytest.mark.parametrize("field", ["received_time_ns", "symbol", "url"])
+@pytest.mark.parametrize("field", ["received_time_ns", "symbol", "url", "kind"])
 def test_a_present_row_missing_a_required_field_refuses(tmp_path: Path, field: str) -> None:
     base = _base_capture(tmp_path)
 

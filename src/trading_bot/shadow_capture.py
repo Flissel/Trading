@@ -13,10 +13,17 @@ weekly capture is a verified superset of the base it extends.
 
 Nothing here refetches a source the base already carries: base payloads are
 hardlinked (or copied) and their manifest rows carried verbatim, so their
-`raw_sha256` is by construction the base's own. Reconciliation of a daily-tail
-bar against the monthly dump that later covers it is a separate step; this
-builder records an empty `reconciliation` block and drops the previous week's
-rows whose month the base now covers for that symbol.
+`raw_sha256` is by construction the base's own.
+
+When a monthly dump finally covers a month the tail already spoke for, the
+monthly dump wins and the previous week's rows for that month are dropped --
+but only after every one of them has been compared against the base's own row
+for the same key (spec section 3.2). Binance generates the monthly dumps from
+the same data as the daily dumps and the funding endpoint, so a disagreement
+is evidence of a data problem, not noise: the capture is refused with
+`RECONCILIATION_MISMATCH` and a `reconciliation-refused.json` is written
+beside the unpublished output for a person to read. A clean comparison is
+recorded in the manifest's `reconciliation` block, inside the seal.
 
 A real base does not cover the same month for every symbol: delisted
 contracts stop years early and funding dumps lag klines. The tail therefore
@@ -39,7 +46,7 @@ from datetime import date as date_type
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.panel_capture import (
@@ -99,6 +106,29 @@ _NANOSECONDS_PER_MILLISECOND = 1_000_000
 _NANOSECONDS_PER_HOUR = 3_600_000_000_000
 _SUNDAY_RETRY_SECONDS = 3600
 _WORST_CASE_REQUIRED_BYTES = 500_000_000
+
+# What reconciliation compares on a bar, in the order a refusal lists it.
+# `available_time_ns` is derived from the close time and `interval_ns` is the
+# same constant on both sides, while `source_payload_hash` is the digest of
+# the payload the row came out of and so differs by construction: the daily
+# dump and the monthly dump are two different files saying the same thing,
+# which is exactly what is being checked.
+_CANDLE_FIELDS = (
+    "close_time_ns",
+    "open",
+    "high",
+    "low",
+    "close",
+    "base_volume",
+    "quote_volume",
+    "trade_count",
+)
+# A settlement is a time and a rate. The REST answer carries no interval
+# column and `parse_funding_rest` infers one from the spacing, so comparing
+# `funding_interval_hours` would weigh that inference against the monthly
+# dump's own measurement and call the difference a data problem.
+_FUNDING_FIELDS = ("rate",)
+_RECONCILIATION_REFUSAL_SUFFIX = "-reconciliation-refused.json"
 
 
 class ShadowCaptureError(RuntimeError):
@@ -252,6 +282,120 @@ def _funding_interval_hours(settlements: list[int], index: int, *, symbol: str) 
     return hours
 
 
+def reconcile_tail_rows(
+    *,
+    previous_rows: tuple[PanelCandleRow | PanelFundingRow, ...],
+    base_rows: tuple[PanelCandleRow | PanelFundingRow, ...],
+) -> tuple[int, tuple[dict[str, object], ...]]:
+    """Compare a week's tail rows against the monthly rows that now cover them.
+
+    Returns `(compared_count, mismatches)`. A candle is matched on
+    `(instrument_id, open_time_ns)` and must agree on `_CANDLE_FIELDS`; a
+    settlement is matched on `(instrument_id, calc_time_ns)` and must agree on
+    its rate. A previous row the base has no counterpart for is itself a
+    mismatch, of kind `missing_in_base`: the monthly dump is about to replace
+    the tail row, so a key only the tail has would silently disappear.
+
+    Pure: rows in, records out. The caller decides which rows to hand it and
+    what a non-empty result means.
+    """
+    base_candles = {
+        (row.instrument_id, row.open_time_ns): row
+        for row in base_rows
+        if isinstance(row, PanelCandleRow)
+    }
+    base_funding = {
+        (row.instrument_id, row.calc_time_ns): row
+        for row in base_rows
+        if isinstance(row, PanelFundingRow)
+    }
+    mismatches: list[dict[str, object]] = []
+    for row in previous_rows:
+        if isinstance(row, PanelCandleRow):
+            counterpart = base_candles.get((row.instrument_id, row.open_time_ns))
+            if counterpart is None:
+                mismatches.append(_missing_in_base("candle", row.instrument_id, row.open_time_ns))
+                continue
+            mismatches.extend(_candle_mismatches(row, counterpart))
+        else:
+            settlement = base_funding.get((row.instrument_id, row.calc_time_ns))
+            if settlement is None:
+                mismatches.append(_missing_in_base("funding", row.instrument_id, row.calc_time_ns))
+                continue
+            mismatches.extend(_funding_mismatches(row, settlement))
+    return len(previous_rows), tuple(mismatches)
+
+
+def _candle_mismatches(
+    previous: PanelCandleRow, base: PanelCandleRow
+) -> tuple[dict[str, object], ...]:
+    """One record per measured field of a bar the two sources disagree on."""
+    return _field_mismatches(
+        "candle", previous.open_time_ns, _CANDLE_FIELDS, previous=previous, base=base
+    )
+
+
+def _funding_mismatches(
+    previous: PanelFundingRow, base: PanelFundingRow
+) -> tuple[dict[str, object], ...]:
+    """One record per measured field of a settlement the two sources disagree on."""
+    return _field_mismatches(
+        "funding", previous.calc_time_ns, _FUNDING_FIELDS, previous=previous, base=base
+    )
+
+
+def _field_mismatches(
+    kind: str,
+    key: int,
+    field_names: tuple[str, ...],
+    *,
+    previous: PanelCandleRow | PanelFundingRow,
+    base: PanelCandleRow | PanelFundingRow,
+) -> tuple[dict[str, object], ...]:
+    """One readable, JSON-able record per named field the two rows disagree on.
+
+    Both values are rendered as text: a `Decimal` is not canonical JSON, and a
+    person reading the refusal wants the digits a dump actually carried rather
+    than a number some later reader might reformat. The comparison itself is
+    on the values, so `100` and `100.00` are the same price written twice, not
+    a disagreement.
+    """
+    records: list[dict[str, object]] = []
+    for field_name in field_names:
+        previous_value = getattr(previous, field_name)
+        base_value = getattr(base, field_name)
+        if previous_value == base_value:
+            continue
+        records.append(
+            {
+                "kind": kind,
+                "instrument_id": previous.instrument_id,
+                "key": key,
+                "field": field_name,
+                "previous": str(previous_value),
+                "base": str(base_value),
+            }
+        )
+    return tuple(records)
+
+
+def _missing_in_base(row_kind: str, instrument_id: str, key: int) -> dict[str, object]:
+    """A tail row the base's monthly dump has no counterpart for at all.
+
+    `field` carries the row kind because `kind` is spent on naming the
+    absence; the pair reads as "the candle at this key: present before,
+    absent now".
+    """
+    return {
+        "kind": "missing_in_base",
+        "instrument_id": instrument_id,
+        "key": key,
+        "field": row_kind,
+        "previous": "present",
+        "base": "absent",
+    }
+
+
 def build_shadow_capture(
     *,
     workspace_root: Path,
@@ -327,6 +471,20 @@ def build_shadow_capture(
         if funding_stale:
             stale_symbols["fundingRate"][symbol] = own_funding_month
 
+    # The previous week's tail, split into the rows the base's own monthly
+    # dumps now cover -- which this week reconciles and then drops -- and the
+    # rows that are still the tail's to carry.
+    previous_tail = (
+        [
+            entry
+            for entry in _source_entries(previous_manifest, label="previous")
+            if str(entry.get("kind")) in (DAILY_TAIL_KIND, FUNDING_REST_KIND)
+        ]
+        if previous_manifest is not None
+        else []
+    )
+    carried_previous, dropped_previous = _partition_previous_tail(previous_tail, covered=covered)
+
     workspace = workspace_root.resolve()
     target = output_directory.resolve()
     StoragePolicy(workspace, reserve_bytes).authorize(
@@ -338,6 +496,31 @@ def build_shadow_capture(
     manifest_path = target / "capture-manifest.json"
     if manifest_path.exists():
         raise ShadowCaptureError("shadow capture already exists and is immutable")
+
+    # Reconciliation runs here and nowhere later: after the storage policy has
+    # authorized the drive the refusal document is written to and after the
+    # immutability check, but before a single byte goes under `target`. A
+    # refused week therefore leaves no capture directory at all -- no
+    # `capture-manifest.json`, no half-copied `raw/` -- so the rerun a person
+    # starts once the data problem is understood is not blocked by this one.
+    compared_rows = 0
+    if dropped_previous and previous_root is not None and previous_manifest is not None:
+        compared_rows, mismatches = _reconcile_dropped_rows(
+            dropped_previous,
+            previous_root=previous_root,
+            base_root=base_root,
+            base_sources=base_sources,
+            venue=venue,
+        )
+        if mismatches:
+            _refuse_reconciliation(
+                target=target,
+                base_capture_root_hash=str(base_manifest["capture_root_hash"]),
+                previous_capture_root_hash=str(previous_manifest["capture_root_hash"]),
+                compared_rows=compared_rows,
+                mismatches=mismatches,
+            )
+
     target.mkdir(parents=True, exist_ok=True)
 
     sources: list[dict[str, object]] = []
@@ -366,22 +549,11 @@ def build_shadow_capture(
     # win, and the days in between would never be fetched by any week.
     carried_daily_days: dict[str, set[date_type]] = {}
     carried_rest_days: dict[str, set[date_type]] = {}
-    if previous_manifest is not None and previous_root is not None:
-        for entry in _source_entries(previous_manifest, label="previous"):
+    if previous_root is not None:
+        for entry in carried_previous:
             kind = str(entry.get("kind"))
-            if kind not in (DAILY_TAIL_KIND, FUNDING_REST_KIND):
-                continue
             symbol = str(entry.get("symbol"))
             span_start, span_end = _row_span(kind, str(entry.get("month")))
-            bucket = "klines" if kind == DAILY_TAIL_KIND else "fundingRate"
-            own_month = covered[bucket].get(symbol)
-            if own_month is not None and _month_of(span_start) <= own_month:
-                # The base's own monthly dump now covers this row's month --
-                # for this symbol, which is what matters when symbols cover
-                # different months. Comparing the two is Task 2's
-                # reconciliation; until it exists the monthly dump simply
-                # wins and the row is dropped.
-                continue
             _carry_source(
                 entry,
                 source_root=previous_root,
@@ -469,7 +641,7 @@ def build_shadow_capture(
         ),
         "tail_through": tail_through,
         "stale_symbols": stale_symbols,
-        "reconciliation": _empty_reconciliation(),
+        "reconciliation": _reconciliation_block(compared_rows),
     }
     capture_root_hash = content_sha256(material)
     document = dict(material)
@@ -481,9 +653,9 @@ def build_shadow_capture(
         dataset_root_hash=dataset.root_hash,
         tail_through=tail_through,
         # Its own block, not the manifest's: that one is already sealed into
-        # `capture_root_hash`, and once Task 2 fills `mismatches` a shared
-        # (or shallow-copied) list would be reachable through the artifact.
-        reconciliation=_empty_reconciliation(),
+        # `capture_root_hash`, and a shared (or shallow-copied) `mismatches`
+        # list would be reachable -- and mutable -- through the artifact.
+        reconciliation=_reconciliation_block(compared_rows),
     )
 
 
@@ -750,6 +922,147 @@ def _rows_from_source(
     raise ShadowCaptureError(f"unknown capture source kind: {kind}")
 
 
+def _partition_previous_tail(
+    entries: list[dict[str, Any]], *, covered: dict[str, dict[str, str]]
+) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+    """Split the previous week's tail rows into the carried and the dropped.
+
+    A dropped row is paired with the month the base now reaches for its
+    symbol and bucket, because that month is also the cutoff for what may be
+    reconciled: a funding window that straddles the boundary is dropped whole
+    -- its uncovered days are refetched by this week's set-difference plan --
+    but only the settlements up to that month have a monthly dump to be
+    compared against.
+    """
+    carried: list[dict[str, Any]] = []
+    dropped: list[tuple[dict[str, Any], str]] = []
+    for entry in entries:
+        covering_month = _covering_month(entry, covered=covered)
+        if covering_month is None:
+            carried.append(entry)
+        else:
+            dropped.append((entry, covering_month))
+    return carried, dropped
+
+
+def _covering_month(
+    entry: dict[str, Any], *, covered: dict[str, dict[str, str]]
+) -> str | None:
+    """The base's last monthly month for this row, when it already covers it.
+
+    Per symbol, which is what matters when symbols cover different months:
+    one contract's base may have reached August while a delisted one's stops
+    years earlier.
+    """
+    kind = str(entry.get("kind"))
+    bucket = _MONTH_BUCKET.get(kind)
+    if bucket is None:
+        return None
+    span_start, _span_end = _row_span(kind, str(entry.get("month")))
+    own_month = covered[bucket].get(str(entry.get("symbol")))
+    if own_month is None or _month_of(span_start) > own_month:
+        return None
+    return own_month
+
+
+def _reconcile_dropped_rows(
+    dropped: list[tuple[dict[str, Any], str]],
+    *,
+    previous_root: Path,
+    base_root: Path,
+    base_sources: list[dict[str, Any]],
+    venue: str,
+) -> tuple[int, tuple[dict[str, object], ...]]:
+    """Compare the rows the base's monthly dumps are about to replace.
+
+    Both sides are parsed from their own capture's payloads -- the previous
+    week's from `previous_root`, the base's from `base_root` -- and both
+    captures have been verified, so the bytes behind every row match the
+    digest their manifest claims. Only the base rows whose months are
+    actually under comparison are parsed; the whole base is parsed once more
+    a moment later by the carry, and there is no reason to do it twice for
+    months nothing was dropped from.
+
+    An `absent` dropped row is not a row: its day was asked for and the venue
+    had nothing, so there is nothing to compare and nothing is lost by the
+    monthly dump taking over.
+    """
+    previous_rows: list[PanelCandleRow | PanelFundingRow] = []
+    needed: dict[tuple[str, str], set[str]] = {}
+    for entry, covering_month in dropped:
+        if entry.get("status") != "present":
+            continue
+        kind = _present_row_text(entry, "kind")
+        symbol = _present_row_text(entry, "symbol")
+        bucket = _MONTH_BUCKET[kind]
+        candles, funding = _rows_from_source(entry, capture_root=previous_root, venue=venue)
+        previous_rows.extend(candles)
+        previous_rows.extend(
+            row
+            for row in funding
+            if _month_of(_day_of_ns(row.calc_time_ns)) <= covering_month
+        )
+        needed.setdefault((bucket, symbol), set()).update(
+            month
+            for month in _months_of(kind, _present_row_text(entry, "month"))
+            if month <= covering_month
+        )
+
+    base_rows: list[PanelCandleRow | PanelFundingRow] = []
+    for entry in base_sources:
+        if entry.get("status") != "present":
+            continue
+        base_kind = str(entry.get("kind"))
+        base_bucket = _MONTH_BUCKET.get(base_kind)
+        if base_bucket is None:
+            continue
+        months = needed.get((base_bucket, str(entry.get("symbol"))))
+        if months is None or months.isdisjoint(_months_of(base_kind, str(entry.get("month")))):
+            continue
+        candles, funding = _rows_from_source(entry, capture_root=base_root, venue=venue)
+        base_rows.extend(candles)
+        base_rows.extend(funding)
+    return reconcile_tail_rows(previous_rows=tuple(previous_rows), base_rows=tuple(base_rows))
+
+
+def _refuse_reconciliation(
+    *,
+    target: Path,
+    base_capture_root_hash: str,
+    previous_capture_root_hash: str,
+    compared_rows: int,
+    mismatches: tuple[dict[str, object], ...],
+) -> NoReturn:
+    """Write the refusal document, then refuse (spec section 6).
+
+    Beside the output directory, not inside it: the capture is not published
+    and its directory must stay absent, or the rerun a person starts after
+    reading this would find a manifest -- or a half-copied `raw/` -- and
+    refuse for the wrong reason. The document is sealed the way the manifest
+    is, so the record of *why* a week is missing cannot be edited unnoticed,
+    and it is written through a temporary file so a reader never finds half
+    of it.
+    """
+    material: dict[str, object] = {
+        "base_capture_root_hash": base_capture_root_hash,
+        "previous_capture_root_hash": previous_capture_root_hash,
+        "compared_rows": compared_rows,
+        "mismatches": list(mismatches),
+    }
+    document = dict(material)
+    document["content_sha256"] = content_sha256(material)
+    path = target.parent / f"{target.name}{_RECONCILIATION_REFUSAL_SUFFIX}"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temporary.write_bytes(canonical_json(document))
+    os.replace(temporary, path)
+    raise ShadowCaptureError(
+        f"RECONCILIATION_MISMATCH: {len(mismatches)} field(s) of the previous capture's "
+        f"tail disagree with the base capture's monthly dumps over {compared_rows} "
+        f"compared rows; see {path}"
+    )
+
+
 def _require_exactly_one_day(
     rows: tuple[PanelCandleRow, ...], *, symbol: str, day: date_type
 ) -> None:
@@ -895,9 +1208,15 @@ def _source_entries(manifest: dict[str, Any], *, label: str) -> list[dict[str, A
     return entries
 
 
-def _empty_reconciliation() -> dict[str, object]:
-    """A fresh, unshared reconciliation block -- Task 2 fills `mismatches`."""
-    return {"compared_rows": 0, "mismatches": []}
+def _reconciliation_block(compared_rows: int) -> dict[str, object]:
+    """A fresh, unshared reconciliation block for a week that reconciled clean.
+
+    `mismatches` is always empty here: a week with any mismatch never reaches
+    the manifest, it refuses. The block is recorded all the same so a reader
+    can tell a week that compared nothing from one that compared hundreds of
+    rows and found them all equal.
+    """
+    return {"compared_rows": compared_rows, "mismatches": []}
 
 
 def _present_row_name(entry: dict[str, Any]) -> str:
@@ -1013,6 +1332,11 @@ def _month_of(day: date_type) -> str:
 
 def _open_time_ns(day: date_type) -> int:
     return (day - _EPOCH).days * DAY_NS
+
+
+def _day_of_ns(time_ns: int) -> date_type:
+    """The UTC calendar day a nanosecond timestamp falls on."""
+    return _EPOCH + timedelta(days=time_ns // DAY_NS)
 
 
 def _day_start_ms(day: date_type) -> int:

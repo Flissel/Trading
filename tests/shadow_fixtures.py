@@ -133,6 +133,15 @@ class ShadowFetch:
     dump that carries the wrong day, a response that repeats a settlement,
     a response that carries settlements outside the window it was asked for,
     and a response long enough to have been truncated.
+
+    Two hooks exist for reconciliation (spec section 3.2) alone. Because the
+    daily dump and the monthly dump are generated from the same numbers here,
+    a capture can only disagree with the monthly dump it is later reconciled
+    against if the *daily* source it was built from said something else:
+    `altered_closes` changes one served day's close, and `extra_settlements`
+    adds a settlement the monthly funding dump does not carry. The capture is
+    then built from the altered payload and verifies against its own seal --
+    which is the situation reconciliation exists to catch.
     """
 
     absent_months: frozenset[tuple[str, str, str]] = frozenset()
@@ -142,6 +151,8 @@ class ShadowFetch:
     duplicate_settlement: bool = False
     settlements_outside_window: bool = False
     pad_settlements_to: int = 0
+    altered_closes: dict[tuple[str, str], str] = field(default_factory=dict)
+    extra_settlements: dict[str, tuple[int, ...]] = field(default_factory=dict)
     urls: list[str] = field(default_factory=list)
     attempts: dict[tuple[str, str], int] = field(default_factory=dict)
 
@@ -183,6 +194,15 @@ class ShadowFetch:
                         "markPrice": "100.00000000",
                     }
                 )
+        for extra_ms in self.extra_settlements.get(symbol, ()):
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "fundingTime": extra_ms,
+                    "fundingRate": rate,
+                    "markPrice": "100.00000000",
+                }
+            )
         return PanelPayload(
             url=url, raw_bytes=json.dumps(rows).encode("utf-8"), received_time_ns=1
         )
@@ -203,6 +223,9 @@ class ShadowFetch:
             if "/data/spot/" in url
             else daily_kline_csv(symbol, served)
         )
+        altered_close = self.altered_closes.get(key)
+        if altered_close is not None:
+            text = _with_close(text, altered_close)
         return _payload(url, "k.csv", text)
 
     def _monthly(self, url: str) -> PanelPayload:
@@ -216,6 +239,20 @@ class ShadowFetch:
         if "/data/spot/" in url:
             return _payload(url, "k.csv", spot_kline_csv(symbol, month))
         return _payload(url, "k.csv", kline_csv(symbol, month))
+
+
+def _with_close(text: str, close: str) -> str:
+    """A one-day kline CSV with its close column replaced and nothing else.
+
+    Only the close moves, so the bar disagrees with the monthly dump in
+    exactly one field and the refusal document has exactly one record to
+    name -- which is what makes the reconciliation test's expectation an
+    equality rather than a search.
+    """
+    header, row = text.splitlines()[:2]
+    fields = row.split(",")
+    fields[4] = close
+    return "\n".join([header, ",".join(fields)]) + "\n"
 
 
 def _next_date(date: str) -> str:
