@@ -38,6 +38,7 @@ from trading_bot.binance_measurement_journal import (
     MeasurementChainHead,
     _segment_paths,
     _verified_chain,
+    _verified_tail,
     book_rows,
     create_measurement_journal,
     load_measurement_journal_spec,
@@ -1100,13 +1101,15 @@ def test_a_book_entry_that_measures_nothing_is_excluded_not_refused(
     assert excluded == 1
 
 
-def test_a_payload_whose_every_usdt_symbol_is_unusable_is_still_a_refusal() -> None:
-    """A venue-wide defect is not a halted pair: there is nothing to record."""
+def test_a_payload_whose_every_usdt_symbol_is_unusable_yields_no_rows_and_counts_them() -> None:
+    """Ruling 12: the ordinary rule at its extreme, not a second path."""
     payload: list[object] = [
         {**entry, "bidQty": "0"} for entry in perp_book_payload() if isinstance(entry, dict)
     ]
-    with pytest.raises(DepthPayloadError, match="every USDT symbol was excluded"):
-        book_rows(payload)
+    assert book_rows(payload) == ((), 2)
+    # An array holding no USDT symbol at all is a schema anomaly, and refuses.
+    with pytest.raises(DepthPayloadError, match="no USDT symbols"):
+        book_rows([entry for entry in payload if "USDC" in str(entry)])
 
 
 def test_unusable_symbols_are_excluded_from_a_snapshot_and_counted_in_the_segment(
@@ -1165,9 +1168,10 @@ def test_unusable_symbols_are_excluded_from_a_snapshot_and_counted_in_the_segmen
     assert verified(journal)[:2] == (True, ())
 
 
-def test_an_endpoint_whose_every_symbol_is_unusable_is_a_failure_in_the_segment(
+def test_an_endpoint_whose_every_symbol_is_unusable_is_an_empty_snapshot(
     tmp_path: Path,
 ) -> None:
+    """Ruling 12: rows the round could not use are counted, never a failure."""
     journal = measurement_journal(tmp_path)
     dead: list[object] = [
         {**entry, "askQty": "0"} for entry in perp_book_payload() if isinstance(entry, dict)
@@ -1183,11 +1187,142 @@ def test_an_endpoint_whose_every_symbol_is_unusable_is_a_failure_in_the_segment(
         sleep=FakeSleep(),
     )
     document = segment_documents(journal)[0]
-    assert document["failures"] == ["perpBookTicker:every USDT symbol was excluded"]
-    assert document["perp_book"] is None
-    # A refused payload was not read to the end, so it counts no exclusions.
+    assert document["failures"] == []
+    # Read and measured nothing: the empty tuple, not the absent one.
+    assert document["perp_book"] == []
+    assert document["premium_index"] is not None
     assert document["excluded"] == {
         "premiumIndex": 0,
-        "perpBookTicker": 0,
+        "perpBookTicker": 2,
         "spotBookTicker": 0,
     }
+    assert verified(journal)[:2] == (True, ())
+
+
+DAY_NS = 86_400_000_000_000
+SIX_HOURS_NS = 21_600_000_000_000
+# 2026-09-23T00:00:00Z.
+THREE_DAY_START_NS = 1_790_121_600_000_000_000
+
+
+def three_day_journal(tmp_path: Path) -> Path:
+    """A journal with one segment a day, in 2026-09-23, -24 and -25.
+
+    A round spends four clock calls, so a six-hour step moves the round stamp a
+    whole day and every round opens its own day directory.
+    """
+    journal = measurement_journal(tmp_path)
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=3,
+        fetcher=FakeVenue(),
+        array_fetcher=SnapshotVenue(),
+        clock=FakeClock(start=THREE_DAY_START_NS, step=SIX_HOURS_NS),
+        sleep=FakeSleep(),
+    )
+    return journal
+
+
+def resume(journal: Path, *, workspace: Path) -> MeasurementChainHead:
+    """One more round, stamped the day after the three-day fixture ends."""
+    return run_measurement_journal(
+        workspace_root=workspace,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=1,
+        fetcher=FakeVenue(),
+        array_fetcher=SnapshotVenue(),
+        clock=FakeClock(start=THREE_DAY_START_NS + 3 * DAY_NS),
+        sleep=FakeSleep(),
+    )
+
+
+def recorded_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Every path opened for reading from here on, in order."""
+    reads: list[Path] = []
+    read_text = Path.read_text
+    read_bytes = Path.read_bytes
+
+    def record_text(path: Path, encoding: str | None = None, errors: str | None = None) -> str:
+        reads.append(path)
+        return read_text(path, encoding=encoding, errors=errors)
+
+    def record_bytes(path: Path) -> bytes:
+        reads.append(path)
+        return read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_text", record_text)
+    monkeypatch.setattr(Path, "read_bytes", record_bytes)
+    return reads
+
+
+def unseal(path: Path) -> None:
+    """Change a segment and leave its recorded hash behind, as an editor would."""
+    document = read_document(path)
+    document["received_time_ns"] = 1
+    path.write_bytes(canonical_json(document))
+
+
+def test_a_resume_reads_only_the_head_and_the_two_newest_day_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ruling 13: a restart costs a listing and two days, not the whole history."""
+    journal = three_day_journal(tmp_path)
+    assert relative_names(journal) == [
+        "2026-09-23/0000000000.json",
+        "2026-09-24/0000000001.json",
+        "2026-09-25/0000000002.json",
+    ]
+    reads = recorded_reads(monkeypatch)
+    head = resume(journal, workspace=tmp_path)
+    assert (head.segment_count, head.last_sequence) == (4, 3)
+    segments = journal / "segments"
+    opened = {
+        path.relative_to(segments).as_posix() for path in reads if segments in path.parents
+    }
+    assert opened == {"2026-09-24/0000000001.json", "2026-09-25/0000000002.json"}
+    assert journal / "chain-head.json" in reads
+    assert journal / "journal-spec.json" in reads
+    assert relative_names(journal)[3] == "2026-09-26/0000000003.json"
+
+
+def test_a_segment_outside_the_resume_window_does_not_stop_a_restart(
+    tmp_path: Path,
+) -> None:
+    journal = three_day_journal(tmp_path)
+    _, spec_hash = load_measurement_journal_spec(journal)
+    unseal(segment_paths(journal)[0])
+    assert _verified_tail(journal, spec_hash=spec_hash)[:2] == (True, ())
+    # The whole-chain verification Task 6 exposes still names it.
+    assert _verified_chain(journal, spec_hash=spec_hash)[:2] == (
+        False,
+        ("SEGMENT_HASH_MISMATCH:2026-09-23/0000000000.json",),
+    )
+    head = resume(journal, workspace=tmp_path)
+    assert (head.segment_count, head.last_sequence) == (4, 3)
+
+
+def test_a_segment_inside_the_resume_window_refuses_a_restart(tmp_path: Path) -> None:
+    journal = three_day_journal(tmp_path)
+    _, spec_hash = load_measurement_journal_spec(journal)
+    unseal(segment_paths(journal)[1])
+    assert _verified_tail(journal, spec_hash=spec_hash)[:2] == (
+        False,
+        ("SEGMENT_HASH_MISMATCH:2026-09-24/0000000001.json",),
+    )
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="SEGMENT_HASH_MISMATCH"):
+        resume(journal, workspace=tmp_path)
+
+
+def test_a_segment_deleted_outside_the_window_still_refuses_a_restart(
+    tmp_path: Path,
+) -> None:
+    """The listing covers the whole journal even where the reading does not."""
+    journal = three_day_journal(tmp_path)
+    segment_paths(journal)[0].unlink()
+    with pytest.raises(
+        BinanceMeasurementJournalSpecError, match="CHAIN_HEAD_MISMATCH:segment_count"
+    ):
+        resume(journal, workspace=tmp_path)

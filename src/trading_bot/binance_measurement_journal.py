@@ -265,7 +265,10 @@ class MeasurementSegment(_Frozen):
     endpoint (ruling 11). All three keys are present on every segment and are
     zero on a round that took no snapshot, so a reader never has to tell an
     absent count from a zero one. Symbols quoted in something other than USDT
-    are out of scope and are not counted here.
+    are out of scope and are not counted here. A snapshot field is the empty
+    tuple where every USDT symbol the endpoint listed was excluded (ruling 12):
+    ``None`` means the endpoint was not read, ``()`` that it was read and
+    measured nothing.
     """
 
     version: Literal["binance-measurement-journal/1.0.0"]
@@ -278,7 +281,7 @@ class MeasurementSegment(_Frozen):
     perp_book: tuple[BookRow, ...] | None
     spot_book: tuple[BookRow, ...] | None
     failures: tuple[str, ...]
-    excluded: dict[str, int]
+    excluded: Mapping[str, int]
     content_hash: str
 
     @field_validator("spec_hash", "previous_segment_hash", "content_hash")
@@ -335,7 +338,7 @@ class MeasurementSegment(_Frozen):
 
     @field_validator("excluded")
     @classmethod
-    def validate_excluded(cls, value: dict[str, int]) -> dict[str, int]:
+    def validate_excluded(cls, value: Mapping[str, int]) -> Mapping[str, int]:
         if set(value) != set(SNAPSHOT_ENDPOINTS):
             raise ValueError(f"a segment counts exclusions for {SNAPSHOT_ENDPOINTS}")
         if any(count < 0 for count in value.values()):
@@ -382,11 +385,14 @@ class MeasurementChainHead(_Frozen):
 def _distinct_rows[RowT: PremiumRow | BookRow](
     value: tuple[RowT, ...] | None,
 ) -> tuple[RowT, ...] | None:
-    """A recorded snapshot is absent or non-empty, and names a symbol once."""
+    """A recorded snapshot names every symbol it carries at most once.
+
+    ``None`` is "this endpoint was not read this round"; the empty tuple is
+    "it was read and every USDT symbol it listed was unusable" (ruling 12), and
+    the segment's ``excluded`` count says how many that was.
+    """
     if value is None:
         return None
-    if not value:
-        raise ValueError("a recorded snapshot carries at least one symbol")
     symbols = [row.symbol for row in value]
     if len(set(symbols)) != len(symbols):
         raise ValueError("a symbol is recorded at most once per snapshot")
@@ -573,20 +579,19 @@ def _refuse_duplicate(symbol: str, seen: set[str]) -> None:
 
 
 def _kept[RowT](rows: list[RowT], *, excluded: int) -> tuple[RowT, ...]:
-    """The parsed rows, refusing a payload that kept none.
+    """The parsed rows, refusing only a payload that held no USDT symbol at all.
 
-    Binance's three all-symbol endpoints list hundreds of USDT symbols. An
-    answer that carries none of them is not a quiet venue, it is an answer this
-    parser does not understand; an answer whose every USDT symbol was
-    unusable is a venue-wide defect rather than a halted pair. Both are
-    recorded as that endpoint's failure for the round rather than as an empty
-    measurement, and the two say which happened.
+    Binance's three all-symbol endpoints list hundreds of USDT symbols, so an
+    array carrying none of them is a schema or venue anomaly and is that
+    endpoint's failure for the round. A payload whose USDT symbols were all
+    *excluded* is the ordinary rule at its extreme and takes the ordinary path
+    (ruling 12): no rows and a count of what was left out, so a venue that
+    halted everything is recorded as exactly that rather than as a parse
+    failure.
     """
-    if rows:
-        return tuple(rows)
-    if excluded:
-        raise DepthPayloadError(f"every {QUOTE_ASSET} symbol was excluded")
-    raise DepthPayloadError(f"no {QUOTE_ASSET} symbols")
+    if not rows and not excluded:
+        raise DepthPayloadError(f"no {QUOTE_ASSET} symbols")
+    return tuple(rows)
 
 
 def create_measurement_journal(
@@ -686,15 +691,20 @@ def run_measurement_journal(
     launcher restarts the process and the supervisor's liveness is the newest
     segment's age.
 
-    The journal is written by one process at a time (v1's ``run.lock``), the
-    whole chain is verified from ``ZERO_HASH`` before anything is appended, and
-    a chain head naming another spec refuses: a resumed run extends exactly the
-    journal it was pointed at or none. Two marks of a killed process are
-    repaired rather than refused, as in v1 - a half-written trailing segment is
-    deleted and its sequence sampled again, and a head that was never written,
-    was torn in half or lags a published segment is rebuilt over the segments
-    once they have all verified. Anything else that fails to verify is a change
-    rather than an interruption and stops the run.
+    The journal is written by one process at a time (v1's ``run.lock``), and a
+    chain head naming another spec refuses: a resumed run extends exactly the
+    journal it was pointed at or none. What a restart verifies is the *tail* -
+    the chain head against the newest segment, and the two newest day
+    directories link by link, over a listing of the whole journal (ruling 13);
+    the explicit verification command walks the whole chain from ``ZERO_HASH``.
+    A permanent stream restarts routinely, and a restart that re-read every
+    round since the journal began would cost more every week it stayed alive.
+    Two marks of a killed process are repaired rather than refused, as in v1 -
+    a half-written trailing segment is deleted and its sequence sampled again,
+    and a head that was never written, was torn in half or lags a published
+    segment is rebuilt over the segments once the tail has verified. Anything
+    else that fails to verify is a change rather than an interruption and stops
+    the run.
 
     It differs from ``run_journal`` in one deliberate way: a round in which
     *every* request failed is still published as a segment of failures. Spec 6
@@ -911,20 +921,28 @@ def _dumped[RowT: PremiumRow | BookRow](rows: tuple[RowT, ...] | None) -> object
 
 
 def _resumed_head(root: Path, *, spec_hash: str) -> MeasurementChainHead | None:
-    """The head a run appends to, once the journal on disk has been judged.
+    """The head a run appends to, once the tail on disk has been judged.
 
     The order matters: the head is read first, because the one sequence a crash
     can catch mid-write is the one past it; the torn file there is discarded;
-    then the whole chain is walked from ``ZERO_HASH``. A chain that verifies
-    against its head is resumed. A chain that verifies against *itself* while
-    its head is missing, torn or one segment behind is a killed publish, and
-    the head the segments imply is written over it. Anything else refuses.
+    then the *tail* is verified - the head against the newest segment, and the
+    two newest day directories link by link (ruling 13). The whole history is
+    not re-read: this stream is permanent and a restart is routine, so a
+    restart costs a directory listing and two days of segments rather than
+    every round since the journal began. The listing still covers the whole
+    journal, so a deleted, duplicated or foreign segment anywhere is caught by
+    the head's segment count or by the layout check.
+
+    A tail that verifies against its head is resumed. A tail that verifies
+    against *itself* while its head is missing, torn or behind the segments on
+    disk is a killed publish, and the head the tail implies is written over it.
+    Anything else refuses.
     """
     head = _resumable_chain_head(root)
     if head is not None and head.spec_hash != spec_hash:
         raise BinanceMeasurementJournalSpecError("this journal is bound to a different spec")
     _discard_torn_trailing_segment(root, head)
-    walk = _walked_segments(root, spec_hash=spec_hash)
+    walk = _walked_tail(root, spec_hash=spec_hash)
     if walk.reasons or not walk.walked:
         raise BinanceMeasurementJournalSpecError(
             "journal verification failed: " + ",".join(walk.reasons)
@@ -937,6 +955,11 @@ def _resumed_head(root: Path, *, spec_hash: str) -> MeasurementChainHead | None:
         raise BinanceMeasurementJournalSpecError(
             "journal verification failed: " + ",".join(reasons)
         )
+    # Wider than v1's single-orphan adoption on purpose: v1 names the one file
+    # a kill can leave past the head, this one compares counts, so a head that
+    # was never written, one a crash tore in half and one a kill left a segment
+    # behind all take the same path - and all of them are judged by a tail that
+    # verified first.
     _report_repair(f"CHAIN_HEAD_REBUILT:{implied.segment_count}")
     return _publish_head(root, implied)
 
@@ -946,20 +969,30 @@ def _verified_chain(
 ) -> tuple[bool, tuple[str, ...], MeasurementChainHead | None]:
     """Recompute every segment's hash, every chain link and the chain head.
 
-    Never raises: an unreadable, foreign or malformed journal comes back as
-    reason codes, the way ``verify_panel_capture`` reports a broken capture. An
-    empty journal - a spec and no segment yet - is valid and implies no head.
-    The third member is the head the segments on disk imply, which is what a
-    resume appends to and what a reader reports.
+    This is the whole history, which is what an explicit verification is for;
+    ``_verified_tail`` is the bounded reading a restart and a status command
+    can afford. Never raises: an unreadable, foreign or malformed journal comes
+    back as reason codes, the way ``verify_panel_capture`` reports a broken
+    capture. An empty journal - a spec and no segment yet - is valid and
+    implies no head. The third member is the head the segments on disk imply.
     """
-    walk = _walked_segments(journal_root, spec_hash=spec_hash)
-    reasons = walk.reasons
-    if walk.walked:
-        head, head_reasons = _chain_head_on_disk(journal_root)
-        reasons = (*reasons, *head_reasons)
-        if not head_reasons:
-            reasons = (*reasons, *_head_mismatch_reasons(head, walk.implied_head))
-    return not reasons, reasons, walk.implied_head
+    return _judged(journal_root, _walked_segments(journal_root, spec_hash=spec_hash))
+
+
+def _verified_tail(
+    journal_root: Path, *, spec_hash: str
+) -> tuple[bool, tuple[str, ...], MeasurementChainHead | None]:
+    """Judge the journal's tip without reading its history (ruling 13).
+
+    The same answer shape as ``_verified_chain`` over the same layout check,
+    but only the head and the segments of the two newest day directories are
+    opened: the window's first segment is an anchor whose predecessor is not
+    resolved (unless it is sequence zero, which must name ``ZERO_HASH``), and
+    every segment after it must link to the one before. A journal whose tail
+    verifies can still be broken further back, which is what ``_verified_chain``
+    is for.
+    """
+    return _judged(journal_root, _walked_tail(journal_root, spec_hash=spec_hash))
 
 
 class _ChainWalk(NamedTuple):
@@ -975,18 +1008,93 @@ class _ChainWalk(NamedTuple):
     walked: bool
 
 
+def _judged(
+    journal_root: Path, walk: _ChainWalk
+) -> tuple[bool, tuple[str, ...], MeasurementChainHead | None]:
+    """A walk plus the head on disk, as one verification answer."""
+    reasons = walk.reasons
+    if walk.walked:
+        head, head_reasons = _chain_head_on_disk(journal_root)
+        reasons = (*reasons, *head_reasons)
+        if not head_reasons:
+            reasons = (*reasons, *_head_mismatch_reasons(head, walk.implied_head))
+    return not reasons, reasons, walk.implied_head
+
+
 def _walked_segments(journal_root: Path, *, spec_hash: str) -> _ChainWalk:
     """Walk every segment in sequence order, checking each against its place."""
-    if not (journal_root / SEGMENT_DIRECTORY_NAME).is_dir():
-        return _ChainWalk(("SEGMENT_DIRECTORY_MISSING",), None, False)
     try:
-        paths = _segment_paths(journal_root)
+        paths = _listed_segments(journal_root)
     except _SegmentLayoutError as error:
         return _ChainWalk((error.reason,), None, False)
+    if paths is None:
+        return _ChainWalk(("SEGMENT_DIRECTORY_MISSING",), None, False)
+    return _walked(paths, journal_root=journal_root, spec_hash=spec_hash, total=len(paths))
+
+
+def _walked_tail(journal_root: Path, *, spec_hash: str) -> _ChainWalk:
+    """Walk the two newest day directories, anchored on the first segment in them.
+
+    The layout of the whole journal is still listed - names, day directories
+    and duplicate sequences are cheap and catch a deletion or an intruder
+    anywhere - and the segment count that listing gives is what the chain head
+    is judged against; only the window's files are opened.
+    """
+    try:
+        paths = _listed_segments(journal_root)
+    except _SegmentLayoutError as error:
+        return _ChainWalk((error.reason,), None, False)
+    if paths is None:
+        return _ChainWalk(("SEGMENT_DIRECTORY_MISSING",), None, False)
+    return _walked(
+        _tail_window(paths),
+        journal_root=journal_root,
+        spec_hash=spec_hash,
+        total=len(paths),
+        anchored=True,
+    )
+
+
+def _listed_segments(journal_root: Path) -> list[Path] | None:
+    """Every segment path in sequence order, or ``None`` where there is no directory."""
+    if not (journal_root / SEGMENT_DIRECTORY_NAME).is_dir():
+        return None
+    return _segment_paths(journal_root)
+
+
+def _tail_window(paths: list[Path]) -> list[Path]:
+    """The segments of the newest day directory and the one before it by name."""
+    if not paths:
+        return []
+    days = sorted({path.parent.name for path in paths})
+    newest = days.index(paths[-1].parent.name)
+    window = set(days[max(newest - 1, 0) : newest + 1])
+    return [path for path in paths if path.parent.name in window]
+
+
+def _walked(
+    paths: list[Path],
+    *,
+    journal_root: Path,
+    spec_hash: str,
+    total: int,
+    anchored: bool = False,
+) -> _ChainWalk:
+    """Check each segment of ``paths`` against its place in the chain.
+
+    ``anchored`` starts the walk at the first segment's own sequence and its
+    own recorded predecessor instead of at zero and ``ZERO_HASH``, which is
+    what a bounded walk needs: the window's first segment is where the reading
+    begins, not where the journal does. A window that does begin at sequence
+    zero is held to ``ZERO_HASH`` all the same, which the segment model
+    enforces anyway.
+    """
     reasons: list[str] = []
+    expected_sequence = 0
     previous_hash = ZERO_HASH
+    anchor_pending = anchored
     last: MeasurementSegment | None = None
-    for expected_sequence, path in enumerate(paths):
+    for path in paths:
         name = _segment_name(journal_root, path)
         try:
             document = _read_object(path, label="a journal segment")
@@ -994,6 +1102,11 @@ def _walked_segments(journal_root: Path, *, spec_hash: str) -> _ChainWalk:
         except (BinanceCostJournalError, ValidationError):
             reasons.append(f"SEGMENT_UNREADABLE:{name}")
             return _ChainWalk(tuple(reasons), None, False)
+        if anchor_pending:
+            anchor_pending = False
+            expected_sequence = segment.sequence
+            if segment.sequence != 0:
+                previous_hash = segment.previous_segment_hash
         reasons.extend(
             _segment_reasons(
                 document,
@@ -1004,9 +1117,10 @@ def _walked_segments(journal_root: Path, *, spec_hash: str) -> _ChainWalk:
                 previous_hash=previous_hash,
             )
         )
+        expected_sequence += 1
         previous_hash = segment.content_hash
         last = segment
-    implied = None if last is None else _chain_head_for(last, spec_hash=spec_hash, count=len(paths))
+    implied = None if last is None else _chain_head_for(last, spec_hash=spec_hash, count=total)
     return _ChainWalk(tuple(reasons), implied, True)
 
 
@@ -1214,6 +1328,13 @@ def _discard_torn_trailing_segment(
     crash caught in the act: it carries no measurement, it is deleted and its
     sequence is sampled again. A file there that *is* a valid segment is the
     orphan a resume adopts, and not this function's business.
+
+    It is named more widely than v1's, which opens exactly
+    ``<head.last_sequence + 1>.json``: under the day-partitioned layout that
+    file's directory is not known without a listing - a round either side of
+    midnight writes into a different day - so the trailing file is found by
+    sequence instead, as the last of the listing, and inspected only if it sits
+    past the head. Exactly one file is ever opened here.
     """
     paths = _segment_paths(journal_root)
     if not paths:
