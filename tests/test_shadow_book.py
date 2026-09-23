@@ -338,6 +338,13 @@ def test_a_phase_a_week_publishes_the_fold_runners_book(harness: Harness) -> Non
     assert document["reason_codes"] == run.reason_codes
     assert document["skipped_sample_ids"] == run.skipped_sample_ids
     assert document["measurement_snapshot_hash"] is None
+    # Ruling 22: the window fields are the snapshot's, so a week that cites no
+    # snapshot carries them as nulls rather than leaving them out.
+    assert document["measurement_snapshot_window_start_ns"] is None
+    assert document["measurement_snapshot_window_end_ns"] is None
+    assert document["measurement_snapshot_first_sequence"] is None
+    assert document["measurement_snapshot_last_sequence"] is None
+    assert document["measurement_snapshot_rounds"] is None
     assert document["holdout_report_hash"] is None
     _, declaration_hash = load_shadow_declaration(declaration)
     assert document["declaration_hash"] == declaration_hash
@@ -1149,20 +1156,31 @@ def _sum(records: list[dict[str, object]], key: str) -> Decimal:
 # --- the measurement snapshot -------------------------------------------
 
 
+_WEEK_NS = 7 * 86_400_000_000_000
+
+
 def _snapshot(
     path: Path,
     *,
     perpetuals: dict[str, object],
     spot: dict[str, object],
     seal: str | None = None,
+    window_end_ns: int | None = None,
+    sunday: str = SECOND_TAIL_SUNDAY,
 ) -> tuple[Path, str]:
-    """A hand-sealed measurement snapshot carrying Ruling 1a's keys."""
+    """A hand-sealed measurement snapshot carrying Ruling 1a's keys.
+
+    Its window ends at the decision close of the Sunday the fixture weeks are
+    run for, because a week cites a reading of its own week or none at all
+    (ruling 22).
+    """
+    ends_ns = _close_ns(sunday) if window_end_ns is None else window_end_ns
     material: dict[str, object] = {
         "version": MEASUREMENT_SNAPSHOT_VERSION,
         "spec_hash": "1" * 64,
         "chain_head_hash": "2" * 64,
-        "window_start_ns": 1,
-        "window_end_ns": 2,
+        "window_start_ns": ends_ns - _WEEK_NS + 1,
+        "window_end_ns": ends_ns,
         "first_sequence": 1,
         "last_sequence": 2,
         "rounds": 2,
@@ -1219,6 +1237,63 @@ def test_a_measurement_snapshot_is_carried_per_pair(
     absent = _mapping(by_symbol[SYMBOLS[1]]["measurement"])
     assert absent["perpetual"] == dict.fromkeys(_PERPETUAL_MEASUREMENT)
     assert absent["spot"] == dict.fromkeys(_SPOT_MEASUREMENT)
+
+
+def test_the_cited_snapshots_window_is_sealed_into_the_week(
+    harness: Harness, tmp_path: Path
+) -> None:
+    """Ruling 22: the artifact records which rounds the reading it cites is over.
+
+    A hash alone says which document was read, not what it covers, so a reader
+    of the week would have to open the snapshot to find out whether the
+    numbers beside every pair are this week's at all.
+    """
+    snapshot, content_hash = _snapshot(tmp_path / "snapshot.json", perpetuals={}, spot={})
+
+    artifact = _run(harness, harness.declare(), measurement_snapshot_path=snapshot)
+
+    document = _document(artifact.output_path)
+    close_ns = _close_ns(SECOND_TAIL_SUNDAY)
+    assert document["measurement_snapshot_hash"] == content_hash
+    assert document["measurement_snapshot_window_start_ns"] == close_ns - _WEEK_NS + 1
+    assert document["measurement_snapshot_window_end_ns"] == close_ns
+    assert document["measurement_snapshot_first_sequence"] == 1
+    assert document["measurement_snapshot_last_sequence"] == 2
+    assert document["measurement_snapshot_rounds"] == 2
+
+
+@pytest.mark.parametrize(
+    ("label", "window_end_ns"),
+    [
+        # Last week's reading: its window ends exactly one week before this
+        # decision, which is the first nanosecond outside this week.
+        ("last week", _close_ns(SECOND_TAIL_SUNDAY) - _WEEK_NS),
+        # A reading that runs past the decision it is cited for.
+        ("after the decision", _close_ns(SECOND_TAIL_SUNDAY) + 1),
+    ],
+)
+def test_a_snapshot_that_is_not_this_weeks_is_a_recorded_refusal(
+    harness: Harness, tmp_path: Path, label: str, window_end_ns: int
+) -> None:
+    """Ruling 22: a week cites a reading of its own week, and says so if it cannot.
+
+    Version and seal alone let any snapshot of the stream be cited by any
+    week -- last week's, or one taken days after the decision -- and every
+    number beside every pair would then be a measurement of a different week
+    with nothing in the document saying so.
+    """
+    snapshot, _ = _snapshot(
+        tmp_path / "snapshot.json", perpetuals={}, spot={}, window_end_ns=window_end_ns
+    )
+
+    with pytest.raises(ShadowBookError, match="SHADOW_SNAPSHOT_NOT_THIS_WEEK"):
+        _run(harness, harness.declare(), measurement_snapshot_path=snapshot)
+
+    assert not harness.output_path().exists()
+    refusal = _document(harness.refusal_path())
+    assert refusal["reason"] == "SHADOW_SNAPSHOT_NOT_THIS_WEEK"
+    assert refusal["decision_sunday"] == SECOND_TAIL_SUNDAY
+    assert str(window_end_ns) in _text(refusal["detail"])
 
 
 def test_a_measurement_snapshot_whose_seal_does_not_recompute_refuses(

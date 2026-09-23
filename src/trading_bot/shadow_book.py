@@ -107,11 +107,23 @@ _PERPETUAL_MEASUREMENT_KEYS = (
     "mean_spread_bps",
 )
 _SPOT_MEASUREMENT_KEYS = ("book_rounds", "mean_spread_bps")
+# The five fields of a cited snapshot that say which rounds it is over
+# (ruling 22). Recorded in the week under a `measurement_snapshot_` prefix.
+_SNAPSHOT_WINDOW_KEYS = (
+    "window_start_ns",
+    "window_end_ns",
+    "first_sequence",
+    "last_sequence",
+    "rounds",
+)
+# The week a decision closes: the seven days ending at the Sunday close.
+_WEEK_NS = 7 * _DAY_NS
 _SUNDAY_NOT_IN_CAPTURE = "SHADOW_SUNDAY_NOT_IN_CAPTURE"
 _NO_SUNDAY_BAR = "SHADOW_BOOK_LEG_HAS_NO_SUNDAY_BAR"
 _DECISION_RUN_REFUSED = "SHADOW_DECISION_RUN_REFUSED"
 _ALREADY_REGISTERED = "SHADOW_WEEK_ALREADY_REGISTERED"
 _NOT_REGISTERED = "SHADOW_WEEK_NOT_REGISTERED"
+_SNAPSHOT_NOT_THIS_WEEK = "SHADOW_SNAPSHOT_NOT_THIS_WEEK"
 
 
 class ShadowBookError(RuntimeError):
@@ -261,6 +273,7 @@ def _publish_week(
     measurement_snapshot_hash: str | None,
 ) -> ShadowWeekArtifact:
     """Everything after the inputs verified: the runs, the blocks, the seal."""
+    _require_this_weeks_snapshot(snapshot_document, decision_close_ns=decision_close_ns)
     inputs, decisions = _load_inputs(
         perp.root, spot.root,
         anchor_close_ns=anchor_close_ns, decision_close_ns=decision_close_ns,
@@ -317,6 +330,10 @@ def _publish_week(
         ),
         "code_hash": _code_hash(),
         "measurement_snapshot_hash": measurement_snapshot_hash,
+        # Which rounds that reading is over (ruling 22). A hash says which
+        # document was cited; these say what it covers, so a reader of the
+        # week never has to open the snapshot to find out.
+        **_snapshot_window_block(snapshot_document),
         # Ruling 16: a Sunday the runner skipped holds nothing, and the week
         # says so outright rather than publishing a flat book that would read
         # as a deliberate decision to hold nothing.
@@ -624,6 +641,7 @@ def _measurement_snapshot(path: Path | None) -> tuple[dict[str, Any] | None, str
     if content_sha256(material) != document.get("content_hash"):
         raise ShadowBookError("the measurement snapshot's seal does not recompute")
     _verify_measurement_blocks(document)
+    _verify_snapshot_window(document)
     return document, str(document["content_hash"])
 
 
@@ -659,6 +677,57 @@ def _verify_measurement_blocks(document: dict[str, Any]) -> None:
                     f"the measurement snapshot's {block}.{symbol}.{key} is "
                     "neither a reading nor a count"
                 )
+
+
+def _verify_snapshot_window(document: dict[str, Any]) -> None:
+    """The five fields that say which rounds a snapshot is over are whole numbers.
+
+    Checked at the input gate beside the per-symbol shapes: they are copied
+    into the sealed week, and `window_end_ns` is what binds the reading to the
+    week that cites it, so a snapshot that does not carry them as counts is a
+    bad input rather than a week that refuses.
+    """
+    for key in _SNAPSHOT_WINDOW_KEYS:
+        value = document.get(key)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ShadowBookError(
+                f"the measurement snapshot's {key} is not a whole number of rounds"
+            )
+
+
+def _require_this_weeks_snapshot(
+    document: dict[str, Any] | None, *, decision_close_ns: int
+) -> None:
+    """Ruling 22: the cited reading is of the week this decision closes.
+
+    The version and the seal say the document is a snapshot of this stream and
+    that nobody edited it; neither says it is a reading of *this* week. Without
+    this, last week's snapshot -- or one taken days after the decision -- could
+    be cited by any week, and every number beside every ranked pair would be a
+    measurement of a different week with nothing in the artifact saying so.
+
+    A recorded refusal rather than a raise at the gate (spec section 6): the
+    inputs are all good, the operator passed the wrong one of several
+    interchangeable-looking documents, and the week that was not written says
+    which one it was handed.
+    """
+    if document is None:
+        return
+    window_end_ns = document["window_end_ns"]
+    if not decision_close_ns - _WEEK_NS < window_end_ns <= decision_close_ns:
+        raise _Refusal(
+            _SNAPSHOT_NOT_THIS_WEEK,
+            f"the cited snapshot's window ends at {window_end_ns}, outside the week "
+            f"ending at this decision's close {decision_close_ns}",
+        )
+
+
+def _snapshot_window_block(document: dict[str, Any] | None) -> dict[str, object]:
+    """The cited reading's window and sequence bounds, or nulls where none is cited."""
+    return {
+        f"measurement_snapshot_{key}": None if document is None else document[key]
+        for key in _SNAPSHOT_WINDOW_KEYS
+    }
 
 
 def _load_inputs(
