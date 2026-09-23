@@ -485,6 +485,114 @@ uv run trading-research carry-holdout --check-only ...  # gleiche Argumente wie 
 Es ist noch kein Holdout gelesen worden; das Öffnen bleibt eine eigene, ausdrückliche
 Entscheidung des Nutzers.
 
+### Shadow-Buch und Messstrom (P1.24)
+
+Zwei Dinge, die von hier an wöchentlich bzw. dauerhaft laufen, beide ohne jede
+Handelsanbindung: wöchentliche **Shadow-Captures** mit dem daraus gerechneten
+**Shadow-Buch** und ein **permanenter Messstrom** neben dem abgeschlossenen Kostenjournal
+v1. Entworfen in
+`docs/superpowers/specs/2026-09-22-shadow-book-and-measurement-stream-design.md`.
+
+Die Strategie liest Binances Monats-Dumps, die erst Wochen später erscheinen — ein
+Wochenbuch kann darauf allein nicht laufen. Eine Shadow-Capture ist deshalb eine
+gewöhnliche Panel-Capture, deren `sources` die Vereinigung aus einer geprüften
+Basis-Capture, dem noch nicht abgedeckten Rest der Vorwoche und dem neuen Schwanz sind: je
+ein Tages-Kline-Dump pro Symbol und Tag und, im Perpetual-Markt, ein
+Funding-History-Fenster über REST. Format und Siegel sind die des Panels, jede
+Wochen-Capture ist also eine geprüfte Obermenge ihrer Basis. Deckt ein Monats-Dump später
+einen Monat ab, für den der Schwanz schon Zeilen führt, gewinnt der Monats-Dump — aber erst,
+nachdem jede dieser Zeilen gegen die Zeile desselben Schlüssels in der Basis verglichen
+wurde; eine einzige Abweichung weist die Capture ab (`RECONCILIATION_MISMATCH`).
+
+Die Montagskette (06:00 UTC), je Markt einmal von der zuletzt reparierten Basis, mit der
+Capture der Vorwoche als `--previous-capture` (die erste Woche einer Kette läuft ohne):
+
+```powershell
+uv run trading-research shadow-capture --base-capture <perp-basis> --output data/shadow/perp-<S> --tail-through <S> --market um --previous-capture data/shadow/perp-<S-1>
+uv run trading-research shadow-capture --base-capture <spot-basis> --output data/shadow/spot-<S> --tail-through <S> --market spot --previous-capture data/shadow/spot-<S-1>
+uv run trading-research shadow-week --declaration configs/shadow-carry-v4.json --capture data/shadow/perp-<S> --hedge-capture data/shadow/spot-<S> --perp-base-capture <perp-basis> --spot-base-capture <spot-basis> --decision-sunday <S> --measurement-snapshot artifacts/cost/binance-measurement-v2-<S>.json
+```
+
+Bricht eine Capture ab, bevor ihr Manifest geschrieben ist, räumt sie das selbst angelegte
+Ausgabeverzeichnis wieder weg — Exit 1 heißt hier „Transport weg, gleich noch einmal“ —, und
+steht doch eines da, weil ein Kill vor dem Aufräumen kam, nennt die Abweisung den Weg:
+Verzeichnis löschen und neu starten.
+
+Nach jeder Capture meldet `shadow-capture` `stale_symbols: klines <n>, fundingRate <n>`, und
+das Wochenartefakt trägt dieselbe Erklärung weiter — ganz unter `stale_symbols` und noch
+einmal neben jedem gerankten Paar, dessen Bein betroffen ist. Ein Symbol steht dort, wenn die
+Basis für es keinen Monats-Dump jenseits des genannten Monats hat (`null`: gar keinen). Sein
+Schwanz beginnt dann nicht am Tag nach seinem eigenen letzten Monat, sondern am globalen
+Stichtag, und die Tage dazwischen stehen in keiner Capture. Das ist kein Fehler des Laufs,
+sondern eine Lücke in der Basis: bei Delistings bleibt sie, sonst heilt sie eine frischere
+oder reparierte Basis. Eine steigende Zahl heißt, dass die Basis zurückfällt.
+
+`--perp-base-capture` und `--spot-base-capture` sind genau dann nötig, wenn die
+Wochen-Capture daneben eine Basis nennt (Ruling 17) — die Herkunftsprüfung braucht deren
+Manifest, das nur der Aufrufer hat. Das Buch des Sonntags `S` ist eine reine Funktion aus
+Deklaration, Wochen-Capture und dem festen Anker-Sonntag **2026-09-13**:
+`evaluate_carry_decisions` — dieselbe Schleife wie im Fold-Runner, unverändert — läuft über
+jeden Sonntag vom Anker bis `S`, und der letzte Entscheid ist das Buch. Es gibt keinen
+gespeicherten Slot-Zustand und nichts, was kaputtgehen könnte: jede Woche ist aus Daten neu
+berechenbar. Wohin Artefakt und Registry gehen, sagt die Deklaration, nicht die
+Kommandozeile. Exit 2 heißt: so nicht berechenbar (Deklaration, Siegel, Herkunft,
+fehlender Sonntagsbalken, Woche schon veröffentlicht), Exit 1 heißt: später noch einmal.
+
+Phase A und Phase B (Spec Abschnitt 2): In **Phase A** trägt jedes Wochenartefakt
+`status: development_only` und **keine P&L** — weder den Block noch die laufenden Summen,
+damit keine nach dem Holdout entstandene Zahl in die Go/No-go-Entscheidung über den
+Holdout-Read gerät. **Phase B** beginnt erst, wenn `P1_33_HOLDOUT_<Datum>.md` `holdout_confirmed`
+festhält und der `report_hash` dieses Reports in `configs/shadow-carry-v4.json` steht; erst
+dann wird `--holdout-report` übergeben, und das Wochenkommando siegelt den Report neu,
+bevor es eine Zahl daraus liest. Ein Holdout-Report an eine Phase-A-Woche wird abgewiesen,
+nicht ignoriert.
+
+Der Messstrom ist ein zweites Journal neben dem Kostenjournal v1, mit eigener Spec, eigener
+Run-Id und hash-verketteten Segmenten. Alle 61 s eine Runde: der Tiefenlauf der Kostenpaare
+aus v1 bei 500 / 5 000 / 50 000 USDT in jeder Runde, dazu in jeder fünften die drei
+All-Symbol-Endpunkte — Funding-Prämie und Basis aller Perpetuals, bestes Bid/Ask aller
+Perpetuals und aller Spot-Paare. Keine Zielrundenzahl: der Strom läuft, bis er gestoppt
+wird.
+
+```powershell
+uv run trading-research binance-measurement-journal-create --journal data/measurement-journals/binance-measurement-v2 --run-id binance-measurement-v2 --cost-journal data/cost-journals/binance-carry-v1
+uv run trading-research binance-measurement-journal-run --journal data/measurement-journals/binance-measurement-v2
+uv run trading-research binance-measurement-journal-status --journal data/measurement-journals/binance-measurement-v2 --last 60
+# täglich, neben dem Altersblick auf das neueste Segment:
+uv run trading-research binance-measurement-journal-verify --journal data/measurement-journals/binance-measurement-v2 --since-day <heute-2>
+# wöchentlich in der Montagskette, über die ganze Kette:
+uv run trading-research binance-measurement-journal-verify --journal data/measurement-journals/binance-measurement-v2
+uv run trading-research binance-measurement-journal-snapshot --journal data/measurement-journals/binance-measurement-v2 --output artifacts/cost/binance-measurement-v2-<S>.json --window-start <S-6>T00:00:00Z --window-end <S>T23:59:59Z
+```
+
+`create` übernimmt Stichprobe, Notionals, Tiefenlimit, Takt und erklärte Gebühren
+unverändert aus dem Kostenjournal v1 und hält dessen Spec-Hash fest — beide Journale messen
+dieselben Beine unter einer Ableitung. `run` hält wie v1 eine exklusive Sperre, wird vom
+Startup-Launcher neu gestartet (Exit 1) und prüft beim Resume nur den Schwanz; Exit 2
+heißt gestoppt. Ohne `--rounds` läuft es, bis der Prozess beendet wird. `status` ist nur
+lesend und liefert das Lebenszeichen `newest_age_seconds` neben Fehlerrate und
+ausgeschlossenen Symbolen je Endpunkt. `verify` läuft in zwei Takten, weil ein Neustart nur
+den Schwanz prüft: täglich mit `--since-day <heute-2>`, das nur die Tagesverzeichnisse ab
+diesem Tag öffnet — die Namensliste deckt trotzdem das ganze Journal ab, eine gelöschte oder
+fremde Datei dahinter fällt also weiterhin auf —, und wöchentlich in der Montagskette ohne
+Flag über die **ganze** Kette ab `ZERO_HASH`. `--since-day` nimmt genau `YYYY-MM-DD`, alles
+andere wird abgewiesen; ein Tag, seit dem nichts geschrieben wurde, ist
+`JOURNAL_SINCE_DAY_EMPTY` und damit auf dem Tages-Check genau der gewünschte Alarm. Beide
+enden mit 0 oder 1. `snapshot` versiegelt ein beidseitig geschlossenes Fenster
+(`--window-start`/`--window-end` als ISO-8601-UTC-Stempel `YYYY-MM-DDTHH:MM:SSZ`, alles
+andere wird abgewiesen) zu einer unveränderlichen Quittung, die das Wochenartefakt per Hash
+zitiert. Ein Snapshot ändert **keine** erklärte Kostentabelle: die Tiers der Familie
+bleiben die der v1-Quittung, der Messstrom ist der Kostenmonitor der Papierphase daneben.
+
+Platzbedarf: bei 61 s Takt, rund 490 USDT-Perpetuals und 450 USDT-Spot-Paaren schreibt der
+Strom etwa **75 MB pro Tag**, also rund **27,5 GB im Jahr**. Gelöscht wird hier nichts — die
+Segmente sind unveränderliche Evidenz, und ob und wie archiviert wird, ist eine spätere
+Entscheidung. Die Reserve-Prüfung der Storage-Policy läuft deshalb nicht nur beim Start,
+sondern noch einmal bei jedem UTC-Tageswechsel: ein unterschrittener Freiraum ist dann ein
+benannter `StorageReserveError` mit Exit 1 statt eines ENOSPC mitten im Schreiben.
+
+Nirgends in diesem Pfad existiert eine Order, ein API-Key oder ein Ausführungsadapter.
+
 ## Harte Grenzen
 
 - `tiny_live` wird von der Runtime-Konfiguration abgewiesen.

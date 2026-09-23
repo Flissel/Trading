@@ -18,8 +18,19 @@ from trading_bot.binance_cost_journal import (
     iso_utc_time,
     journal_status,
     load_journal_spec,
+    public_binance_json_array_fetcher,
     public_binance_json_fetcher,
     run_journal,
+)
+from trading_bot.binance_measurement_journal import (
+    BinanceMeasurementJournalSpecError,
+    MeasurementStatus,
+    create_measurement_journal,
+    load_measurement_journal_spec,
+    measurement_status,
+    run_measurement_journal,
+    snapshot_measurement_journal,
+    verify_measurement_journal,
 )
 from trading_bot.carry_fold_run import run_carry_fold
 from trading_bot.carry_holdout_run import run_carry_holdout
@@ -33,12 +44,19 @@ from trading_bot.features import MarketState
 from trading_bot.fold_evaluation import run_fold_evaluation
 from trading_bot.funding_xs_fold_run import run_funding_xs_fold
 from trading_bot.market_capture import capture_public_candle_history, capture_public_candles
-from trading_bot.panel_capture import capture_panel, repair_panel_capture
+from trading_bot.panel_capture import PanelZipClient, capture_panel, repair_panel_capture
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_decision import build_panel_decision
 from trading_bot.panel_fold_run import run_panel_fold
 from trading_bot.panel_samples import publish_panel_walk_forward
 from trading_bot.research_run import run_capture_research
+from trading_bot.shadow_book import ShadowBookError, run_shadow_week
+from trading_bot.shadow_capture import (
+    ShadowCaptureError,
+    ShadowCaptureTransportError,
+    build_shadow_capture,
+)
+from trading_bot.shadow_config import ShadowDeclarationError, load_shadow_declaration
 from trading_bot.storage import StoragePolicy, StoragePolicyError, StorageReserveError
 from trading_bot.strategy import CostScenario
 from trading_bot.trend_fold_run import run_trend_fold
@@ -204,6 +222,68 @@ def main(arguments: list[str] | None = None) -> int:
     journal_status_command.add_argument("--workspace-root", type=Path, default=Path.cwd())
     journal_status_command.add_argument("--journal", type=Path, required=True)
     journal_status_command.add_argument("--last", type=int, default=60)
+    shadow_capture = commands.add_parser("shadow-capture")
+    shadow_capture.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    shadow_capture.add_argument("--base-capture", type=Path, required=True)
+    shadow_capture.add_argument("--output", type=Path, required=True)
+    shadow_capture.add_argument(
+        "--tail-through", required=True, help="the last Sunday to cover, YYYY-MM-DD"
+    )
+    shadow_capture.add_argument("--market", choices=("um", "spot"), required=True)
+    shadow_capture.add_argument(
+        "--previous-capture", type=Path, default=None, help="last week's shadow capture"
+    )
+    shadow_capture.add_argument("--reserve-bytes", type=int, default=20_000_000_000)
+    shadow_week = commands.add_parser("shadow-week")
+    shadow_week.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    shadow_week.add_argument("--declaration", type=Path, required=True)
+    shadow_week.add_argument("--capture", type=Path, required=True)
+    shadow_week.add_argument("--hedge-capture", type=Path, required=True)
+    shadow_week.add_argument("--decision-sunday", required=True)
+    shadow_week.add_argument("--holdout-report", type=Path, default=None)
+    shadow_week.add_argument("--measurement-snapshot", type=Path, default=None)
+    shadow_week.add_argument(
+        "--perp-base-capture",
+        type=Path,
+        default=None,
+        help="the base the weekly perpetual capture extends (ruling 17)",
+    )
+    shadow_week.add_argument("--spot-base-capture", type=Path, default=None)
+    shadow_week.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    measurement_create = commands.add_parser("binance-measurement-journal-create")
+    measurement_create.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    measurement_create.add_argument("--journal", type=Path, required=True)
+    measurement_create.add_argument("--run-id", required=True)
+    measurement_create.add_argument("--cost-journal", type=Path, required=True)
+    measurement_create.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    measurement_run = commands.add_parser("binance-measurement-journal-run")
+    measurement_run.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    measurement_run.add_argument("--journal", type=Path, required=True)
+    measurement_run.add_argument(
+        "--rounds", type=int, default=None, help="omit to sample until the process is stopped"
+    )
+    measurement_run.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
+    measurement_status_command = commands.add_parser("binance-measurement-journal-status")
+    measurement_status_command.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    measurement_status_command.add_argument("--journal", type=Path, required=True)
+    measurement_status_command.add_argument("--last", type=int, default=60)
+    measurement_verify = commands.add_parser("binance-measurement-journal-verify")
+    measurement_verify.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    measurement_verify.add_argument("--journal", type=Path, required=True)
+    measurement_verify.add_argument(
+        "--since-day", default=None, help="bound the walk to this UTC day on (YYYY-MM-DD)"
+    )
+    measurement_snapshot = commands.add_parser("binance-measurement-journal-snapshot")
+    measurement_snapshot.add_argument("--workspace-root", type=Path, default=Path.cwd())
+    measurement_snapshot.add_argument("--journal", type=Path, required=True)
+    measurement_snapshot.add_argument("--output", type=Path, required=True)
+    measurement_snapshot.add_argument(
+        "--window-start", required=True, help="ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    )
+    measurement_snapshot.add_argument(
+        "--window-end", required=True, help="ISO-8601 UTC, YYYY-MM-DDTHH:MM:SSZ"
+    )
+    measurement_snapshot.add_argument("--reserve-bytes", type=int, default=10_000_000_000)
     parsed = parser.parse_args(arguments)
 
     if parsed.command == "demo-backtest":
@@ -476,6 +556,20 @@ def main(arguments: list[str] | None = None) -> int:
         return _binance_cost_journal_finalize(parsed)
     if parsed.command == "binance-cost-journal-status":
         return _binance_cost_journal_status(parsed)
+    if parsed.command == "shadow-capture":
+        return _shadow_capture(parsed)
+    if parsed.command == "shadow-week":
+        return _shadow_week(parsed)
+    if parsed.command == "binance-measurement-journal-create":
+        return _binance_measurement_journal_create(parsed)
+    if parsed.command == "binance-measurement-journal-run":
+        return _binance_measurement_journal_run(parsed)
+    if parsed.command == "binance-measurement-journal-status":
+        return _binance_measurement_journal_status(parsed)
+    if parsed.command == "binance-measurement-journal-verify":
+        return _binance_measurement_journal_verify(parsed)
+    if parsed.command == "binance-measurement-journal-snapshot":
+        return _binance_measurement_journal_snapshot(parsed)
     raise AssertionError("unreachable command")
 
 
@@ -687,6 +781,334 @@ def _print_journal_status(status: JournalStatus, *, last: int) -> None:
             f"premium_index_reason {'-' if degraded is None else degraded}"
         )
     print(f"verify: {'ok' if status.verified else ','.join(status.reasons)}")
+
+
+def _shadow_capture(parsed: argparse.Namespace) -> int:
+    """Publish one weekly shadow capture over a verified base (spec section 3).
+
+    `--previous-capture` is last week's capture of the same market: its tail
+    rows are carried rather than refetched, and the ones a monthly dump has
+    since covered are reconciled against that dump before they are dropped.
+    The first week of a chain is run without it.
+    """
+    workspace: Path = parsed.workspace_root.resolve()
+    base: Path = parsed.base_capture.resolve()
+    output: Path = parsed.output.resolve()
+    previous: Path | None = _resolved(parsed.previous_capture)
+    if _outside(workspace, base, output, previous):
+        return _journal_failure("shadow capture paths must stay inside workspace", 2)
+    try:
+        artifact = build_shadow_capture(
+            workspace_root=workspace,
+            base_capture_root=base,
+            output_directory=output,
+            reserve_bytes=parsed.reserve_bytes,
+            tail_through=parsed.tail_through,
+            market=parsed.market,
+            fetch=PanelZipClient().fetch,
+            previous_capture_root=previous,
+        )
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
+    print(f"shadow capture written: {artifact.capture_root}")
+    print(f"tail_through: {artifact.tail_through}")
+    print(f"capture_root_hash: {artifact.capture_root_hash}")
+    print(f"dataset_root_hash: {artifact.dataset_root_hash}")
+    print(f"reconciled_rows: {artifact.reconciliation['compared_rows']}")
+    # Ruling 23: a rising count is the base falling behind for those symbols,
+    # which is the Monday operator's cue to repair or refresh it.
+    counts = ", ".join(
+        f"{bucket} {len(symbols)}" for bucket, symbols in artifact.stale_symbols.items()
+    )
+    print(f"stale_symbols: {counts}")
+    return 0
+
+
+def _shadow_week(parsed: argparse.Namespace) -> int:
+    """Compute, seal and register one Sunday's shadow book (spec section 4).
+
+    The declaration decides where the artifact and the registry go, so only
+    the inputs are named here. `--perp-base-capture` and `--spot-base-capture`
+    are required exactly when the weekly capture beside them records a base
+    (ruling 17); a monthly capture extends nothing and is run without one.
+    `--holdout-report` belongs to Phase B alone and `--measurement-snapshot`
+    is the week's cited reading of the measurement stream.
+    """
+    workspace: Path = parsed.workspace_root.resolve()
+    declaration: Path = parsed.declaration.resolve()
+    perpetual: Path = parsed.capture.resolve()
+    spot: Path = parsed.hedge_capture.resolve()
+    holdout_report: Path | None = _resolved(parsed.holdout_report)
+    snapshot: Path | None = _resolved(parsed.measurement_snapshot)
+    perp_base: Path | None = _resolved(parsed.perp_base_capture)
+    spot_base: Path | None = _resolved(parsed.spot_base_capture)
+    if _outside(
+        workspace, declaration, perpetual, spot, holdout_report, snapshot, perp_base, spot_base
+    ):
+        return _journal_failure("shadow week paths must stay inside workspace", 2)
+    try:
+        artifact = run_shadow_week(
+            workspace_root=workspace,
+            declaration_path=declaration,
+            perp_capture_root=perpetual,
+            spot_capture_root=spot,
+            decision_sunday=parsed.decision_sunday,
+            holdout_report_path=holdout_report,
+            measurement_snapshot_path=snapshot,
+            perp_base_capture_root=perp_base,
+            spot_base_capture_root=spot_base,
+            reserve_bytes=parsed.reserve_bytes,
+        )
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        refused = _shadow_refusal_path(workspace, declaration, parsed.decision_sunday)
+        if refused is not None and refused.exists():
+            print(f"refused document: {refused}", file=sys.stderr)
+        return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
+    print(f"shadow week written: {artifact.output_path}")
+    print(f"report hash: {artifact.report_hash}")
+    print(f"status: {artifact.status}")
+    return 0
+
+
+def _shadow_refusal_path(
+    workspace: Path, declaration_path: Path, decision_sunday: str
+) -> Path | None:
+    """`<workspace>/<artifact_root>/<family_name>/<S>-refused.json`, or nothing.
+
+    A refusal after the inputs verified is recorded beside the week that was
+    not written (spec section 6), and the declaration -- not the command line
+    -- says where that is. Nothing is returned where the declaration is the
+    thing that could not be read: there is no artifact root to name then, and
+    no document was written either.
+    """
+    try:
+        declaration, _ = load_shadow_declaration(declaration_path)
+    except ShadowDeclarationError:
+        return None
+    return (
+        workspace
+        / declaration.artifact_root
+        / declaration.family_name
+        / f"{decision_sunday}-refused.json"
+    )
+
+
+def _binance_measurement_journal_create(parsed: argparse.Namespace) -> int:
+    """Declare the permanent measurement journal from the cost journal's sample."""
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    cost_journal: Path = parsed.cost_journal.resolve()
+    if _outside(workspace, journal, cost_journal):
+        return _journal_failure("binance measurement journal paths must stay inside workspace", 2)
+    try:
+        create_measurement_journal(
+            workspace_root=workspace,
+            journal_root=journal,
+            reserve_bytes=parsed.reserve_bytes,
+            run_id=parsed.run_id,
+            cost_journal_root=cost_journal,
+        )
+        spec, _ = load_measurement_journal_spec(journal)
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
+    print(f"binance measurement journal created: {spec.run_id}")
+    print(
+        f"{len(spec.instruments)} instruments every {spec.sample_interval_seconds} s, "
+        f"continuing cost journal spec {spec.cost_journal_spec_hash}"
+    )
+    return 0
+
+
+def _binance_measurement_journal_run(parsed: argparse.Namespace) -> int:
+    """Append rounds to the journal; without `--rounds`, until the process stops."""
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    if _outside(workspace, journal):
+        return _journal_failure("binance measurement journal paths must stay inside workspace", 2)
+    try:
+        run_measurement_journal(
+            workspace_root=workspace,
+            journal_root=journal,
+            reserve_bytes=parsed.reserve_bytes,
+            rounds=parsed.rounds,
+            fetcher=public_binance_json_fetcher,
+            array_fetcher=public_binance_json_array_fetcher,
+        )
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
+    return 0
+
+
+def _binance_measurement_journal_status(parsed: argparse.Namespace) -> int:
+    """Report the stream's tip; 0 when its tail verifies, 1 when it does not."""
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    if _outside(workspace, journal):
+        return _journal_failure("binance measurement journal paths must stay inside workspace", 2)
+    try:
+        status = measurement_status(journal, last=parsed.last)
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
+    _print_measurement_status(status, last=parsed.last)
+    return 0 if status.verify_ok else 1
+
+
+def _binance_measurement_journal_verify(parsed: argparse.Namespace) -> int:
+    """Walk the whole chain; 0 when it verifies, 1 when it does not.
+
+    The daily liveness check runs this and not `status`: a restart verifies
+    the tail alone (ruling 13), so corruption older than the two newest day
+    directories sits unnoticed until the chain is walked. It runs it with
+    `--since-day <today-2>`, which bounds the reading to those days while the
+    layout listing still covers the whole journal (ruling 24); the weekly
+    Monday chain runs it without one, over the whole history. The walk never
+    raises -- an unreadable spec is a reason like any other -- so the only
+    refusals here are a path outside the workspace and a day that is not one.
+    """
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    if _outside(workspace, journal):
+        return _journal_failure("binance measurement journal paths must stay inside workspace", 2)
+    try:
+        since_day = None if parsed.since_day is None else _utc_day(parsed.since_day)
+    except ValueError as error:
+        return _journal_failure(str(error), 2)
+    verified, reasons = verify_measurement_journal(journal, since_day=since_day)
+    print(f"verify: {'ok' if verified else ','.join(reasons)}")
+    return 0 if verified else 1
+
+
+def _binance_measurement_journal_snapshot(parsed: argparse.Namespace) -> int:
+    """Seal the rounds inside a closed window into an immutable reading."""
+    workspace: Path = parsed.workspace_root.resolve()
+    journal: Path = parsed.journal.resolve()
+    output: Path = parsed.output.resolve()
+    if _outside(workspace, journal, output):
+        return _journal_failure("binance measurement journal paths must stay inside workspace", 2)
+    try:
+        window_start_ns = _utc_stamp_ns(parsed.window_start)
+        window_end_ns = _utc_stamp_ns(parsed.window_end)
+    except ValueError as error:
+        return _journal_failure(str(error), 2)
+    try:
+        written = snapshot_measurement_journal(
+            workspace_root=workspace,
+            journal_root=journal,
+            output_path=output,
+            reserve_bytes=parsed.reserve_bytes,
+            window_start_ns=window_start_ns,
+            window_end_ns=window_end_ns,
+        )
+    except Exception as error:  # the supervisor reads the code, not the traceback
+        return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
+    # The hash a weekly shadow artifact cites, read back off the published bytes.
+    document = json.loads(written.read_text(encoding="utf-8"))
+    print(f"binance measurement snapshot written: {written}")
+    print(f"snapshot content hash: {document['content_hash']}")
+    print(f"rounds: {document['rounds']}")
+    return 0
+
+
+def _print_measurement_status(status: MeasurementStatus, *, last: int) -> None:
+    """One field a line, as `_print_journal_status` prints v1's.
+
+    `newest_age_seconds` is the liveness figure the 2026-09-17 lesson asks
+    for, and the failure rate belongs beside the exclusions: an endpoint that
+    quietly stops measuring symbols raises the second long before the first.
+    """
+    print(f"segment_count: {status.segment_count}")
+    print(f"last_sequence: {status.last_sequence}")
+    print(f"newest_received_time: {iso_utc_time(status.newest_received_time_ns)}")
+    print(f"newest_age_seconds: {status.newest_age_seconds}")
+    print(f"window: last {last} segments")
+    print(f"snapshot_rounds: {status.snapshot_rounds}")
+    for endpoint, rate in status.failure_rate.items():
+        print(f"failure_rate {endpoint}: {rate}")
+    for endpoint, excluded in status.excluded_total.items():
+        print(f"excluded_total {endpoint}: {excluded}")
+    print(f"depth_failure_rate: {status.depth_failure_rate}")
+    print(f"verify: {'ok' if status.verify_ok else ','.join(status.verify_reasons)}")
+
+
+def _utc_day(value: str) -> str:
+    """A `YYYY-MM-DD` UTC day, spelled the way a day directory names itself.
+
+    One spelling only, for the reason a snapshot window has one: a day read
+    loosely bounds the verification somewhere other than where the operator
+    asked, and a walk that quietly checked the wrong days reports a healthy
+    journal without having looked at it.
+    """
+    try:
+        day = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=UTC)
+    except ValueError:
+        raise ValueError(
+            f"a verification day is a UTC day (YYYY-MM-DD), not {value!r}"
+        ) from None
+    if day.strftime("%Y-%m-%d") != value:
+        # `strptime` reads `2026-9-23` as the twenty-third; the day
+        # directories are zero-padded and a string comparison against an
+        # unpadded day would bound the walk at the wrong place entirely.
+        raise ValueError(f"a verification day is a UTC day (YYYY-MM-DD), not {value!r}")
+    return value
+
+
+def _utc_stamp_ns(value: str) -> int:
+    """An ISO-8601 UTC stamp `YYYY-MM-DDTHH:MM:SSZ` as nanoseconds.
+
+    A snapshot window is written by hand, so exactly one spelling is read: a
+    bare date, a local offset or anything else is refused rather than guessed
+    at, because a window guessed wrong seals the wrong rounds into a document
+    that a weekly shadow artifact then cites by hash.
+    """
+    try:
+        stamp = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        raise ValueError(
+            "a snapshot window is an ISO-8601 UTC stamp (YYYY-MM-DDTHH:MM:SSZ), "
+            f"not {value!r}"
+        ) from None
+    return int(stamp.timestamp()) * 1_000_000_000
+
+
+def _resolved(path: Path | None) -> Path | None:
+    """An optional path argument, resolved where one was given."""
+    return None if path is None else path.resolve()
+
+
+def _outside(workspace: Path, *paths: Path | None) -> bool:
+    """True when any given path leaves the workspace; absent paths are no path."""
+    return any(path is not None and not path.is_relative_to(workspace) for path in paths)
+
+
+# Refusals a rerun cannot fix: a declaration that does not read, a base a
+# capture does not extend, a reconciliation mismatch, a journal spec that
+# changed under a running stream, an output that already exists, and a storage
+# authorisation that is not about free space. `StorageReserveError` is a
+# subclass of `StoragePolicyError` and is judged before this tuple is reached.
+_SHADOW_REFUSALS: tuple[type[Exception], ...] = (
+    ShadowCaptureError,
+    ShadowBookError,
+    ShadowDeclarationError,
+    BinanceMeasurementJournalSpecError,
+    StoragePolicyError,
+)
+
+
+def _shadow_exit_code(error: Exception) -> int:
+    """`_journal_exit_code`'s policy over the shadow and measurement errors.
+
+    2 stops the supervisor on what the same command would keep hitting; 1 is
+    worth another attempt -- a dump the venue has not published this hour, a
+    round in which every request failed, a transport that dropped, and the
+    free-space reserve, which is the one thing here that changes on its own.
+
+    `ShadowCaptureTransportError` is named here rather than left to the
+    fall-through (ruling 21(a)): it is a `ShadowCaptureError`, and every other
+    one of those is a fact about the inputs that stops the supervisor.
+    """
+    if isinstance(error, StorageReserveError | ShadowCaptureTransportError):
+        return 1
+    return 2 if isinstance(error, _SHADOW_REFUSALS) else 1
 
 
 def _journal_exit_code(error: Exception) -> int:

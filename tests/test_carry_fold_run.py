@@ -42,18 +42,25 @@ from trading_bot.carry_fold_run import (
     FOLD_WARMED_REASON_CODE,
     CarryFoldError,
     DecisionRun,
+    FinalBook,
+    _final_books,
     control_reference,
     evaluate_carry_decisions,
+    load_decision_inputs,
     run_carry_fold,
     warm_up_weeks_of,
 )
-from trading_bot.carry_signals import hurdle_minimum_trailing, random_pair_order
+from trading_bot.carry_signals import (
+    WEEK_NS,
+    Cohort,
+    CohortEntry,
+    hurdle_minimum_trailing,
+    random_pair_order,
+)
 from trading_bot.carry_universe import EligiblePair, PairUniverseSnapshot
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_fold_run import verify_panel_fold_report
-from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
-from trading_bot.panel_universe import build_contract_histories
 from trading_bot.registry import MetadataRegistry
 
 Workspace = tuple[Path, Path, Path, Path]  # root, perp capture, spot capture, config
@@ -1082,14 +1089,17 @@ def test_a_universe_too_small_week_empties_every_slot(
 
 
 def _decision_runner(
-    space: Workspace, fold_index: int = 0
+    space: Workspace, fold_index: int = 0, *, decisions: list[int] | None = None
 ) -> Callable[[tuple[str, ...] | None], DecisionRun]:
-    """Load one fold's bars, funding and decisions as `run_carry_fold` does,
-    and hand back a caller that evaluates them for a choice of candidates.
+    """Load one fold's inputs through `load_decision_inputs` -- the loader
+    `run_carry_fold` itself calls -- and hand back a caller that evaluates
+    them for a choice of candidates.
 
     The holdout runner will load the same way and call the same function with
     its own decisions, so a full run and a filtered one are compared here over
     one set of inputs, with nothing between them but `candidate_names`.
+    `decisions` overrides the fold's own list, which is how a run is made to
+    end on a chosen Sunday over the same loaded inputs.
     """
     root, perp, spot, config_path = space
     spec, _ = load_carry_family_spec(config_path)
@@ -1099,26 +1109,21 @@ def _decision_runner(
         if item["fold_index"] == fold_index
     )
     test_end_ns = int(fold["test_end_ns"])
-    perp_histories = build_contract_histories(
-        load_panel_bars(perp / "dataset", available_before_ns=test_end_ns + 1)
+    inputs = load_decision_inputs(
+        perp / "dataset", spot / "dataset", available_before_ns=test_end_ns + 1
     )
-    spot_histories = build_contract_histories(
-        load_panel_bars(spot / "dataset", available_before_ns=test_end_ns + 1)
+    evaluated = (
+        sorted(int(str(value).split(":")[1]) for value in fold["test_ids"])
+        if decisions is None
+        else decisions
     )
-    leg_histories = {f"perp:{cid}": history for cid, history in perp_histories.items()}
-    leg_histories.update({f"spot:{cid}": history for cid, history in spot_histories.items()})
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
-    for event in load_funding_events(perp / "dataset"):
-        leg_key = f"perp:{event.contract_id}"
-        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
-    decisions = sorted(int(str(value).split(":")[1]) for value in fold["test_ids"])
 
     def evaluate(candidate_names: tuple[str, ...] | None) -> DecisionRun:
         return evaluate_carry_decisions(
             spec,
-            perp_histories=perp_histories, spot_histories=spot_histories,
-            leg_histories=leg_histories, funding_by_leg=funding_by_leg,
-            decisions=decisions, candidate_names=candidate_names,
+            perp_histories=inputs.perp_histories, spot_histories=inputs.spot_histories,
+            leg_histories=inputs.leg_histories, funding_by_leg=inputs.funding_by_leg,
+            decisions=evaluated, candidate_names=candidate_names,
         )
 
     return evaluate
@@ -1183,3 +1188,237 @@ def test_an_undeclared_candidate_name_is_refused(v4_workspace: Workspace) -> Non
     evaluate = _decision_runner(v4_workspace)
     with pytest.raises(CarryFoldError):
         evaluate(("carry_s10_l4w_h26w_exit", "carry_l4w_h26w_exit"))
+
+
+# --- the book a decision run ends on ------------------------------------------
+
+
+def _decisions(root: Path) -> list[int]:
+    """Fold 0's decision closes, in the order the runner evaluates them."""
+    return [int(value.split(":")[1]) for value in _ordered_test_sample_ids(root)]
+
+
+def _last_episode(run: DecisionRun, name: str) -> dict[str, object]:
+    """The candidate's last base-scenario episode, as the decision loop left
+    it -- Decimals, before the report stringifies them."""
+    record = next(item for item in run.candidates if item["candidate_name"] == name)
+    return _object_dict(_object_list(_object_dict(record["base"])["episodes"])[-1])
+
+
+def _contributing_pairs(episode: dict[str, object]) -> set[str]:
+    """The pairs an episode attributed money to."""
+    pairs: set[str] = set()
+    for item in _object_list(episode["contract_net_contributions"]):
+        assert isinstance(item, list) and len(item) == 2
+        pair_id, amount = item
+        assert isinstance(pair_id, str) and isinstance(amount, Decimal)
+        if amount != 0:
+            pairs.add(pair_id)
+    return pairs
+
+
+def _gross_exposure(episode: dict[str, object]) -> Decimal:
+    value = episode["gross_exposure"]
+    assert isinstance(value, Decimal)
+    return value
+
+
+def test_the_final_book_of_a_slot_member_is_its_last_decision_s_slots(
+    v4_workspace: Workspace,
+) -> None:
+    """Spec 4.1: the last decision's slot state and leg weights are the book.
+
+    The two slots the exit member ends fold 0 on are the two pairs its last
+    episode traded -- the same book stated as slots and as weights -- and the
+    weights are the declared book's, not a proportional one: four slots, two
+    filled, so each pair carries a quarter of the book as spot +1/8 and
+    perpetual -1/8.
+    """
+    space = v4_workspace
+    run = _decision_runner(space)(None)
+    name = MEMBER_NAMES_V4[3]
+    book = run.final_books[name]
+    assert book.decision_close_ns == _decisions(space[0])[-1]
+    episode = _last_episode(run, name)
+    assert {slot.pair_id for slot in book.slots} == _contributing_pairs(episode)
+    assert len(book.slots) == 2
+    weights = dict(book.leg_weights)
+    assert len(weights) == 2 * len(book.slots)
+    for slot in book.slots:
+        assert weights[slot.spot_leg] == Decimal(1) / 8
+        assert weights[slot.perpetual_leg] == -Decimal(1) / 8
+    filled = Decimal(len(book.slots))
+    assert sum((w for w in weights.values() if w > 0), Decimal(0)) == filled / 4 / 2
+    assert sum((w for w in weights.values() if w < 0), Decimal(0)) == -filled / 4 / 2
+    # the weights are the ones the episode was actually evaluated on
+    assert sum((abs(w) for w in weights.values()), Decimal(0)) == _gross_exposure(episode)
+    # sorted by leg id, so one week's book is byte-stable
+    assert list(book.leg_weights) == sorted(book.leg_weights)
+
+
+def test_a_slot_s_weeks_held_counts_from_the_sunday_it_was_entered(
+    v4_workspace_with_one_negative_week: Workspace,
+) -> None:
+    """A slot carries the Sunday it was entered, so the book says how long
+    each pair has been held rather than only what is held. The exit member
+    empties C10USDT's slot at the second decision and refills it there, so it
+    ends the fold holding one week-old slot beside one opened that week."""
+    space = v4_workspace_with_one_negative_week
+    run = _decision_runner(space)(None)
+    decisions = _decisions(space[0])
+    book = run.final_books[MEMBER_NAMES_V4[3]]
+    assert [slot.entry_decision_close_ns for slot in book.slots] == [
+        decisions[1], decisions[2],
+    ]
+    assert [slot.weeks_held for slot in book.slots] == [1, 0]
+    for slot in book.slots:
+        assert slot.weeks_held == (decisions[-1] - slot.entry_decision_close_ns) // WEEK_NS
+
+
+def test_a_cohort_candidate_s_final_book_carries_no_slots(v2_workspace: Workspace) -> None:
+    """A weekly cohort is not a slot, so a cohort family reports no slot state
+    -- its book is the leg weights `assemble_book` handed the last episode.
+
+    v2's hold-26 member ends fold 0 on the fixture's two top payers. Each of
+    its live cohorts sits on 1/26 of capital split over the two, so a pair
+    carries 1/52 per cohort and a leg half of that, 1/104. Fifteen cohorts are
+    live at the last decision -- the fixture's capture is too short to warm
+    all twenty-six, and an unwarmed cohort leaves its share undeployed rather
+    than redistributing it -- so every leg is 15/104 and the book is
+    deliberately less than fully deployed.
+    """
+    run = _decision_runner(v2_workspace)(None)
+    for name in MEMBER_NAMES_V2 + CONTROL_NAMES:
+        assert run.final_books[name].slots == (), name
+    assert run.final_books["no_trade"].leg_weights == ()
+    name = MEMBER_NAMES_V2[0]
+    book = run.final_books[name]
+    weights = dict(book.leg_weights)
+    assert {leg.split(":")[1] for leg in weights} == set(TOP_PAYING_SYMBOLS)
+    assert {leg.split(":")[0] for leg in weights} == {"perp", "spot"}
+    leg_share = Decimal(15) / 104
+    for leg, weight in weights.items():
+        assert weight == (leg_share if leg.startswith("spot:") else -leg_share), leg
+    assert sum(weights.values(), Decimal(0)) == 0
+    total = sum((abs(w) for w in weights.values()), Decimal(0))
+    assert total == 4 * leg_share == _gross_exposure(_last_episode(run, name))
+
+
+def test_a_run_with_no_decisions_has_no_final_books(v4_workspace: Workspace) -> None:
+    """An empty decision list evaluates nothing, so there is no last decision
+    and no book -- and the field is additive, so a `DecisionRun` built without
+    one is empty rather than absent."""
+    spec, _ = load_carry_family_spec(v4_workspace[3])
+    run = evaluate_carry_decisions(
+        spec, perp_histories={}, spot_histories={}, leg_histories={},
+        funding_by_leg={}, decisions=[],
+    )
+    assert run.final_books == {}
+    assert run.episode_count == 0
+    assert DecisionRun(
+        candidates=[], skipped_sample_ids=[], episode_count=0, reason_codes=[],
+        warm_up_weeks=0,
+    ).final_books == {}
+
+
+def test_a_slot_that_holds_more_than_one_pair_is_refused() -> None:
+    """Fail closed: a slot holds exactly one pair, so a slot list that has
+    drifted into a multi-pair cohort is a bug in the slot bookkeeping rather
+    than a book to report -- and the same cohort under a candidate that never
+    ran the slot book is simply not slot state."""
+    def entry(pair_id: str) -> CohortEntry:
+        return CohortEntry(
+            pair_id=pair_id,
+            perpetual_leg=f"perp:{pair_id}",
+            spot_leg=f"spot:{pair_id}",
+            tier=1,
+        )
+
+    crowded = Cohort(0, (entry("A"), entry("B")), ())
+    with pytest.raises(CarryFoldError, match="a slot holds exactly one"):
+        _final_books(
+            {"member": (crowded,)},
+            leg_weights={"member": ()},
+            decision_close_ns=WEEK_NS,
+            slot_names={"member"},
+        )
+    books = _final_books(
+        {"member": (crowded,)},
+        leg_weights={"member": ()},
+        decision_close_ns=WEEK_NS,
+        slot_names=set(),
+    )
+    assert books["member"].slots == ()
+
+
+def test_a_skipped_last_decision_leaves_every_candidate_on_an_empty_book(
+    v4_workspace_with_a_liquidity_dip: Workspace,
+) -> None:
+    """A shadow week is these fold mechanics unchanged (spec 4.1), and the
+    runner empties every slot on a week whose universe is too small. So a run
+    that ends on the skipped Sunday ends on an empty book dated to it, not on
+    the book of the last decision that traded -- and every candidate is on
+    one, whether or not it ran the slot book."""
+    space = v4_workspace_with_a_liquidity_dip
+    decisions = _decisions(space[0])
+    names = list(MEMBER_NAMES_V4 + CONTROL_NAMES)
+    # the decision before the skip trades a real book ...
+    traded = _decision_runner(space, decisions=decisions[:1])(None)
+    assert traded.skipped_sample_ids == []
+    assert traded.final_books[MEMBER_NAMES_V4[3]].slots != ()
+    assert traded.final_books[MEMBER_NAMES_V4[3]].decision_close_ns == decisions[0]
+    # ... and the skip that follows it resets the book rather than leaving it
+    run = _decision_runner(space, decisions=decisions[:2])(None)
+    assert run.skipped_sample_ids == [f"BINANCE_UM:{decisions[1]}:w1"]
+    assert sorted(run.final_books) == sorted(names)
+    empty = FinalBook(decision_close_ns=decisions[1], slots=(), leg_weights=())
+    for name in names:
+        assert run.final_books[name] == empty, name
+
+
+def test_a_run_whose_every_decision_is_skipped_still_reports_its_empty_book(
+    v4_workspace_with_a_liquidity_dip: Workspace,
+) -> None:
+    """One skipped decision and nothing else: no episode was evaluated, but a
+    decision was, so the run reports the flat book that decision left rather
+    than no book at all -- which is what an empty decision list reports."""
+    space = v4_workspace_with_a_liquidity_dip
+    skipped_close = _decisions(space[0])[1]
+    run = _decision_runner(space, decisions=[skipped_close])(None)
+    assert run.episode_count == 0
+    assert run.skipped_sample_ids == [f"BINANCE_UM:{skipped_close}:w1"]
+    empty = FinalBook(decision_close_ns=skipped_close, slots=(), leg_weights=())
+    assert run.final_books == {name: empty for name in MEMBER_NAMES_V4 + CONTROL_NAMES}
+
+
+def test_a_pair_force_closed_by_the_last_episode_is_still_in_the_book(
+    v4_workspace_with_a_hole: Workspace,
+) -> None:
+    """The book is the state the decision traded on, not what survived its
+    episode.
+
+    The hole symbol loses its perpetual bar during the week after the second
+    decision, so that episode force-closes the leg and the runner strips the
+    pair from the slot it was filling -- but the decision did trade it, so the
+    book still names its slot and still carries its weights. This is not a
+    corner: a shadow week's last episode is exited past the end of the capture,
+    so every leg is force-closed there and a book read after the episode would
+    always be empty while the weights it traded were real.
+    """
+    space = v4_workspace_with_a_hole
+    decisions = _decisions(space[0])
+    name = MEMBER_NAMES_V4[2]
+    run = _decision_runner(space, decisions=decisions[:2])(None)
+    episode = _last_episode(run, name)
+    assert episode["forced_close_count"] == 1
+    book = run.final_books[name]
+    assert book.decision_close_ns == decisions[1]
+    assert len(book.slots) == 2
+    assert HOLE_SYMBOL in {slot.pair_id.split(":")[0] for slot in book.slots}
+    # slots and leg weights are one book: the forced close thins neither
+    weights = dict(book.leg_weights)
+    assert len(weights) == 2 * len(book.slots)
+    for slot in book.slots:
+        assert weights[slot.spot_leg] == Decimal(1) / 8
+        assert weights[slot.perpetual_leg] == -Decimal(1) / 8
+    assert sum((abs(w) for w in weights.values()), Decimal(0)) == _gross_exposure(episode)

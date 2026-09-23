@@ -2,7 +2,7 @@
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -35,7 +35,12 @@ from trading_bot.carry_signals import (
 from trading_bot.carry_universe import PairUniverseSnapshot, select_pair_universe
 from trading_bot.panel_capture import verify_panel_capture
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
-from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
+from trading_bot.panel_reader import (
+    FundingEvent,
+    PanelBar,
+    load_funding_events,
+    load_panel_bars,
+)
 from trading_bot.panel_samples import verify_panel_manifest
 from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.registry import ExperimentRecord, MetadataRegistry
@@ -110,12 +115,118 @@ class CarryFoldArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class SlotEntry:
+    """One filled slot of the book a decision run's last decision traded on.
+
+    Spec 4.1 reads the shadow book off the last decision's slot state, and
+    spec 4.2 states that book per slot: the pair, the Sunday it was entered
+    and how many weeks it has been held. So a slot says all three rather than
+    only naming the pair and leaving a reader to rediscover its age.
+    """
+
+    pair_id: str
+    perpetual_leg: str
+    spot_leg: str
+    tier: int
+    entry_decision_close_ns: int
+    weeks_held: int
+
+
+@dataclass(frozen=True, slots=True)
+class FinalBook:
+    """The book one candidate's last decision in a run traded on (spec 4.1).
+
+    `slots` and `leg_weights` are one and the same book, stated twice: the
+    slot state the last decision traded on -- after its releases, exit-rule
+    removals, untradeable drops and fills -- and the leg weights assembled
+    from exactly that state. Both are taken before the decision's episode, so
+    neither is emptied by the forced closes that end an episode whose exit
+    week reaches past the capture, nor thinned by the age prune that bounds
+    state for a decision that never ran. A cohort candidate has no slots -- a
+    weekly cohort is not a slot and reading it as one would invent a book --
+    so `slots` is empty for it and `leg_weights` is its whole book. A last
+    decision skipped for want of a universe leaves both empty at that Sunday's
+    close, because the runner resets its state there and the book is the
+    runner's state, reset included.
+    """
+
+    decision_close_ns: int
+    slots: tuple[SlotEntry, ...]
+    leg_weights: tuple[tuple[str, Decimal], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class DecisionInputs:
+    """Everything `evaluate_carry_decisions` reads, loaded from two datasets.
+
+    The loop takes four separate mappings, and how they are built -- which
+    bars a decision may see, what a leg key looks like, which market carries
+    the funding -- is part of the mechanics, not of the caller. Carrying them
+    together means the fold runner, the weekly shadow book and the tests that
+    pin one against the other cannot load them differently: a pin that
+    compares two evaluations over separately assembled inputs proves only that
+    the loop agrees with itself.
+
+    `perp_bars` is kept because the rebalance calendar is the perpetual
+    panel's -- a caller deriving its own decisions from
+    `panel_samples.rebalance_close_times` reads them here rather than loading
+    the same parquet a second time. The spot bars are not kept: nothing asks
+    the hedge for a calendar, and a second bar tuple nobody reads is weight.
+    """
+
+    perp_bars: tuple[PanelBar, ...]
+    perp_histories: dict[str, ContractHistory]
+    spot_histories: dict[str, ContractHistory]
+    leg_histories: dict[str, ContractHistory]
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]]
+
+
+def load_decision_inputs(
+    perp_dataset_root: Path, spot_dataset_root: Path, *, available_before_ns: int
+) -> DecisionInputs:
+    """Load both markets' bars, histories and funding for one decision window.
+
+    The one loader every caller of `evaluate_carry_decisions` goes through.
+    `available_before_ns` is the point-in-time boundary the caller owns -- a
+    fold uses its test end, a shadow week its Sunday -- but everything after
+    it is fixed here: a leg is `perp:<contract id>` or `spot:<contract id>`,
+    the funding is the perpetual market's and is indexed by the perpetual
+    leg, and the spot dataset contributes histories only.
+    """
+    perp_bars = load_panel_bars(perp_dataset_root, available_before_ns=available_before_ns)
+    spot_bars = load_panel_bars(spot_dataset_root, available_before_ns=available_before_ns)
+    perp_histories = build_contract_histories(perp_bars)
+    spot_histories = build_contract_histories(spot_bars)
+    leg_histories: dict[str, ContractHistory] = {}
+    for contract_id, history in perp_histories.items():
+        leg_histories[f"perp:{contract_id}"] = history
+    for contract_id, history in spot_histories.items():
+        leg_histories[f"spot:{contract_id}"] = history
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
+    for event in load_funding_events(perp_dataset_root):
+        leg_key = f"perp:{event.contract_id}"
+        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
+    return DecisionInputs(
+        perp_bars=perp_bars,
+        perp_histories=perp_histories,
+        spot_histories=spot_histories,
+        leg_histories=leg_histories,
+        funding_by_leg=funding_by_leg,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionRun:
     """What evaluating a list of decisions produced, before it is sealed.
 
     Exactly the parts of a fold report that come out of the decision loop
     rather than out of the manifest, so a fold report and a holdout read are
     assembled from one evaluation rather than from two copies of it.
+
+    `final_books` is additive and defaults to empty: no fold report material
+    reads it, and a caller that wants the book the run ended on -- the weekly
+    shadow book, which is exactly one run of this loop (spec 4.1) -- reads it
+    instead of re-deriving a book from a second copy of the rules.
     """
 
     candidates: list[dict[str, object]]
@@ -123,6 +234,7 @@ class DecisionRun:
     episode_count: int
     reason_codes: list[str]
     warm_up_weeks: int
+    final_books: dict[str, FinalBook] = field(default_factory=dict)
 
 
 def run_carry_fold(
@@ -185,26 +297,18 @@ def run_carry_fold(
         raise CarryFoldError(f"fold {fold_index} is not in the manifest")
 
     test_end_ns = int(fold["test_end_ns"])
-    perp_bars = load_panel_bars(perp_capture_root / "dataset", available_before_ns=test_end_ns + 1)
-    spot_bars = load_panel_bars(spot_capture_root / "dataset", available_before_ns=test_end_ns + 1)
-    perp_histories = build_contract_histories(perp_bars)
-    spot_histories = build_contract_histories(spot_bars)
-    leg_histories: dict[str, ContractHistory] = {}
-    for cid, history in perp_histories.items():
-        leg_histories[f"perp:{cid}"] = history
-    for cid, history in spot_histories.items():
-        leg_histories[f"spot:{cid}"] = history
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
-    for event in load_funding_events(perp_capture_root / "dataset"):
-        leg_key = f"perp:{event.contract_id}"
-        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
+    inputs = load_decision_inputs(
+        perp_capture_root / "dataset",
+        spot_capture_root / "dataset",
+        available_before_ns=test_end_ns + 1,
+    )
 
     test_ids = [str(value) for value in fold["test_ids"]]
     decisions = sorted(int(value.split(":")[1]) for value in test_ids)
     run = evaluate_carry_decisions(
         spec,
-        perp_histories=perp_histories, spot_histories=spot_histories,
-        leg_histories=leg_histories, funding_by_leg=funding_by_leg,
+        perp_histories=inputs.perp_histories, spot_histories=inputs.spot_histories,
+        leg_histories=inputs.leg_histories, funding_by_leg=inputs.funding_by_leg,
         decisions=decisions,
     )
     material: dict[str, object] = {
@@ -363,6 +467,20 @@ def evaluate_carry_decisions(
     # The last evaluated decision's tiers, which price the fold's uncharged
     # final exit; empty until the first decision that is not skipped.
     tiers: dict[str, int] = {}
+    # Spec 4.1's book, recorded per decision rather than read off the live
+    # state after the loop, so that all three parts of a book are one and the
+    # same decision's. Recorded where the decision's weights are assembled,
+    # which is the state it traded on: what follows in the loop body is the
+    # episode, whose forced closes strip pairs, and the prune, which bounds
+    # state for the next decision -- and a week's last episode is exited past
+    # the end of the capture, so it force-closes every leg and would leave
+    # every book empty. A shadow week is these fold mechanics unchanged, so
+    # every decision records -- a skipped one included, which is why the skip
+    # branch below records its reset rather than leaving the last decision that
+    # traded standing as the book.
+    last_weights: dict[str, tuple[tuple[str, Decimal], ...]] = {}
+    last_slot_state: dict[str, tuple[Cohort, ...]] = {}
+    last_decision_close_ns: int | None = None
     for decision_close_ns in decisions:
         sample_id = f"BINANCE_UM:{decision_close_ns}:w1"
         snapshot = select_pair_universe(
@@ -375,6 +493,12 @@ def evaluate_carry_decisions(
                 carried[episode_key] = ()
             for name in names:
                 cohorts[name] = []
+                # The book mirrors the reset the line above applies: a skipped
+                # last decision ends the run flat at this Sunday's close, on
+                # nothing held and nothing traded.
+                last_slot_state[name] = ()
+                last_weights[name] = ()
+            last_decision_close_ns = decision_close_ns
             continue
         # Tiers follow P1.27: this week's universe tier, tier two for a leg that
         # is only being exited (see panel_accounting's `tiers.get(id, 2)`).
@@ -462,6 +586,8 @@ def evaluate_carry_decisions(
                     key: Decimal(value)
                     for key, value in zip(_SLOT_EXTRA_KEYS, counts, strict=True)
                 })
+            last_weights[name] = weights
+            last_slot_state[name] = tuple(cohorts[name])
             held_nothing[name].append(name in members and not weights)
             forced_pairs: set[str] = set()
             for scenario in scenarios:
@@ -487,6 +613,7 @@ def evaluate_carry_decisions(
             cohorts[name] = [
                 c for c in cohorts[name] if decision_close_ns - c.decision_close_ns < longest
             ]
+        last_decision_close_ns = decision_close_ns
 
     episode_count = len(episodes[(names[0], "base")]) if names else 0
     # Spec 3.3: what liquidating the fold's last book would cost, stated
@@ -534,13 +661,77 @@ def evaluate_carry_decisions(
         }
         for name in names
     ]
+    final_books: dict[str, FinalBook] = (
+        {}
+        if last_decision_close_ns is None
+        else _final_books(
+            last_slot_state,
+            leg_weights=last_weights,
+            decision_close_ns=last_decision_close_ns,
+            slot_names=slot_names,
+        )
+    )
     return DecisionRun(
         candidates=candidates,
         skipped_sample_ids=skipped,
         episode_count=episode_count,
         reason_codes=reason_codes,
         warm_up_weeks=warm_up_weeks,
+        final_books=final_books,
     )
+
+
+def _final_books(
+    slot_state: dict[str, tuple[Cohort, ...]],
+    *,
+    leg_weights: dict[str, tuple[tuple[str, Decimal], ...]],
+    decision_close_ns: int,
+    slot_names: set[str],
+) -> dict[str, FinalBook]:
+    """The book each candidate's last decision traded on, as the loop recorded it.
+
+    Spec 4.1 makes the last decision's slot state and leg weights the book, so
+    both are read off the state that decision assembled its weights from,
+    rather than recomputed from a second copy of the rules. Only a slot family
+    has slots; a slot is a `Cohort` holding exactly one pair, so anything else
+    is a bug in the slot bookkeeping and is refused rather than guessed at. A
+    run with no decisions at all recorded nothing and so has no books, which
+    is why this iterates the recorded weights; a run whose decisions were all
+    skipped recorded each reset and so has an empty book per candidate rather
+    than none.
+    """
+    books: dict[str, FinalBook] = {}
+    for name, weights in leg_weights.items():
+        slots: list[SlotEntry] = []
+        if name in slot_names:
+            for slot in slot_state[name]:
+                # Deliberately stricter than `assemble_slot_book`, which
+                # refuses only more than one entry: an emptied slot is dropped
+                # on every live path (`_without_pairs(..., drop_empty=True)`),
+                # so a zero-entry slot reaching here is a bug in the slot
+                # bookkeeping too, not a slot that happens to hold nothing.
+                if len(slot.entries) != 1:
+                    raise CarryFoldError(
+                        f"{name} ended on a slot holding {len(slot.entries)} pairs; "
+                        "a slot holds exactly one"
+                    )
+                entry = slot.entries[0]
+                slots.append(
+                    SlotEntry(
+                        pair_id=entry.pair_id,
+                        perpetual_leg=entry.perpetual_leg,
+                        spot_leg=entry.spot_leg,
+                        tier=entry.tier,
+                        entry_decision_close_ns=slot.decision_close_ns,
+                        weeks_held=(decision_close_ns - slot.decision_close_ns) // WEEK_NS,
+                    )
+                )
+        books[name] = FinalBook(
+            decision_close_ns=decision_close_ns,
+            slots=tuple(slots),
+            leg_weights=weights,
+        )
+    return books
 
 
 def _without_pairs(
