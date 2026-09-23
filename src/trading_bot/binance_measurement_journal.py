@@ -508,14 +508,19 @@ def premium_rows(payload: Sequence[object]) -> tuple[tuple[PremiumRow, ...], int
     mark price, a funding time that is not a stamp - is *excluded* from the
     rows and counted instead (ruling 11): a delisted perpetual can carry a zero
     index every round, and one of those must not cost the whole venue's
-    snapshot.
+    snapshot. So is a USDT symbol the row models cannot name (ruling 25): the
+    venue lists a few USDT pairs with CJK names, seen live on 2026-09-23.
     """
     rows: list[PremiumRow] = []
     excluded = 0
     seen: set[str] = set()
     for index, entry in enumerate(payload):
         document = _mapping_entry(entry, index=index)
-        symbol = _entry_symbol(document, index=index)
+        try:
+            symbol = _entry_symbol(document, index=index)
+        except _UnusableSymbol:
+            excluded += 1
+            continue
         if symbol is None:
             continue
         _refuse_duplicate(symbol, seen)
@@ -559,7 +564,11 @@ def book_rows(payload: Sequence[object]) -> tuple[tuple[BookRow, ...], int]:
     seen: set[str] = set()
     for index, entry in enumerate(payload):
         document = _mapping_entry(entry, index=index)
-        symbol = _entry_symbol(document, index=index)
+        try:
+            symbol = _entry_symbol(document, index=index)
+        except _UnusableSymbol:
+            excluded += 1
+            continue
         if symbol is None:
             continue
         _refuse_duplicate(symbol, seen)
@@ -644,15 +653,22 @@ def _mapping_entry(entry: object, *, index: int) -> Mapping[str, object]:
         raise DepthPayloadError(f"malformed entry at index {index}") from error
 
 
+class _UnusableSymbol(Exception):
+    """A USDT-quoted symbol the journal's row models cannot carry (ruling 25)."""
+
+
 def _entry_symbol(document: Mapping[str, object], *, index: int) -> str | None:
     """The entry's symbol, or ``None`` where the journal does not keep it.
 
     A symbol quoted in something other than USDT is dropped, which is the
     journal's declared scope and neither a defect nor an exclusion. A symbol
-    that *is* quoted in USDT and is not an upper-case venue symbol refuses the
-    payload: it is a row this parser does not understand in the set it does
-    keep. The index names the entry rather than the string, so a hostile
-    payload cannot write its own text into a segment.
+    that *is* quoted in USDT but is not an upper-case ASCII venue symbol - the
+    venue lists a handful of USDT pairs with CJK names - raises
+    ``_UnusableSymbol``, which the parsers count as an exclusion (ruling 25):
+    the row parsed, the models simply cannot name it, and one such symbol may
+    not cost the whole venue's snapshot. Only a symbol that is not a string at
+    all refuses the payload. The index names the entry rather than the string,
+    so a hostile payload cannot write its own text into a segment.
     """
     try:
         symbol = _string(document.get("symbol"), field_name="symbol")
@@ -661,7 +677,7 @@ def _entry_symbol(document: Mapping[str, object], *, index: int) -> str | None:
     if not symbol.endswith(QUOTE_ASSET):
         return None
     if not _SYMBOL.match(symbol):
-        raise DepthPayloadError(f"malformed entry at index {index}")
+        raise _UnusableSymbol(index)
     return symbol
 
 

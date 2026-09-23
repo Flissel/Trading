@@ -204,8 +204,6 @@ def test_book_rows_keep_the_usdt_pairs_and_quantise_the_spread_by_hand() -> None
         ({"lastFundingRate": 0.0001}, "malformed entry ETHUSDT"),
         ({"nextFundingTime": "1757001600000"}, "malformed entry ETHUSDT"),
         ({"symbol": 17}, "malformed entry at index 1"),
-        # Quoted in USDT and not a venue symbol: kept scope, unreadable row.
-        ({"symbol": "ETH-USDT"}, "malformed entry at index 1"),
         ({"symbol": "BTCUSDT"}, "duplicate entry BTCUSDT"),
     ],
 )
@@ -238,6 +236,25 @@ def test_one_bad_book_entry_refuses_the_whole_payload(
     payload[1] = {**entry, **overrides}
     with pytest.raises(DepthPayloadError, match=reason):
         book_rows(payload)
+
+
+@pytest.mark.parametrize("symbol", ["ETH-USDT", "\u5e01\u5b89\u4eba\u751fUSDT"])
+def test_a_usdt_symbol_the_models_cannot_name_is_excluded_not_a_failure(symbol: str) -> None:
+    """Ruling 25, seen live on 2026-09-23: Binance lists a few USDT pairs with CJK
+    names, and one of them must not cost the whole venue's snapshot. The entry
+    is counted as excluded on every endpoint; the other symbols stay."""
+    premium = premium_payload()
+    entry = premium[1]
+    assert isinstance(entry, dict)
+    premium[1] = {**entry, "symbol": symbol}
+    rows, excluded = premium_rows(premium)
+    assert (excluded, [row.symbol for row in rows]) == (1, ["BTCUSDT", "XRPUSDT"])
+    book = perp_book_payload()
+    entry = book[1]
+    assert isinstance(entry, dict)
+    book[1] = {**entry, "symbol": symbol}
+    rows_b, excluded_b = book_rows(book)
+    assert (excluded_b, [row.symbol for row in rows_b]) == (1, ["BTCUSDT"])
 
 
 def test_a_payload_without_one_usdt_symbol_is_refused() -> None:
