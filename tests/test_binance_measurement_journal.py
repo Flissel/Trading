@@ -1344,6 +1344,113 @@ def test_a_segment_deleted_outside_the_window_still_refuses_a_restart(
         resume(journal, workspace=tmp_path)
 
 
+HOUR_NS = 3_600_000_000_000
+# Three runs, each two rounds, under a clock that jumps forward three days and
+# is then corrected: the day directories end up out of sequence order, which is
+# what a reboot with a wrong RTC followed by an NTP correction leaves behind.
+CLOCK_STEPPED_DAYS = (
+    THREE_DAY_START_NS - DAY_NS,  # 2026-09-22: sequences 0 and 1
+    THREE_DAY_START_NS + 2 * DAY_NS,  # 2026-09-25: sequences 2 and 3
+    THREE_DAY_START_NS,  # 2026-09-23: sequences 4 and 5
+)
+CLOCK_STEPPED_LAYOUT = [
+    "2026-09-22/0000000000.json",
+    "2026-09-22/0000000001.json",
+    "2026-09-23/0000000004.json",
+    "2026-09-23/0000000005.json",
+    "2026-09-25/0000000002.json",
+    "2026-09-25/0000000003.json",
+]
+# The last nanosecond of 2026-09-23, so a window over the two oldest day names
+# holds sequences 0, 1, 4 and 5 and leaves 2 and 3 outside it.
+SECOND_DAY_END_NS = THREE_DAY_START_NS + DAY_NS - 1
+
+
+def clock_stepped_journal(tmp_path: Path) -> Path:
+    """Six rounds whose day directories are not monotone in sequence order."""
+    journal = measurement_journal(tmp_path)
+    for start_ns in CLOCK_STEPPED_DAYS:
+        run_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            reserve_bytes=0,
+            rounds=2,
+            fetcher=FakeVenue(),
+            array_fetcher=SnapshotVenue(),
+            clock=FakeClock(start=start_ns + HOUR_NS),
+            sleep=FakeSleep(),
+        )
+    return journal
+
+
+def test_a_backwards_clock_step_across_utc_midnight_does_not_kill_the_restart(
+    tmp_path: Path,
+) -> None:
+    """C1: the tail window is a contiguous sequence suffix, not a day-name filter.
+
+    Filtering the sequence-ordered listing by the two newest day *names* picks
+    sequences 0, 1, 4 and 5 out of this layout, which is not a run - so the
+    anchored walk reports a gap and the run refuses with exit 2 on every
+    restart, for ever, while the whole-chain verification says the journal is
+    healthy. The suffix after the last segment outside the window is what the
+    walk can actually be anchored on.
+    """
+    journal = clock_stepped_journal(tmp_path)
+    assert relative_names(journal) == CLOCK_STEPPED_LAYOUT
+    assert verify_measurement_journal(journal) == (True, ())
+
+    head = run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=1,
+        fetcher=FakeVenue(),
+        array_fetcher=SnapshotVenue(),
+        clock=FakeClock(start=THREE_DAY_START_NS + 2 * HOUR_NS),
+        sleep=FakeSleep(),
+    )
+    assert (head.segment_count, head.last_sequence) == (7, 6)
+    assert relative_names(journal)[4] == "2026-09-23/0000000006.json"
+    assert verify_measurement_journal(journal) == (True, ())
+
+
+def test_a_snapshot_of_a_clock_stepped_journal_reads_the_windows_contiguous_run(
+    tmp_path: Path,
+) -> None:
+    """C1: the window is selected by sequence contiguity too, not by day name alone."""
+    journal = clock_stepped_journal(tmp_path)
+    stamps = stamps_of(journal)
+    whole = read_document(
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "whole.json",
+            reserve_bytes=0,
+            window_start_ns=min(stamps),
+            window_end_ns=max(stamps),
+        )
+    )
+    assert (whole["first_sequence"], whole["last_sequence"], whole["rounds"]) == (0, 5, 6)
+    # A window that stops before the jumped-forward rounds holds sequences 0,
+    # 1, 4 and 5, which is not a run: the contiguous suffix is what it is read
+    # over, and the document says so in its own sequence bounds.
+    two_days = read_document(
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "two-days.json",
+            reserve_bytes=0,
+            window_start_ns=min(stamps),
+            window_end_ns=SECOND_DAY_END_NS,
+        )
+    )
+    assert (two_days["first_sequence"], two_days["last_sequence"], two_days["rounds"]) == (
+        4,
+        5,
+        2,
+    )
+
+
 # --- Task 6: verify, status and windowed snapshots -------------------------
 
 # `FakeClock`'s default start falls on this UTC day, so every round of a

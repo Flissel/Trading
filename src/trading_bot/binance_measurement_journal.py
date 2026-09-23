@@ -1156,13 +1156,35 @@ def _listed_segments(journal_root: Path) -> list[Path] | None:
 
 
 def _tail_window(paths: list[Path]) -> list[Path]:
-    """The segments of the newest day directory and the one before it by name."""
+    """The newest day directories' segments, as a contiguous sequence suffix.
+
+    The two newest day *names* say which segments the window is about; where
+    the walk may start is a different question, and it is the one this answers.
+    The day directories are not guaranteed to be monotone in sequence order: a
+    host that reboots with a wrong RTC writes rounds under a future day and
+    the NTP correction puts the following rounds back under the real one, so a
+    listing can read 09-22, 09-22, 09-23, 09-23, 09-25, 09-25 while the
+    sequences run 0, 1, 4, 5, 2, 3. Filtering that by day membership yields
+    sequences 0, 1, 4, 5 - not a run - and the anchored walk then reports a
+    gap and a broken link on a journal that is perfectly healthy, on every
+    restart, for ever.
+
+    So the window is cut instead of filtered: everything after the last
+    segment whose day is outside it. The result is always a run ending at the
+    newest segment (the newest day is in the window by construction), which is
+    exactly what an anchored walk can be held to, and on a journal whose days
+    are monotone it is the same list the filter produced.
+    """
     if not paths:
         return []
     days = sorted({path.parent.name for path in paths})
     newest = days.index(paths[-1].parent.name)
     window = set(days[max(newest - 1, 0) : newest + 1])
-    return [path for path in paths if path.parent.name in window]
+    cut = 0
+    for index, path in enumerate(paths):
+        if path.parent.name not in window:
+            cut = index + 1
+    return paths[cut:]
 
 
 def _walked(
@@ -1716,16 +1738,32 @@ def _window_segments(
     ``received_time_ns``, so no other directory can hold one - and the listing
     that finds them still covers the whole journal, which is what refuses a
     foreign name or a duplicated sequence anywhere.
+
+    What is kept is the contiguous *run* of in-window segments that ends at
+    the newest one, by the same rule ``_tail_window`` cuts the restart's window
+    with: a clock stepped across UTC midnight can leave rounds the window
+    excludes sitting between rounds it includes, and those are a reading this
+    window cannot be anchored on rather than a broken journal. A sequence
+    missing from the listing altogether is still a genuine gap and still
+    refuses, because nothing dropped it out of the window - it is not there.
+    On a journal whose days are monotone the run is every in-window segment,
+    so the numbers a window produces do not change.
     """
     first_day = _segment_day(window_start_ns)
     last_day = _segment_day(window_end_ns)
+    run: list[_ReadSegment] = []
     kept: list[_ReadSegment] = []
     for path in _segment_paths(journal_root):
-        if not first_day <= path.parent.name <= last_day:
+        inside: _ReadSegment | None = None
+        if first_day <= path.parent.name <= last_day:
+            read = _read_segment(journal_root, path)
+            if window_start_ns <= read.segment.received_time_ns <= window_end_ns:
+                inside = read
+        if inside is None:
+            run = []
             continue
-        read = _read_segment(journal_root, path)
-        if window_start_ns <= read.segment.received_time_ns <= window_end_ns:
-            kept.append(read)
+        run.append(inside)
+        kept = run
     if not kept:
         raise BinanceMeasurementJournalSpecError(
             "MEASUREMENT_WINDOW_EMPTY: this journal received no round inside the window"
