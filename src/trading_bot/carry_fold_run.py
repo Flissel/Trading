@@ -2,7 +2,7 @@
 
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
@@ -110,12 +110,52 @@ class CarryFoldArtifact:
 
 
 @dataclass(frozen=True, slots=True)
+class SlotEntry:
+    """One filled slot of the book a decision run ended on.
+
+    Spec 4.1 reads the shadow book off the last decision's slot state, and
+    spec 4.2 states that book per slot: the pair, the Sunday it was entered
+    and how many weeks it has been held. So a slot says all three rather than
+    only naming the pair and leaving a reader to rediscover its age.
+    """
+
+    pair_id: str
+    perpetual_leg: str
+    spot_leg: str
+    tier: int
+    entry_decision_close_ns: int
+    weeks_held: int
+
+
+@dataclass(frozen=True, slots=True)
+class FinalBook:
+    """The book one candidate ended a decision run on (spec 4.1).
+
+    `leg_weights` is what the last evaluated decision actually traded, before
+    that episode's forced closes; `slots` is the slot state the same decision
+    ended with, forced closes stripped and the prune applied, which is what
+    the next decision would start from. A cohort candidate has no slots --
+    a weekly cohort is not a slot and reading it as one would invent a book --
+    so `slots` is empty for it and `leg_weights` is its whole book.
+    """
+
+    decision_close_ns: int
+    slots: tuple[SlotEntry, ...]
+    leg_weights: tuple[tuple[str, Decimal], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionRun:
     """What evaluating a list of decisions produced, before it is sealed.
 
     Exactly the parts of a fold report that come out of the decision loop
     rather than out of the manifest, so a fold report and a holdout read are
     assembled from one evaluation rather than from two copies of it.
+
+    `final_books` is additive and defaults to empty: no fold report material
+    reads it, and a caller that wants the book the run ended on -- the weekly
+    shadow book, which is exactly one run of this loop (spec 4.1) -- reads it
+    instead of re-deriving a book from a second copy of the rules.
     """
 
     candidates: list[dict[str, object]]
@@ -123,6 +163,7 @@ class DecisionRun:
     episode_count: int
     reason_codes: list[str]
     warm_up_weeks: int
+    final_books: dict[str, FinalBook] = field(default_factory=dict)
 
 
 def run_carry_fold(
@@ -363,6 +404,13 @@ def evaluate_carry_decisions(
     # The last evaluated decision's tiers, which price the fold's uncharged
     # final exit; empty until the first decision that is not skipped.
     tiers: dict[str, int] = {}
+    # Spec 4.1's book, recorded as each decision ends rather than read off the
+    # live state after the loop: a trailing skipped week empties the state
+    # without evaluating anything, and would otherwise label the last
+    # evaluated decision's weights with a book it never held.
+    last_weights: dict[str, tuple[tuple[str, Decimal], ...]] = {}
+    last_slot_state: dict[str, tuple[Cohort, ...]] = {}
+    last_decision_close_ns: int | None = None
     for decision_close_ns in decisions:
         sample_id = f"BINANCE_UM:{decision_close_ns}:w1"
         snapshot = select_pair_universe(
@@ -462,6 +510,7 @@ def evaluate_carry_decisions(
                     key: Decimal(value)
                     for key, value in zip(_SLOT_EXTRA_KEYS, counts, strict=True)
                 })
+            last_weights[name] = weights
             held_nothing[name].append(name in members and not weights)
             forced_pairs: set[str] = set()
             for scenario in scenarios:
@@ -487,6 +536,8 @@ def evaluate_carry_decisions(
             cohorts[name] = [
                 c for c in cohorts[name] if decision_close_ns - c.decision_close_ns < longest
             ]
+            last_slot_state[name] = tuple(cohorts[name])
+        last_decision_close_ns = decision_close_ns
 
     episode_count = len(episodes[(names[0], "base")]) if names else 0
     # Spec 3.3: what liquidating the fold's last book would cost, stated
@@ -534,13 +585,69 @@ def evaluate_carry_decisions(
         }
         for name in names
     ]
+    final_books: dict[str, FinalBook] = (
+        {}
+        if last_decision_close_ns is None
+        else _final_books(
+            last_slot_state,
+            leg_weights=last_weights,
+            decision_close_ns=last_decision_close_ns,
+            slot_names=slot_names,
+        )
+    )
     return DecisionRun(
         candidates=candidates,
         skipped_sample_ids=skipped,
         episode_count=episode_count,
         reason_codes=reason_codes,
         warm_up_weeks=warm_up_weeks,
+        final_books=final_books,
     )
+
+
+def _final_books(
+    slot_state: dict[str, tuple[Cohort, ...]],
+    *,
+    leg_weights: dict[str, tuple[tuple[str, Decimal], ...]],
+    decision_close_ns: int,
+    slot_names: set[str],
+) -> dict[str, FinalBook]:
+    """The book each evaluated candidate ended on, from the state the loop left.
+
+    Spec 4.1 makes the last decision's slot state and leg weights the book, so
+    both are read off that state rather than recomputed from a second copy of
+    the rules. Only a slot family has slots; a slot is a `Cohort` holding
+    exactly one pair, so anything else is a bug in the slot bookkeeping and is
+    refused rather than guessed at. A candidate no decision was evaluated for
+    has no entry at all, which is why this iterates the recorded weights.
+    """
+    books: dict[str, FinalBook] = {}
+    for name, weights in leg_weights.items():
+        slots: list[SlotEntry] = []
+        if name in slot_names:
+            for slot in slot_state[name]:
+                if len(slot.entries) != 1:
+                    raise CarryFoldError(
+                        f"{name} ended on a slot holding {len(slot.entries)} pairs; "
+                        "a slot holds exactly one"
+                    )
+                entry = slot.entries[0]
+                slots.append(
+                    SlotEntry(
+                        pair_id=entry.pair_id,
+                        perpetual_leg=entry.perpetual_leg,
+                        spot_leg=entry.spot_leg,
+                        tier=entry.tier,
+                        entry_decision_close_ns=slot.decision_close_ns,
+                        weeks_held=(decision_close_ns - slot.decision_close_ns) // WEEK_NS,
+                    )
+                )
+        books[name] = FinalBook(
+            decision_close_ns=decision_close_ns,
+            slots=tuple(slots),
+            leg_weights=weights,
+        )
+    return books
 
 
 def _without_pairs(

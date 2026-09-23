@@ -42,12 +42,19 @@ from trading_bot.carry_fold_run import (
     FOLD_WARMED_REASON_CODE,
     CarryFoldError,
     DecisionRun,
+    _final_books,
     control_reference,
     evaluate_carry_decisions,
     run_carry_fold,
     warm_up_weeks_of,
 )
-from trading_bot.carry_signals import hurdle_minimum_trailing, random_pair_order
+from trading_bot.carry_signals import (
+    WEEK_NS,
+    Cohort,
+    CohortEntry,
+    hurdle_minimum_trailing,
+    random_pair_order,
+)
 from trading_bot.carry_universe import EligiblePair, PairUniverseSnapshot
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_fold_run import verify_panel_fold_report
@@ -1183,3 +1190,163 @@ def test_an_undeclared_candidate_name_is_refused(v4_workspace: Workspace) -> Non
     evaluate = _decision_runner(v4_workspace)
     with pytest.raises(CarryFoldError):
         evaluate(("carry_s10_l4w_h26w_exit", "carry_l4w_h26w_exit"))
+
+
+# --- the book a decision run ends on ------------------------------------------
+
+
+def _decisions(root: Path) -> list[int]:
+    """Fold 0's decision closes, in the order the runner evaluates them."""
+    return [int(value.split(":")[1]) for value in _ordered_test_sample_ids(root)]
+
+
+def _last_episode(run: DecisionRun, name: str) -> dict[str, object]:
+    """The candidate's last base-scenario episode, as the decision loop left
+    it -- Decimals, before the report stringifies them."""
+    record = next(item for item in run.candidates if item["candidate_name"] == name)
+    return _object_dict(_object_list(_object_dict(record["base"])["episodes"])[-1])
+
+
+def _contributing_pairs(episode: dict[str, object]) -> set[str]:
+    """The pairs an episode attributed money to."""
+    pairs: set[str] = set()
+    for item in _object_list(episode["contract_net_contributions"]):
+        assert isinstance(item, list) and len(item) == 2
+        pair_id, amount = item
+        assert isinstance(pair_id, str) and isinstance(amount, Decimal)
+        if amount != 0:
+            pairs.add(pair_id)
+    return pairs
+
+
+def _gross_exposure(episode: dict[str, object]) -> Decimal:
+    value = episode["gross_exposure"]
+    assert isinstance(value, Decimal)
+    return value
+
+
+def test_the_final_book_of_a_slot_member_is_its_last_decision_s_slots(
+    v4_workspace: Workspace,
+) -> None:
+    """Spec 4.1: the last decision's slot state and leg weights are the book.
+
+    The two slots the exit member ends fold 0 on are the two pairs its last
+    episode traded, and the weights are the declared book's, not a
+    proportional one: four slots, two filled, so each pair carries a quarter
+    of the book as spot +1/8 and perpetual -1/8.
+    """
+    space = v4_workspace
+    run = _decision_runner(space)(None)
+    name = MEMBER_NAMES_V4[3]
+    book = run.final_books[name]
+    assert book.decision_close_ns == _decisions(space[0])[-1]
+    episode = _last_episode(run, name)
+    assert {slot.pair_id for slot in book.slots} == _contributing_pairs(episode)
+    assert len(book.slots) == 2
+    weights = dict(book.leg_weights)
+    assert len(weights) == 2 * len(book.slots)
+    for slot in book.slots:
+        assert weights[slot.spot_leg] == Decimal(1) / 8
+        assert weights[slot.perpetual_leg] == -Decimal(1) / 8
+    filled = Decimal(len(book.slots))
+    assert sum((w for w in weights.values() if w > 0), Decimal(0)) == filled / 4 / 2
+    assert sum((w for w in weights.values() if w < 0), Decimal(0)) == -filled / 4 / 2
+    # the weights are the ones the episode was actually evaluated on
+    assert sum((abs(w) for w in weights.values()), Decimal(0)) == _gross_exposure(episode)
+    # sorted by leg id, so one week's book is byte-stable
+    assert list(book.leg_weights) == sorted(book.leg_weights)
+
+
+def test_a_slot_s_weeks_held_counts_from_the_sunday_it_was_entered(
+    v4_workspace_with_one_negative_week: Workspace,
+) -> None:
+    """A slot carries the Sunday it was entered, so the book says how long
+    each pair has been held rather than only what is held. The exit member
+    empties C10USDT's slot at the second decision and refills it there, so it
+    ends the fold holding one week-old slot beside one opened that week."""
+    space = v4_workspace_with_one_negative_week
+    run = _decision_runner(space)(None)
+    decisions = _decisions(space[0])
+    book = run.final_books[MEMBER_NAMES_V4[3]]
+    assert [slot.entry_decision_close_ns for slot in book.slots] == [
+        decisions[1], decisions[2],
+    ]
+    assert [slot.weeks_held for slot in book.slots] == [1, 0]
+    for slot in book.slots:
+        assert slot.weeks_held == (decisions[-1] - slot.entry_decision_close_ns) // WEEK_NS
+
+
+def test_a_cohort_candidate_s_final_book_carries_no_slots(v2_workspace: Workspace) -> None:
+    """A weekly cohort is not a slot, so a cohort family reports no slot state
+    -- its book is the leg weights `assemble_book` handed the last episode.
+
+    v2's hold-26 member ends fold 0 on the fixture's two top payers. Each of
+    its live cohorts sits on 1/26 of capital split over the two, so a pair
+    carries 1/52 per cohort and a leg half of that, 1/104. Fifteen cohorts are
+    live at the last decision -- the fixture's capture is too short to warm
+    all twenty-six, and an unwarmed cohort leaves its share undeployed rather
+    than redistributing it -- so every leg is 15/104 and the book is
+    deliberately less than fully deployed.
+    """
+    run = _decision_runner(v2_workspace)(None)
+    for name in MEMBER_NAMES_V2 + CONTROL_NAMES:
+        assert run.final_books[name].slots == (), name
+    assert run.final_books["no_trade"].leg_weights == ()
+    name = MEMBER_NAMES_V2[0]
+    book = run.final_books[name]
+    weights = dict(book.leg_weights)
+    assert {leg.split(":")[1] for leg in weights} == set(TOP_PAYING_SYMBOLS)
+    assert {leg.split(":")[0] for leg in weights} == {"perp", "spot"}
+    leg_share = Decimal(15) / 104
+    for leg, weight in weights.items():
+        assert weight == (leg_share if leg.startswith("spot:") else -leg_share), leg
+    assert sum(weights.values(), Decimal(0)) == 0
+    total = sum((abs(w) for w in weights.values()), Decimal(0))
+    assert total == 4 * leg_share == _gross_exposure(_last_episode(run, name))
+
+
+def test_a_run_with_no_decisions_has_no_final_books(v4_workspace: Workspace) -> None:
+    """An empty decision list evaluates nothing, so there is no last decision
+    and no book -- and the field is additive, so a `DecisionRun` built without
+    one is empty rather than absent."""
+    spec, _ = load_carry_family_spec(v4_workspace[3])
+    run = evaluate_carry_decisions(
+        spec, perp_histories={}, spot_histories={}, leg_histories={},
+        funding_by_leg={}, decisions=[],
+    )
+    assert run.final_books == {}
+    assert run.episode_count == 0
+    assert DecisionRun(
+        candidates=[], skipped_sample_ids=[], episode_count=0, reason_codes=[],
+        warm_up_weeks=0,
+    ).final_books == {}
+
+
+def test_a_slot_that_holds_more_than_one_pair_is_refused() -> None:
+    """Fail closed: a slot holds exactly one pair, so a slot list that has
+    drifted into a multi-pair cohort is a bug in the slot bookkeeping rather
+    than a book to report -- and the same cohort under a candidate that never
+    ran the slot book is simply not slot state."""
+    def entry(pair_id: str) -> CohortEntry:
+        return CohortEntry(
+            pair_id=pair_id,
+            perpetual_leg=f"perp:{pair_id}",
+            spot_leg=f"spot:{pair_id}",
+            tier=1,
+        )
+
+    crowded = Cohort(0, (entry("A"), entry("B")), ())
+    with pytest.raises(CarryFoldError, match="a slot holds exactly one"):
+        _final_books(
+            {"member": (crowded,)},
+            leg_weights={"member": ()},
+            decision_close_ns=WEEK_NS,
+            slot_names={"member"},
+        )
+    books = _final_books(
+        {"member": (crowded,)},
+        leg_weights={"member": ()},
+        decision_close_ns=WEEK_NS,
+        slot_names=set(),
+    )
+    assert books["member"].slots == ()
