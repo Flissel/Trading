@@ -754,6 +754,54 @@ def test_a_weekly_capture_that_is_not_a_superset_of_its_base_refuses(
     assert not harness.artifact_root.exists()
 
 
+def test_a_stale_symbol_is_carried_into_the_week_and_beside_its_pair(
+    harness: Harness, tmp_path: Path
+) -> None:
+    """Ruling 23: what a capture declared stale is sealed into the week that reads it.
+
+    A non-empty `stale_symbols` says the base has no monthly dump for that
+    symbol past the month it names, so the symbol's tail starts at the global
+    cutoff and the days between are in no capture at all. Sealed into every
+    manifest since Task 1 and read by nobody, that is a silent hole in exactly
+    the pairs a reader would otherwise trust; the week now carries the whole
+    declaration and repeats it beside the ranked pairs it touches.
+    """
+    perpetual = tmp_path / "perp"
+    spot = tmp_path / "spot"
+    shutil.copytree(harness.captures.perp_second, perpetual)
+    shutil.copytree(harness.captures.spot_second, spot)
+    stale_symbol = SYMBOLS[0]
+    perp_stale = {"klines": {stale_symbol: "2020-05"}, "fundingRate": {stale_symbol: None}}
+    spot_stale = {"klines": {stale_symbol: "2020-06"}}
+    _reseal(perpetual, lambda material: material.__setitem__("stale_symbols", perp_stale))
+    _reseal(spot, lambda material: material.__setitem__("stale_symbols", spot_stale))
+
+    artifact = _run(harness, harness.declare(), perp=perpetual, spot=spot)
+
+    document = _document(artifact.output_path)
+    assert document["stale_symbols"] == {"perpetual": perp_stale, "hedge": spot_stale}
+    measurements = [_mapping(item) for item in _sequence(document["universe_measurements"])]
+    by_symbol = {_text(item["pair_id"]).split(":")[0]: item for item in measurements}
+    assert by_symbol[stale_symbol]["stale"] == {
+        "perpetual": {"klines": "2020-05", "fundingRate": None},
+        "hedge": {"klines": "2020-06"},
+    }
+    # Every other pair is not stale, and says so with nothing rather than {}.
+    assert by_symbol[SYMBOLS[1]]["stale"] == {"perpetual": None, "hedge": None}
+
+
+def test_a_week_over_captures_with_nothing_stale_says_so(harness: Harness) -> None:
+    artifact = _run(harness, harness.declare())
+
+    document = _document(artifact.output_path)
+    assert document["stale_symbols"] == {
+        "perpetual": {"klines": {}, "fundingRate": {}},
+        "hedge": {"klines": {}},
+    }
+    measurements = [_mapping(item) for item in _sequence(document["universe_measurements"])]
+    assert all(item["stale"] == {"perpetual": None, "hedge": None} for item in measurements)
+
+
 def _reseal(capture_root: Path, mutate: Callable[[dict[str, object]], None]) -> str:
     """Rewrite a capture manifest after `mutate`, resealed so it still verifies.
 

@@ -112,6 +112,8 @@ def test_the_cli_builds_the_monday_chain_of_weekly_shadow_captures(
     reported = capsys.readouterr().out
     assert str(perpetual) in reported
     assert FIRST_TAIL_SUNDAY in reported
+    # Ruling 23: the counts the Monday operator reads before the week is run.
+    assert "stale_symbols: klines 0, fundingRate 0" in reported
     assert verify_panel_capture(perpetual) == (True, ())
 
     spot = root / "cli-spot-first"
@@ -126,7 +128,8 @@ def test_the_cli_builds_the_monday_chain_of_weekly_shadow_captures(
         )
         == 0
     )
-    capsys.readouterr()
+    # A spot capture has no funding bucket to be stale in.
+    assert "stale_symbols: klines 0" in capsys.readouterr().out
     assert verify_panel_capture(spot) == (True, ())
 
     # Next week: the same base, this week's capture as the previous one.

@@ -160,6 +160,7 @@ class _Capture:
     dataset_root_hash: str
     base_capture_root_hash: str | None
     data_available_time_ns: int
+    stale_symbols: dict[str, dict[str, str | None]]
 
 
 def run_shadow_week(
@@ -341,10 +342,14 @@ def _publish_week(
         "reason_codes": list(run.reason_codes),
         "skipped_sample_ids": list(run.skipped_sample_ids),
         "book": _book_block(book),
+        # Ruling 23: what each capture declared stale, whole, plus the same
+        # fact beside every ranked pair a stale symbol is a leg of.
+        "stale_symbols": {"perpetual": perp.stale_symbols, "hedge": spot.stale_symbols},
         "universe_measurements": _universe_block(
             universe,
             inputs=inputs,
             snapshot_document=snapshot_document,
+            stale_symbols={"perpetual": perp.stale_symbols, "hedge": spot.stale_symbols},
         ),
         "m_labels": _m_label_block(
             previous_book,
@@ -452,6 +457,7 @@ def _capture(
         dataset_root_hash=_hash_of(dataset, "root_hash", label=f"{label} dataset"),
         base_capture_root_hash=base_capture_root_hash,
         data_available_time_ns=_data_available_time_ns(manifest, label=label),
+        stale_symbols=_stale_symbols(manifest, label=label),
     )
 
 
@@ -536,6 +542,40 @@ def _data_available_time_ns(manifest: dict[str, Any], *, label: str) -> int:
             f"the {label} capture has a present source row without a received_time_ns"
         )
     return max(times)
+
+
+def _stale_symbols(
+    manifest: dict[str, Any], *, label: str
+) -> dict[str, dict[str, str | None]]:
+    """What this capture declared stale, bucket by bucket (ruling 4).
+
+    A symbol is stale in a bucket when the base has no monthly dump for it
+    past the month recorded here -- which is `null` where the base has none at
+    all -- so its tail starts at the global cutoff and the days in between are
+    in no capture. A monthly capture has no tail and declares nothing, so an
+    absent block is an empty one; a block that is there is read strictly,
+    because it is about to be sealed into a week.
+    """
+    recorded = manifest.get("stale_symbols")
+    if recorded is None:
+        return {}
+    if not isinstance(recorded, dict):
+        raise ShadowBookError(f"the {label} capture's stale_symbols is malformed")
+    stale: dict[str, dict[str, str | None]] = {}
+    for bucket, symbols in recorded.items():
+        if not isinstance(symbols, dict):
+            raise ShadowBookError(
+                f"the {label} capture's stale_symbols.{bucket} is malformed"
+            )
+        months: dict[str, str | None] = {}
+        for symbol, month in symbols.items():
+            if month is not None and not isinstance(month, str):
+                raise ShadowBookError(
+                    f"the {label} capture's stale_symbols.{bucket}.{symbol} is not a month"
+                )
+            months[str(symbol)] = month
+        stale[str(bucket)] = months
+    return stale
 
 
 def _family(
@@ -840,6 +880,7 @@ def _universe_block(
     *,
     inputs: DecisionInputs,
     snapshot_document: dict[str, Any] | None,
+    stale_symbols: dict[str, dict[str, dict[str, str | None]]],
 ) -> list[dict[str, object]]:
     """Spec 4.2's measurements, for every pair the universe ranked.
 
@@ -880,9 +921,50 @@ def _universe_block(
                 inputs=inputs,
                 snapshot_document=snapshot_document,
             ),
+            "stale": _stale_for_pair(
+                perpetual_leg=f"perp:{pair.perpetual_contract_id}",
+                spot_leg=f"spot:{pair.spot_contract_id}",
+                inputs=inputs,
+                stale_symbols=stale_symbols,
+            ),
         }
         for pair in universe.pairs
     ]
+
+
+def _stale_for_pair(
+    *,
+    perpetual_leg: str,
+    spot_leg: str,
+    inputs: DecisionInputs,
+    stale_symbols: dict[str, dict[str, dict[str, str | None]]],
+) -> dict[str, object]:
+    """Whether either leg of this pair is a symbol its capture declared stale.
+
+    The same venue symbol a measurement is keyed by, looked up in the capture
+    that carries that leg. A pair with nothing stale says so with nothing -
+    `null` rather than an empty map - so a reader scanning the list sees the
+    stale pairs at a glance and cannot read an empty declaration as a bucket
+    that was checked and found clean.
+    """
+    return {
+        "perpetual": _stale_buckets(
+            stale_symbols["perpetual"], inputs.leg_histories[perpetual_leg].instrument_id
+        ),
+        "hedge": _stale_buckets(
+            stale_symbols["hedge"], inputs.leg_histories[spot_leg].instrument_id
+        ),
+    }
+
+
+def _stale_buckets(
+    stale: dict[str, dict[str, str | None]], symbol: str
+) -> dict[str, str | None] | None:
+    """The buckets one symbol is stale in, or nothing where it is stale in none."""
+    listed = {
+        bucket: months[symbol] for bucket, months in stale.items() if symbol in months
+    }
+    return listed or None
 
 
 def _measurement_for(

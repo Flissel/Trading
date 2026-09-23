@@ -812,6 +812,12 @@ def _shadow_capture(parsed: argparse.Namespace) -> int:
     print(f"capture_root_hash: {artifact.capture_root_hash}")
     print(f"dataset_root_hash: {artifact.dataset_root_hash}")
     print(f"reconciled_rows: {artifact.reconciliation['compared_rows']}")
+    # Ruling 23: a rising count is the base falling behind for those symbols,
+    # which is the Monday operator's cue to repair or refresh it.
+    counts = ", ".join(
+        f"{bucket} {len(symbols)}" for bucket, symbols in artifact.stale_symbols.items()
+    )
+    print(f"stale_symbols: {counts}")
     return 0
 
 

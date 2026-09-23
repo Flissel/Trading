@@ -156,6 +156,9 @@ class ShadowCaptureArtifact:
     dataset_root_hash: str
     tail_through: str
     reconciliation: dict[str, object]
+    # Per bucket, the symbols whose own last monthly dump is older than the
+    # cutoff the tail starts at (ruling 4), as the manifest seals them.
+    stale_symbols: dict[str, dict[str, object]]
 
 
 def build_funding_rest_url(symbol: str, *, start_time_ms: int, end_time_ms: int) -> str:
@@ -688,6 +691,7 @@ def build_shadow_capture(
         # `capture_root_hash`, and a shared (or shallow-copied) `mismatches`
         # list would be reachable -- and mutable -- through the artifact.
         reconciliation=_reconciliation_block(compared_rows),
+        stale_symbols={bucket: dict(symbols) for bucket, symbols in stale_symbols.items()},
     )
 
 

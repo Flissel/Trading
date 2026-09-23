@@ -518,6 +518,15 @@ Ausgabeverzeichnis wieder weg — Exit 1 heißt hier „Transport weg, gleich no
 steht doch eines da, weil ein Kill vor dem Aufräumen kam, nennt die Abweisung den Weg:
 Verzeichnis löschen und neu starten.
 
+Nach jeder Capture meldet `shadow-capture` `stale_symbols: klines <n>, fundingRate <n>`, und
+das Wochenartefakt trägt dieselbe Erklärung weiter — ganz unter `stale_symbols` und noch
+einmal neben jedem gerankten Paar, dessen Bein betroffen ist. Ein Symbol steht dort, wenn die
+Basis für es keinen Monats-Dump jenseits des genannten Monats hat (`null`: gar keinen). Sein
+Schwanz beginnt dann nicht am Tag nach seinem eigenen letzten Monat, sondern am globalen
+Stichtag, und die Tage dazwischen stehen in keiner Capture. Das ist kein Fehler des Laufs,
+sondern eine Lücke in der Basis: bei Delistings bleibt sie, sonst heilt sie eine frischere
+oder reparierte Basis. Eine steigende Zahl heißt, dass die Basis zurückfällt.
+
 `--perp-base-capture` und `--spot-base-capture` sind genau dann nötig, wenn die
 Wochen-Capture daneben eine Basis nennt (Ruling 17) — die Herkunftsprüfung braucht deren
 Manifest, das nur der Aufrufer hat. Das Buch des Sonntags `S` ist eine reine Funktion aus
