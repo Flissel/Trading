@@ -27,7 +27,8 @@ import json
 import re
 import sys
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
@@ -1665,14 +1666,15 @@ def snapshot_measurement_journal(
     if head is None:
         named = head_reasons[0] if head_reasons else "CHAIN_HEAD_MISSING"
         raise BinanceMeasurementJournalSpecError(f"this journal has no readable head: {named}")
-    segments = _window_segments(
+    window = _window_fold(
         root,
+        spec=spec,
         spec_hash=spec_hash,
         window_start_ns=window_start_ns,
         window_end_ns=window_end_ns,
     )
-    floor_count = _tier_floor_count(len(segments))
-    instruments, tiers = _cost_blocks(spec, segments, floor_count=floor_count)
+    floor_count = _tier_floor_count(window.rounds)
+    instruments, tiers = _cost_blocks(spec, window.depth, floor_count=floor_count)
     material: dict[str, object] = {
         "version": MEASUREMENT_SNAPSHOT_VERSION,
         "spec_hash": spec_hash,
@@ -1680,17 +1682,14 @@ def snapshot_measurement_journal(
         "chain_head_hash": head.content_hash,
         "window_start_ns": window_start_ns,
         "window_end_ns": window_end_ns,
-        "first_sequence": segments[0].sequence,
-        "last_sequence": segments[-1].sequence,
-        "rounds": len(segments),
-        "snapshot_rounds": _snapshot_round_count(segments, every=spec.snapshot_every_rounds),
-        "failures": _failure_totals(segments),
-        "excluded": _excluded_totals(segments),
-        "perpetuals": _perpetual_block(
-            _rows_by_symbol(segment.premium_index for segment in segments),
-            _rows_by_symbol(segment.perp_book for segment in segments),
-        ),
-        "spot": _spot_block(_rows_by_symbol(segment.spot_book for segment in segments)),
+        "first_sequence": window.first_sequence,
+        "last_sequence": window.last_sequence,
+        "rounds": window.rounds,
+        "snapshot_rounds": window.snapshot_rounds,
+        "failures": window.failures,
+        "excluded": window.excluded,
+        "perpetuals": _perpetual_block(window.premium, window.perp_book),
+        "spot": _spot_block(window.spot_book),
         "cost_instruments": instruments,
         "cost_tiers": tiers,
         # Sealed with the medians it admitted, so a reader of the document can
@@ -1728,10 +1727,127 @@ def _read_segment(journal_root: Path, path: Path) -> _ReadSegment:
     return _ReadSegment(name, path.parent.name, document, segment)
 
 
-def _window_segments(
-    journal_root: Path, *, spec_hash: str, window_start_ns: int, window_end_ns: int
-) -> tuple[MeasurementSegment, ...]:
-    """The rounds received inside the window, verified among themselves.
+@dataclass
+class _PremiumTally:
+    """One symbol's premium-index readings, folded round by round."""
+
+    rounds: int = 0
+    funding_total: Decimal = Decimal(0)
+    basis_total: Decimal = Decimal(0)
+    last_funding_rate: Decimal | None = None
+
+    def add(self, row: PremiumRow) -> None:
+        self.rounds += 1
+        self.funding_total += row.last_funding_rate
+        self.basis_total += row.basis_bps
+        # The rounds arrive in sequence order, so the newest round that
+        # carried the symbol is simply the last one to write here.
+        self.last_funding_rate = row.last_funding_rate
+
+
+@dataclass
+class _BookTally:
+    """One symbol's book readings, folded round by round."""
+
+    rounds: int = 0
+    spread_total: Decimal = Decimal(0)
+
+    def add(self, row: BookRow) -> None:
+        self.rounds += 1
+        self.spread_total += row.spread_bps
+
+
+@dataclass
+class _WindowFold:
+    """A window of rounds as the numbers they add up to, not as the rounds.
+
+    A week of this stream is about 9 900 segments and some 2 000 of them are
+    snapshot rounds carrying every USDT perpetual and every USDT spot pair -
+    around 2.4 MB each once parsed. A reading that kept them all to take means
+    over afterwards needed more than 5 GB of memory to seal one weekly
+    snapshot, on a machine that also has to keep writing the stream. So each
+    segment is folded in as it is read and then let go of: the per-symbol
+    totals here are a few hundred bytes a symbol however long the window is,
+    and the depth observations are thirty a round.
+
+    The verification is folded in with the numbers, anchored exactly as the
+    tail walk anchors: the first segment's predecessor is outside the window
+    by construction and is taken as given, and every segment after it must
+    follow the one before by sequence and name its hash.
+    """
+
+    spec_hash: str
+    snapshot_every_rounds: int
+    rounds: int = 0
+    snapshot_rounds: int = 0
+    first_sequence: int = 0
+    last_sequence: int = 0
+    reasons: list[str] = field(default_factory=list)
+    failures: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(SNAPSHOT_ENDPOINTS, 0)
+    )
+    excluded: dict[str, int] = field(
+        default_factory=lambda: dict.fromkeys(SNAPSHOT_ENDPOINTS, 0)
+    )
+    premium: dict[str, _PremiumTally] = field(default_factory=dict)
+    perp_book: dict[str, _BookTally] = field(default_factory=dict)
+    spot_book: dict[str, _BookTally] = field(default_factory=dict)
+    depth: dict[str, list[InstrumentObservation]] = field(default_factory=dict)
+    _expected_sequence: int = 0
+    _previous_hash: str = ZERO_HASH
+
+    def add(self, read: _ReadSegment) -> None:
+        """Fold one round in: judge it, then count what it measured."""
+        segment = read.segment
+        if self.rounds == 0:
+            self.first_sequence = segment.sequence
+            self._expected_sequence = segment.sequence
+            if segment.sequence != 0:
+                self._previous_hash = segment.previous_segment_hash
+        self.reasons.extend(
+            _segment_reasons(
+                read.document,
+                segment,
+                name=read.name,
+                day=read.day,
+                expected_sequence=self._expected_sequence,
+                spec_hash=self.spec_hash,
+                previous_hash=self._previous_hash,
+            )
+        )
+        self._expected_sequence += 1
+        self._previous_hash = segment.content_hash
+        self.last_sequence = segment.sequence
+        self.rounds += 1
+        if segment.sequence % self.snapshot_every_rounds == 0:
+            self.snapshot_rounds += 1
+        for endpoint, count in _failure_counts(segment).items():
+            self.failures[endpoint] += count
+        for endpoint in SNAPSHOT_ENDPOINTS:
+            self.excluded[endpoint] += segment.excluded[endpoint]
+        for premium_row in segment.premium_index or ():
+            self.premium.setdefault(premium_row.symbol, _PremiumTally()).add(premium_row)
+        for perp_row in segment.perp_book or ():
+            self.perp_book.setdefault(perp_row.symbol, _BookTally()).add(perp_row)
+        for spot_row in segment.spot_book or ():
+            self.spot_book.setdefault(spot_row.symbol, _BookTally()).add(spot_row)
+        for observation in segment.depth:
+            # A failed observation carries no measurement at all, so it is
+            # left out rather than counted as a zero - exactly what v1's
+            # finalisation does with the segments its chain head covers.
+            if observation.ok:
+                self.depth.setdefault(observation.instrument_id, []).append(observation)
+
+
+def _window_fold(
+    journal_root: Path,
+    *,
+    spec: BinanceMeasurementJournalSpec,
+    spec_hash: str,
+    window_start_ns: int,
+    window_end_ns: int,
+) -> _WindowFold:
+    """The rounds received inside the window, folded and verified among themselves.
 
     Only the day directories whose names fall between the window's two days
     are opened - a segment sits under the UTC day of its own
@@ -1739,7 +1855,7 @@ def _window_segments(
     that finds them still covers the whole journal, which is what refuses a
     foreign name or a duplicated sequence anywhere.
 
-    What is kept is the contiguous *run* of in-window segments that ends at
+    What is read is the contiguous *run* of in-window segments that ends at
     the newest one, by the same rule ``_tail_window`` cuts the restart's window
     with: a clock stepped across UTC midnight can leave rounds the window
     excludes sitting between rounds it includes, and those are a reading this
@@ -1748,11 +1864,16 @@ def _window_segments(
     refuses, because nothing dropped it out of the window - it is not there.
     On a journal whose days are monotone the run is every in-window segment,
     so the numbers a window produces do not change.
+
+    A run that ends is kept until a later one starts, because the rounds after
+    the window's last in-window segment are ordinarily just the rounds the
+    stream has written since. At most two folds are alive at once and neither
+    holds a segment.
     """
     first_day = _segment_day(window_start_ns)
     last_day = _segment_day(window_end_ns)
-    run: list[_ReadSegment] = []
-    kept: list[_ReadSegment] = []
+    fold = _WindowFold(spec_hash=spec_hash, snapshot_every_rounds=spec.snapshot_every_rounds)
+    kept = fold
     for path in _segment_paths(journal_root):
         inside: _ReadSegment | None = None
         if first_day <= path.parent.name <= last_day:
@@ -1760,48 +1881,22 @@ def _window_segments(
             if window_start_ns <= read.segment.received_time_ns <= window_end_ns:
                 inside = read
         if inside is None:
-            run = []
+            if fold.rounds:
+                fold = _WindowFold(
+                    spec_hash=spec_hash, snapshot_every_rounds=spec.snapshot_every_rounds
+                )
             continue
-        run.append(inside)
-        kept = run
-    if not kept:
+        fold.add(inside)
+        kept = fold
+    if kept.rounds == 0:
         raise BinanceMeasurementJournalSpecError(
             "MEASUREMENT_WINDOW_EMPTY: this journal received no round inside the window"
         )
-    reasons = _window_reasons(kept, spec_hash=spec_hash)
-    if reasons:
+    if kept.reasons:
         raise BinanceMeasurementJournalSpecError(
-            "journal verification failed: " + ",".join(reasons)
+            "journal verification failed: " + ",".join(kept.reasons)
         )
-    return tuple(read.segment for read in kept)
-
-
-def _window_reasons(kept: Sequence[_ReadSegment], *, spec_hash: str) -> list[str]:
-    """Everything the window's segments can be wrong about, as the walk judges it.
-
-    Anchored like the tail walk: the first segment's predecessor is outside
-    the window by construction and is taken as given, and every segment after
-    it must follow the one before by sequence and name its hash.
-    """
-    first = kept[0].segment
-    expected_sequence = first.sequence
-    previous_hash = ZERO_HASH if first.sequence == 0 else first.previous_segment_hash
-    reasons: list[str] = []
-    for read in kept:
-        reasons.extend(
-            _segment_reasons(
-                read.document,
-                read.segment,
-                name=read.name,
-                day=read.day,
-                expected_sequence=expected_sequence,
-                spec_hash=spec_hash,
-                previous_hash=previous_hash,
-            )
-        )
-        expected_sequence += 1
-        previous_hash = read.segment.content_hash
-    return reasons
+    return kept
 
 
 def _snapshot_round_count(segments: Sequence[MeasurementSegment], *, every: int) -> int:
@@ -1814,17 +1909,23 @@ def _snapshot_round_count(segments: Sequence[MeasurementSegment], *, every: int)
     return sum(1 for segment in segments if segment.sequence % every == 0)
 
 
-def _failure_totals(segments: Sequence[MeasurementSegment]) -> dict[str, int]:
-    """How many of these rounds each endpoint failed in (ruling 10's ``<endpoint>:``)."""
+def _failure_counts(segment: MeasurementSegment) -> dict[str, int]:
+    """How many of one round's failures each endpoint owns (ruling 10's ``<endpoint>:``)."""
     return {
         endpoint: sum(
-            1
-            for segment in segments
-            for failure in segment.failures
-            if failure.startswith(f"{endpoint}:")
+            1 for failure in segment.failures if failure.startswith(f"{endpoint}:")
         )
         for endpoint in SNAPSHOT_ENDPOINTS
     }
+
+
+def _failure_totals(segments: Sequence[MeasurementSegment]) -> dict[str, int]:
+    """How many of these rounds each endpoint failed in."""
+    totals = dict.fromkeys(SNAPSHOT_ENDPOINTS, 0)
+    for segment in segments:
+        for endpoint, count in _failure_counts(segment).items():
+            totals[endpoint] += count
+    return totals
 
 
 def _excluded_totals(segments: Sequence[MeasurementSegment]) -> dict[str, int]:
@@ -1868,84 +1969,77 @@ def _age_seconds(received_time_ns: int, *, now_ns: int) -> Decimal:
     )
 
 
-def _mean(values: Sequence[Decimal], *, quantum: Decimal) -> Decimal | None:
-    """The mean at the recorded precision, or ``None`` where nothing was measured."""
-    if not values:
+def _mean(total: Decimal, rounds: int, *, quantum: Decimal) -> Decimal | None:
+    """A folded total over its rounds, at the recorded precision.
+
+    ``None`` where nothing was measured: a symbol no round carried has no
+    mean, which is not a mean of zero. The total was summed in round
+    order, so it is the decimal those rounds added up to when the window
+    was read whole.
+    """
+    if rounds == 0:
         return None
-    return _rounded(sum(values, Decimal(0)) / Decimal(len(values)), quantum)
+    return _rounded(total / Decimal(rounds), quantum)
 
 
 def _rounded(value: Decimal, quantum: Decimal) -> Decimal:
     return value.quantize(quantum, rounding=ROUND_HALF_EVEN)
 
 
-def _rows_by_symbol[RowT: PremiumRow | BookRow](
-    rounds: Iterable[tuple[RowT, ...] | None],
-) -> dict[str, list[RowT]]:
-    """Every round's rows regrouped under their symbol, in round order.
-
-    ``None`` and ``()`` both contribute nothing: an endpoint that was not read
-    this round and one that was read and measured nothing leave the same gap
-    in a symbol's series, and the segment's ``failures`` and ``excluded``
-    counts are where the difference is recorded.
-    """
-    tally: dict[str, list[RowT]] = {}
-    for rows in rounds:
-        for row in rows or ():
-            tally.setdefault(row.symbol, []).append(row)
-    return tally
-
-
 def _perpetual_block(
-    premium: Mapping[str, list[PremiumRow]], book: Mapping[str, list[BookRow]]
+    premium: Mapping[str, _PremiumTally], book: Mapping[str, _BookTally]
 ) -> dict[str, object]:
     """Per USDT perpetual: its two round counts, its funding, its basis and its spread.
 
     The counts are kept apart because the two endpoints are: a symbol the
     premium index listed and the book ticker did not is measured in one and
     not the other, and averaging over a single count would quietly claim
-    otherwise.
+    otherwise. A symbol no round in the window carried has no tally here at
+    all, which is how it stays absent from the map rather than present with
+    zeroes.
     """
     block: dict[str, object] = {}
     for symbol in sorted(set(premium) | set(book)):
-        rows = premium.get(symbol, [])
-        books = book.get(symbol, [])
+        rates = premium.get(symbol, _PremiumTally())
+        books = book.get(symbol, _BookTally())
         block[symbol] = {
-            "premium_rounds": len(rows),
-            "book_rounds": len(books),
+            "premium_rounds": rates.rounds,
+            "book_rounds": books.rounds,
             "mean_last_funding_rate": _recorded(
-                _mean([row.last_funding_rate for row in rows], quantum=_FUNDING_RATE_QUANTUM)
+                _mean(rates.funding_total, rates.rounds, quantum=_FUNDING_RATE_QUANTUM)
             ),
             # The venue's own last rate, from the newest round that carried
             # the symbol: a week's mean says what was paid, this says what is
             # being paid now.
-            "last_funding_rate": str(rows[-1].last_funding_rate) if rows else None,
+            "last_funding_rate": (
+                None if rates.last_funding_rate is None else str(rates.last_funding_rate)
+            ),
             "mean_basis_bps": _recorded(
-                _mean([row.basis_bps for row in rows], quantum=_BPS_QUANTUM)
+                _mean(rates.basis_total, rates.rounds, quantum=_BPS_QUANTUM)
             ),
             "mean_spread_bps": _recorded(
-                _mean([row.spread_bps for row in books], quantum=_BPS_QUANTUM)
+                _mean(books.spread_total, books.rounds, quantum=_BPS_QUANTUM)
             ),
         }
     return block
 
 
-def _spot_block(book: Mapping[str, list[BookRow]]) -> dict[str, object]:
+def _spot_block(book: Mapping[str, _BookTally]) -> dict[str, object]:
     """Per USDT spot pair: how many rounds quoted it and what it cost to cross."""
     return {
         symbol: {
-            "book_rounds": len(rows),
+            "book_rounds": tally.rounds,
             "mean_spread_bps": _recorded(
-                _mean([row.spread_bps for row in rows], quantum=_BPS_QUANTUM)
+                _mean(tally.spread_total, tally.rounds, quantum=_BPS_QUANTUM)
             ),
         }
-        for symbol, rows in sorted(book.items())
+        for symbol, tally in sorted(book.items())
     }
 
 
 def _cost_blocks(
     spec: BinanceMeasurementJournalSpec,
-    segments: Sequence[MeasurementSegment],
+    measured: Mapping[str, Sequence[InstrumentObservation]],
     *,
     floor_count: int,
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -1962,7 +2056,6 @@ def _cost_blocks(
     instead of the receipt's eligibility (ruling 14).
     """
     keys = _notional_keys(spec.notionals)
-    measured = _measured_depth(segments)
     statistics = tuple(
         _instrument_statistics(instrument, measured.get(instrument.instrument_id, ()), keys=keys)
         for instrument in spec.instruments
@@ -2051,23 +2144,6 @@ def _window_tier_block(
             "p50_of_p90": _recorded(_quantile(nineties, _P50) if reported else None),
         }
     return {"instrument_count": len(members), "slippage": slippage}
-
-
-def _measured_depth(
-    segments: Sequence[MeasurementSegment],
-) -> dict[str, list[InstrumentObservation]]:
-    """Every measured depth observation of the window, per instrument, in round order.
-
-    A failed observation carries no measurement at all, so it is left out
-    rather than counted as a zero - exactly what v1's finalisation does with
-    the segments its chain head covers.
-    """
-    measured: dict[str, list[InstrumentObservation]] = {}
-    for segment in segments:
-        for observation in segment.depth:
-            if observation.ok:
-                measured.setdefault(observation.instrument_id, []).append(observation)
-    return measured
 
 
 def _counted(value: Decimal | int | None) -> int:

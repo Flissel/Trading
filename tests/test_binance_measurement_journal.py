@@ -1,5 +1,8 @@
+import gc
 import json
+import time
 import urllib.request
+import weakref
 from collections.abc import Mapping, Sequence
 from decimal import Decimal
 from pathlib import Path
@@ -43,6 +46,8 @@ from trading_bot.binance_measurement_journal import (
     SPOT_BOOK_TICKER_URL,
     BinanceMeasurementJournalSpecError,
     MeasurementChainHead,
+    MeasurementSegment,
+    _ReadSegment,
     _segment_paths,
     _tier_floor_count,
     _verified_chain,
@@ -1861,6 +1866,69 @@ def test_a_snapshot_over_rounds_two_to_seven_equals_a_hand_computation(
     }
     material = {key: value for key, value in document.items() if key != "content_hash"}
     assert document["content_hash"] == content_sha256(material)
+
+
+# A fixed creation stamp, so the journal spec - and with it every hash that
+# names it - is the same on every run of the pin below.
+PINNED_CREATION_NS = 1_790_000_000_000_000_000
+# What rounds two to seven of `scripted_journal` seal, taken from the reading
+# that held every segment of the window in memory at once. Streaming the
+# window may not move a digit of it.
+SCRIPTED_WINDOW_CONTENT_HASH = "607f8c37bf9ab8576018a0f566f7a60e80ad48b45c3089dab7a7535dd2d97cbe"
+
+
+def test_a_windows_document_is_the_same_reading_however_it_is_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The document's seal is the pin: the same rounds, the same numbers, the
+    same bytes, whether the window is held in memory or folded one segment at
+    a time."""
+    monkeypatch.setattr(time, "time_ns", lambda: PINNED_CREATION_NS)
+    journal = scripted_journal(tmp_path)
+
+    document = take_snapshot(tmp_path, journal, first=2, last=7)
+
+    assert document["content_hash"] == SCRIPTED_WINDOW_CONTENT_HASH
+
+
+def held_window_segments(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """How many of a window's segments are alive at each read, in read order.
+
+    The parsed model is the expensive half of a segment - 2.4 MB of rows on a
+    snapshot round of the real stream - so a weak reference to it is alive
+    exactly while the reading is still holding that segment.
+    """
+    alive: list[weakref.ReferenceType[MeasurementSegment]] = []
+    held: list[int] = []
+    read_segment = binance_measurement_journal._read_segment
+
+    def counting(journal_root: Path, path: Path) -> _ReadSegment:
+        read = read_segment(journal_root, path)
+        alive.append(weakref.ref(read.segment))
+        gc.collect()
+        held.append(sum(1 for reference in alive if reference() is not None))
+        return read
+
+    monkeypatch.setattr(binance_measurement_journal, "_read_segment", counting)
+    return held
+
+
+def test_a_snapshot_holds_at_most_two_of_the_windows_segments_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A week of the real stream is ~9 900 segments, ~2 000 of them 2.4 MB once
+    parsed: a reading that kept them all would need more than 5 GB of memory to
+    seal one weekly snapshot. The window is folded segment by segment instead -
+    the one before the current one is still in hand, because that is what the
+    chain link is checked against, and nothing older."""
+    journal = scripted_journal(tmp_path)
+    held = held_window_segments(monkeypatch)
+
+    document = take_snapshot(tmp_path, journal, first=0, last=SCRIPTED_ROUNDS - 1)
+
+    assert document["rounds"] == SCRIPTED_ROUNDS
+    assert len(held) == SCRIPTED_ROUNDS
+    assert max(held) <= 2
 
 
 def decimal_or_none(value: object) -> str | None:
