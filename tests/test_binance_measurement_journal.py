@@ -143,8 +143,9 @@ def test_the_measurement_endpoints_are_the_three_the_spec_names() -> None:
 
 
 def test_premium_rows_keep_the_usdt_perpetuals_and_quantise_the_basis_by_hand() -> None:
-    rows = premium_rows(premium_payload())
+    rows, excluded = premium_rows(premium_payload())
     assert [row.symbol for row in rows] == ["BTCUSDT", "ETHUSDT", "XRPUSDT"]
+    assert excluded == 0
     # (100.5 - 100) / 100 * 10 000 = 50 bps.
     assert rows[0].basis_bps == Decimal("50.000000")
     assert rows[0].mark_price == Decimal("100.5")
@@ -159,16 +160,17 @@ def test_premium_rows_keep_the_usdt_perpetuals_and_quantise_the_basis_by_hand() 
 
 
 def test_book_rows_keep_the_usdt_pairs_and_quantise_the_spread_by_hand() -> None:
-    perpetual = book_rows(perp_book_payload())
+    perpetual, excluded = book_rows(perp_book_payload())
     assert [row.symbol for row in perpetual] == ["BTCUSDT", "ETHUSDT"]
+    assert excluded == 0
     # mid 100, spread 0.02 -> 2 bps.
     assert perpetual[0].spread_bps == Decimal("2.000000")
     assert (perpetual[0].bid_price, perpetual[0].bid_qty) == (Decimal("99.99"), Decimal("3"))
     assert (perpetual[0].ask_price, perpetual[0].ask_qty) == (Decimal("100.01"), Decimal("4"))
     # mid 2000, spread 2 -> 10 bps.
     assert perpetual[1].spread_bps == Decimal("10.000000")
-    spot = book_rows(spot_book_payload())
-    assert [row.symbol for row in spot] == ["BTCUSDT", "DOGEUSDT"]
+    spot, spot_excluded = book_rows(spot_book_payload())
+    assert (spot_excluded, [row.symbol for row in spot]) == (0, ["BTCUSDT", "DOGEUSDT"])
     # mid 100, spread 0.1 -> 10 bps.
     assert spot[0].spread_bps == Decimal("10.000000")
     # mid 3.5, spread 1 -> 10 000 / 3.5 = 2857.142857142857... at 1e-6, half even.
@@ -185,8 +187,6 @@ def test_book_rows_keep_the_usdt_pairs_and_quantise_the_spread_by_hand() -> None
         ({"symbol": 17}, "malformed entry at index 1"),
         # Quoted in USDT and not a venue symbol: kept scope, unreadable row.
         ({"symbol": "ETH-USDT"}, "malformed entry at index 1"),
-        ({"indexPrice": "0"}, "non-positive premium index ETHUSDT"),
-        ({"markPrice": "-1"}, "non-positive premium index ETHUSDT"),
         ({"symbol": "BTCUSDT"}, "duplicate entry BTCUSDT"),
     ],
 )
@@ -207,10 +207,7 @@ def test_one_bad_premium_entry_refuses_the_whole_payload(
     [
         ({"bidPrice": 1999.0}, "malformed entry ETHUSDT"),
         ({"askQty": ["2.5"]}, "malformed entry ETHUSDT"),
-        ({"bidQty": "0"}, "empty book ETHUSDT"),
-        ({"askPrice": "0"}, "empty book ETHUSDT"),
-        ({"bidPrice": "2001", "askPrice": "2000"}, "crossed book ETHUSDT"),
-        ({"bidPrice": "2000", "askPrice": "2000"}, "crossed book ETHUSDT"),
+        ({"askQty": None}, "malformed entry ETHUSDT"),
     ],
 )
 def test_one_bad_book_entry_refuses_the_whole_payload(
@@ -437,6 +434,16 @@ def segment_documents(journal_root: Path) -> list[dict[str, object]]:
     return [read_document(path) for path in segment_paths(journal_root)]
 
 
+def rows_of(document: dict[str, object], key: str) -> list[dict[str, object]]:
+    rows = document[key]
+    assert isinstance(rows, list)
+    return rows
+
+
+def nothing_excluded() -> dict[str, int]:
+    return {"premiumIndex": 0, "perpBookTicker": 0, "spotBookTicker": 0}
+
+
 def relative_names(journal_root: Path) -> list[str]:
     root = journal_root / "segments"
     return [path.relative_to(root).as_posix() for path in segment_paths(journal_root)]
@@ -490,6 +497,8 @@ def test_six_rounds_chain_and_only_the_snapshot_rounds_carry_the_all_symbol_book
     for document in documents[1:5]:
         assert (document["perp_book"], document["spot_book"]) == (None, None)
         assert document["failures"] == []
+    # Sealed on every segment, zero where the round took no snapshot (ruling 11).
+    assert [document["excluded"] for document in documents] == [nothing_excluded()] * 6
     assert snapshots.urls == [
         PREMIUM_INDEX_URL, PERP_BOOK_TICKER_URL, SPOT_BOOK_TICKER_URL,
     ] * 2
@@ -637,6 +646,8 @@ def test_a_malformed_snapshot_payload_is_a_recorded_failure_not_an_exception(
     ]
     assert (document["perp_book"], document["spot_book"]) == (None, None)
     assert document["premium_index"] is not None
+    # A wrong type is an API change, not a halted pair: nothing was excluded.
+    assert document["excluded"] == nothing_excluded()
     assert verified(journal)[:2] == (True, ())
 
 
@@ -1039,3 +1050,144 @@ def test_a_resume_refuses_a_chain_that_was_changed_rather_than_interrupted(
             clock=FakeClock(start=RECEIVED_NS + 10**12),
             sleep=FakeSleep(),
         )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"indexPrice": "0"},
+        {"markPrice": "0"},
+        {"markPrice": "-1"},
+        {"nextFundingTime": 0},
+    ],
+)
+def test_a_premium_entry_that_measures_nothing_is_excluded_not_refused(
+    overrides: dict[str, object],
+) -> None:
+    """Ruling 11: a delisted perpetual's zero index costs its row, not the venue's."""
+    payload = premium_payload()
+    entry = payload[1]
+    assert isinstance(entry, dict)
+    payload[1] = {**entry, **overrides}
+    rows, excluded = premium_rows(payload)
+    assert [row.symbol for row in rows] == ["BTCUSDT", "XRPUSDT"]
+    assert excluded == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"bidQty": "0"},
+        {"askQty": "0"},
+        {"bidPrice": "0"},
+        {"askPrice": "0"},
+        {"bidPrice": "-1999"},
+        # Crossed, and locked: a zero spread is not a measurement either.
+        {"bidPrice": "2001", "askPrice": "2000"},
+        {"bidPrice": "2000", "askPrice": "2000"},
+    ],
+)
+def test_a_book_entry_that_measures_nothing_is_excluded_not_refused(
+    overrides: dict[str, object],
+) -> None:
+    """Ruling 11: a halted pair quotes a zero book every day and costs its row only."""
+    payload = perp_book_payload()
+    entry = payload[1]
+    assert isinstance(entry, dict)
+    payload[1] = {**entry, **overrides}
+    rows, excluded = book_rows(payload)
+    assert [row.symbol for row in rows] == ["BTCUSDT"]
+    assert excluded == 1
+
+
+def test_a_payload_whose_every_usdt_symbol_is_unusable_is_still_a_refusal() -> None:
+    """A venue-wide defect is not a halted pair: there is nothing to record."""
+    payload: list[object] = [
+        {**entry, "bidQty": "0"} for entry in perp_book_payload() if isinstance(entry, dict)
+    ]
+    with pytest.raises(DepthPayloadError, match="every USDT symbol was excluded"):
+        book_rows(payload)
+
+
+def test_unusable_symbols_are_excluded_from_a_snapshot_and_counted_in_the_segment(
+    tmp_path: Path,
+) -> None:
+    journal = measurement_journal(tmp_path)
+    premium = premium_payload()
+    delisted = premium[2]
+    assert isinstance(delisted, dict)
+    premium[2] = {**delisted, "indexPrice": "0"}
+    halted: dict[str, object] = {
+        "symbol": "LUNAUSDT",
+        "bidPrice": "1.5",
+        "bidQty": "0",
+        "askPrice": "1.6",
+        "askQty": "10",
+    }
+    crossed: dict[str, object] = {
+        "symbol": "XRPUSDT",
+        "bidPrice": "2.1",
+        "bidQty": "5",
+        "askPrice": "2.0",
+        "askQty": "5",
+    }
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=1,
+        fetcher=FakeVenue(),
+        array_fetcher=SnapshotVenue(
+            payloads={
+                PREMIUM_INDEX_URL: premium,
+                SPOT_BOOK_TICKER_URL: [*spot_book_payload(), halted, crossed],
+            }
+        ),
+        clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    document = segment_documents(journal)[0]
+    assert document["failures"] == []
+    assert document["excluded"] == {
+        "premiumIndex": 1,
+        "perpBookTicker": 0,
+        "spotBookTicker": 2,
+    }
+    assert [row["symbol"] for row in rows_of(document, "premium_index")] == [
+        "BTCUSDT",
+        "ETHUSDT",
+    ]
+    assert [row["symbol"] for row in rows_of(document, "spot_book")] == [
+        "BTCUSDT",
+        "DOGEUSDT",
+    ]
+    assert [row["symbol"] for row in rows_of(document, "perp_book")] == ["BTCUSDT", "ETHUSDT"]
+    assert verified(journal)[:2] == (True, ())
+
+
+def test_an_endpoint_whose_every_symbol_is_unusable_is_a_failure_in_the_segment(
+    tmp_path: Path,
+) -> None:
+    journal = measurement_journal(tmp_path)
+    dead: list[object] = [
+        {**entry, "askQty": "0"} for entry in perp_book_payload() if isinstance(entry, dict)
+    ]
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=1,
+        fetcher=FakeVenue(),
+        array_fetcher=SnapshotVenue(payloads={PERP_BOOK_TICKER_URL: dead}),
+        clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    document = segment_documents(journal)[0]
+    assert document["failures"] == ["perpBookTicker:every USDT symbol was excluded"]
+    assert document["perp_book"] is None
+    # A refused payload was not read to the end, so it counts no exclusions.
+    assert document["excluded"] == {
+        "premiumIndex": 0,
+        "perpBookTicker": 0,
+        "spotBookTicker": 0,
+    }

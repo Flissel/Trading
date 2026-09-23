@@ -83,6 +83,12 @@ SPOT_BOOK_TICKER_URL = "https://api.binance.com/api/v3/ticker/bookTicker"
 PREMIUM_INDEX_ENDPOINT = "premiumIndex"
 PERP_BOOK_TICKER_ENDPOINT = "perpBookTicker"
 SPOT_BOOK_TICKER_ENDPOINT = "spotBookTicker"
+# The keys every segment's `excluded` count carries, in request order.
+SNAPSHOT_ENDPOINTS: tuple[str, ...] = (
+    PREMIUM_INDEX_ENDPOINT,
+    PERP_BOOK_TICKER_ENDPOINT,
+    SPOT_BOOK_TICKER_ENDPOINT,
+)
 # The measurement stream is a USDT stream: the carry family quotes in USDT and
 # a symbol quoted in anything else is dropped before it is parsed.
 QUOTE_ASSET = "USDT"
@@ -252,6 +258,14 @@ class MeasurementSegment(_Frozen):
     round - the sequence decides, ``sequence % snapshot_every_rounds == 0``, so
     the first round of a journal is one - and on a snapshot round whose
     endpoint failed; ``failures`` then names the endpoint and what it answered.
+
+    ``excluded`` counts, per endpoint, the USDT symbols that parsed and
+    measured nothing - a halted pair's zero book, a delisted perpetual's zero
+    index - and were left out of the rows rather than costing the whole
+    endpoint (ruling 11). All three keys are present on every segment and are
+    zero on a round that took no snapshot, so a reader never has to tell an
+    absent count from a zero one. Symbols quoted in something other than USDT
+    are out of scope and are not counted here.
     """
 
     version: Literal["binance-measurement-journal/1.0.0"]
@@ -264,6 +278,7 @@ class MeasurementSegment(_Frozen):
     perp_book: tuple[BookRow, ...] | None
     spot_book: tuple[BookRow, ...] | None
     failures: tuple[str, ...]
+    excluded: dict[str, int]
     content_hash: str
 
     @field_validator("spec_hash", "previous_segment_hash", "content_hash")
@@ -318,6 +333,15 @@ class MeasurementSegment(_Frozen):
             raise ValueError("an endpoint fails at most once per round")
         return value
 
+    @field_validator("excluded")
+    @classmethod
+    def validate_excluded(cls, value: dict[str, int]) -> dict[str, int]:
+        if set(value) != set(SNAPSHOT_ENDPOINTS):
+            raise ValueError(f"a segment counts exclusions for {SNAPSHOT_ENDPOINTS}")
+        if any(count < 0 for count in value.values()):
+            raise ValueError("an exclusion count cannot be negative")
+        return value
+
     @model_validator(mode="after")
     def validate_chain_link(self) -> Self:
         if self.sequence == 0 and self.previous_segment_hash != ZERO_HASH:
@@ -369,17 +393,25 @@ def _distinct_rows[RowT: PremiumRow | BookRow](
     return value
 
 
-def premium_rows(payload: Sequence[object]) -> tuple[PremiumRow, ...]:
-    """Parse ``GET /fapi/v1/premiumIndex`` (all perpetuals) into the USDT rows.
+def premium_rows(payload: Sequence[object]) -> tuple[tuple[PremiumRow, ...], int]:
+    """Parse ``GET /fapi/v1/premiumIndex`` into the USDT rows and the count excluded.
 
     A symbol quoted in anything but USDT is dropped before its numbers are
-    read; every symbol that is kept must parse whole. Prices and the funding
-    rate are Binance's decimal strings - a JSON number is a float that has
-    already lost digits, so it refuses the entry - and one refused entry
-    refuses the payload, because a partial all-symbol snapshot is a silently
-    incomplete one (fail closed, as ``depth_observation`` is).
+    read, and is not counted. Every symbol that is kept must *parse* whole:
+    prices and the funding rate are Binance's decimal strings, and a JSON
+    number is a float that has already lost digits, so a wrong type, a missing
+    field or an entry that is not an object refuses the whole payload. That is
+    evidence of an API change, and half an all-symbol snapshot is a silently
+    incomplete one.
+
+    An entry that parses and measures nothing - a zero or negative index or
+    mark price, a funding time that is not a stamp - is *excluded* from the
+    rows and counted instead (ruling 11): a delisted perpetual can carry a zero
+    index every round, and one of those must not cost the whole venue's
+    snapshot.
     """
     rows: list[PremiumRow] = []
+    excluded = 0
     seen: set[str] = set()
     for index, entry in enumerate(payload):
         document = _mapping_entry(entry, index=index)
@@ -396,33 +428,34 @@ def premium_rows(payload: Sequence[object]) -> tuple[PremiumRow, ...]:
             next_funding = _integer(document.get("nextFundingTime"), field_name="nextFundingTime")
         except DepthPayloadError as error:
             raise DepthPayloadError(f"malformed entry {symbol}") from error
-        if mark_price <= 0 or index_price <= 0 or next_funding <= 0:
-            raise DepthPayloadError(f"non-positive premium index {symbol}")
-        rows.append(
-            PremiumRow(
-                symbol=symbol,
-                mark_price=mark_price,
-                index_price=index_price,
-                last_funding_rate=funding_rate,
-                next_funding_time_ms=next_funding,
-                basis_bps=_quantised(
-                    (mark_price - index_price) / index_price * _BPS, _BPS_QUANTUM
-                ),
-            )
+        row = _premium_row(
+            symbol,
+            mark_price=mark_price,
+            index_price=index_price,
+            funding_rate=funding_rate,
+            next_funding=next_funding,
         )
-    return _kept(rows)
+        if row is None:
+            excluded += 1
+            continue
+        rows.append(row)
+    return _kept(rows, excluded=excluded), excluded
 
 
-def book_rows(payload: Sequence[object]) -> tuple[BookRow, ...]:
-    """Parse one ``ticker/bookTicker`` array (perpetual or spot) into the USDT rows.
+def book_rows(payload: Sequence[object]) -> tuple[tuple[BookRow, ...], int]:
+    """Parse one ``ticker/bookTicker`` array into the USDT rows and the count excluded.
 
     The spread is the distance between the two best prices over their mid, in
-    basis points at 1e-6, half-even. A crossed book and a side displaying no
-    price or no quantity are defects of the payload, not measurements: they
-    refuse the whole snapshot the way one bad entry does, so a round either
-    records a venue-wide book or records why it did not.
+    basis points at 1e-6, half-even. What refuses the payload and what is
+    merely excluded from it is the split ``premium_rows`` makes: a wrong type
+    or a missing field is an API change and refuses; a book that parses and
+    displays nothing to measure - a zero or negative price or quantity on
+    either side, a crossed or locked book, a spread below the recorded
+    precision - is excluded and counted (ruling 11). Halted spot pairs quote a
+    zero book every day and may not cost the whole venue's snapshot.
     """
     rows: list[BookRow] = []
+    excluded = 0
     seen: set[str] = set()
     for index, entry in enumerate(payload):
         document = _mapping_entry(entry, index=index)
@@ -437,25 +470,71 @@ def book_rows(payload: Sequence[object]) -> tuple[BookRow, ...]:
             ask_qty = _decimal_string(document.get("askQty"), field_name="askQty")
         except DepthPayloadError as error:
             raise DepthPayloadError(f"malformed entry {symbol}") from error
-        if min(bid_price, bid_qty, ask_price, ask_qty) <= 0:
-            raise DepthPayloadError(f"empty book {symbol}")
-        if bid_price >= ask_price:
-            raise DepthPayloadError(f"crossed book {symbol}")
-        mid = (bid_price + ask_price) / Decimal(2)
-        spread_bps = _quantised((ask_price - bid_price) / mid * _BPS, _BPS_QUANTUM)
-        if spread_bps <= 0:
-            raise DepthPayloadError(f"book below the recorded precision {symbol}")
-        rows.append(
-            BookRow(
-                symbol=symbol,
-                bid_price=bid_price,
-                bid_qty=bid_qty,
-                ask_price=ask_price,
-                ask_qty=ask_qty,
-                spread_bps=spread_bps,
-            )
+        row = _book_row(
+            symbol,
+            bid_price=bid_price,
+            bid_qty=bid_qty,
+            ask_price=ask_price,
+            ask_qty=ask_qty,
         )
-    return _kept(rows)
+        if row is None:
+            excluded += 1
+            continue
+        rows.append(row)
+    return _kept(rows, excluded=excluded), excluded
+
+
+def _premium_row(
+    symbol: str,
+    *,
+    mark_price: Decimal,
+    index_price: Decimal,
+    funding_rate: Decimal,
+    next_funding: int,
+) -> PremiumRow | None:
+    """The row a parsed premium-index entry measures, or ``None`` for none of it."""
+    if mark_price <= 0 or index_price <= 0 or next_funding <= 0:
+        return None
+    try:
+        basis_bps = _quantised((mark_price - index_price) / index_price * _BPS, _BPS_QUANTUM)
+    except DepthPayloadError:
+        return None
+    return PremiumRow(
+        symbol=symbol,
+        mark_price=mark_price,
+        index_price=index_price,
+        last_funding_rate=funding_rate,
+        next_funding_time_ms=next_funding,
+        basis_bps=basis_bps,
+    )
+
+
+def _book_row(
+    symbol: str,
+    *,
+    bid_price: Decimal,
+    bid_qty: Decimal,
+    ask_price: Decimal,
+    ask_qty: Decimal,
+) -> BookRow | None:
+    """The row a parsed book entry measures, or ``None`` for none of it."""
+    if min(bid_price, bid_qty, ask_price, ask_qty) <= 0 or bid_price >= ask_price:
+        return None
+    mid = (bid_price + ask_price) / Decimal(2)
+    try:
+        spread_bps = _quantised((ask_price - bid_price) / mid * _BPS, _BPS_QUANTUM)
+    except DepthPayloadError:
+        return None
+    if spread_bps <= 0:
+        return None
+    return BookRow(
+        symbol=symbol,
+        bid_price=bid_price,
+        bid_qty=bid_qty,
+        ask_price=ask_price,
+        ask_qty=ask_qty,
+        spread_bps=spread_bps,
+    )
 
 
 def _mapping_entry(entry: object, *, index: int) -> Mapping[str, object]:
@@ -469,11 +548,11 @@ def _entry_symbol(document: Mapping[str, object], *, index: int) -> str | None:
     """The entry's symbol, or ``None`` where the journal does not keep it.
 
     A symbol quoted in something other than USDT is dropped, which is the
-    journal's declared scope and not a defect. A symbol that *is* quoted in
-    USDT and is not an upper-case venue symbol refuses the payload: it is a
-    row this parser does not understand in the set it does keep. The index
-    names the entry rather than the string, so a hostile payload cannot write
-    its own text into a segment.
+    journal's declared scope and neither a defect nor an exclusion. A symbol
+    that *is* quoted in USDT and is not an upper-case venue symbol refuses the
+    payload: it is a row this parser does not understand in the set it does
+    keep. The index names the entry rather than the string, so a hostile
+    payload cannot write its own text into a segment.
     """
     try:
         symbol = _string(document.get("symbol"), field_name="symbol")
@@ -487,22 +566,27 @@ def _entry_symbol(document: Mapping[str, object], *, index: int) -> str | None:
 
 
 def _refuse_duplicate(symbol: str, seen: set[str]) -> None:
+    """One symbol answers once: a repeat is a payload this parser cannot read."""
     if symbol in seen:
         raise DepthPayloadError(f"duplicate entry {symbol}")
     seen.add(symbol)
 
 
-def _kept[RowT](rows: list[RowT]) -> tuple[RowT, ...]:
+def _kept[RowT](rows: list[RowT], *, excluded: int) -> tuple[RowT, ...]:
     """The parsed rows, refusing a payload that kept none.
 
     Binance's three all-symbol endpoints list hundreds of USDT symbols. An
     answer that carries none of them is not a quiet venue, it is an answer this
-    parser does not understand, and the round records it as a failure rather
-    than as an empty measurement.
+    parser does not understand; an answer whose every USDT symbol was
+    unusable is a venue-wide defect rather than a halted pair. Both are
+    recorded as that endpoint's failure for the round rather than as an empty
+    measurement, and the two say which happened.
     """
-    if not rows:
-        raise DepthPayloadError(f"no {QUOTE_ASSET} symbols")
-    return tuple(rows)
+    if rows:
+        return tuple(rows)
+    if excluded:
+        raise DepthPayloadError(f"every {QUOTE_ASSET} symbol was excluded")
+    raise DepthPayloadError(f"no {QUOTE_ASSET} symbols")
 
 
 def create_measurement_journal(
@@ -704,8 +788,9 @@ def _sample_round(
     The depth walk is v1's, instrument by instrument, so the slippage tiers
     stay continuous across the two journals; every fifth round adds the three
     all-symbol requests. Nothing here raises: a failed instrument is its own
-    failed observation and a failed endpoint is an entry in ``failures``
-    (ruling 10), and the segment is published either way.
+    failed observation, a failed endpoint is an entry in ``failures``
+    (ruling 10), a symbol that measured nothing is a count in ``excluded``
+    (ruling 11), and the segment is published either way.
     """
     received_time_ns = clock()
     sequence = 0 if head is None else head.last_sequence + 1
@@ -719,29 +804,39 @@ def _sample_round(
     perp_book: tuple[BookRow, ...] | None = None
     spot_book: tuple[BookRow, ...] | None = None
     failures: list[str] = []
+    excluded = dict.fromkeys(SNAPSHOT_ENDPOINTS, 0)
     if sequence % spec.snapshot_every_rounds == 0:
-        premium_index, premium_seconds, premium_failure = _snapshot(
+        premium = _snapshot(
             endpoint=PREMIUM_INDEX_ENDPOINT,
             url=PREMIUM_INDEX_URL,
             array_fetcher=array_fetcher,
             parse=premium_rows,
         )
-        perp_book, perp_seconds, perp_failure = _snapshot(
+        perpetual = _snapshot(
             endpoint=PERP_BOOK_TICKER_ENDPOINT,
             url=PERP_BOOK_TICKER_URL,
             array_fetcher=array_fetcher,
             parse=book_rows,
         )
-        spot_book, spot_seconds, spot_failure = _snapshot(
+        spot = _snapshot(
             endpoint=SPOT_BOOK_TICKER_ENDPOINT,
             url=SPOT_BOOK_TICKER_URL,
             array_fetcher=array_fetcher,
             parse=book_rows,
         )
-        throttle_seconds = max(throttle_seconds, premium_seconds, perp_seconds, spot_seconds)
+        premium_index, perp_book, spot_book = premium.rows, perpetual.rows, spot.rows
+        excluded = {
+            PREMIUM_INDEX_ENDPOINT: premium.excluded,
+            PERP_BOOK_TICKER_ENDPOINT: perpetual.excluded,
+            SPOT_BOOK_TICKER_ENDPOINT: spot.excluded,
+        }
+        throttle_seconds = max(
+            throttle_seconds, premium.throttle_seconds, perpetual.throttle_seconds,
+            spot.throttle_seconds,
+        )
         failures = [
             failure
-            for failure in (premium_failure, perp_failure, spot_failure)
+            for failure in (premium.failure, perpetual.failure, spot.failure)
             if failure is not None
         ]
     material: dict[str, object] = {
@@ -755,6 +850,7 @@ def _sample_round(
         "perp_book": _dumped(perp_book),
         "spot_book": _dumped(spot_book),
         "failures": failures,
+        "excluded": excluded,
     }
     segment = MeasurementSegment.model_validate(
         {**material, "content_hash": content_sha256(material)}
@@ -762,23 +858,33 @@ def _sample_round(
     return segment, throttle_seconds
 
 
+class _Snapshot[RowT](NamedTuple):
+    """What one all-symbol request came back with.
+
+    ``rows`` is ``None`` exactly when ``failure`` is set - a snapshot is the
+    whole venue or the reason there is none - and ``excluded`` is then zero,
+    because a payload the parser refused was not read to the end.
+    """
+
+    rows: tuple[RowT, ...] | None
+    excluded: int
+    throttle_seconds: int
+    failure: str | None
+
+
 def _snapshot[RowT](
     *,
     endpoint: str,
     url: str,
     array_fetcher: ArrayFetcher,
-    parse: Callable[[Sequence[object]], tuple[RowT, ...]],
-) -> tuple[tuple[RowT, ...] | None, int, str | None]:
-    """One all-symbol request: its rows, the back-off it earned, its failure.
-
-    A snapshot is all or nothing - the rows or the reason there are none - so
-    the round never records half a venue.
-    """
+    parse: Callable[[Sequence[object]], tuple[tuple[RowT, ...], int]],
+) -> _Snapshot[RowT]:
+    """One all-symbol request, turned into a record whether it worked or not."""
     try:
-        rows = parse(array_fetcher(url))
+        rows, excluded = parse(array_fetcher(url))
     except Exception as error:  # one endpoint's failure is a record, not an abort
-        return None, _throttle_seconds(error), _endpoint_failure(endpoint, error)
-    return rows, 0, None
+        return _Snapshot(None, 0, _throttle_seconds(error), _endpoint_failure(endpoint, error))
+    return _Snapshot(rows, excluded, 0, None)
 
 
 def _endpoint_failure(endpoint: str, error: Exception) -> str:
