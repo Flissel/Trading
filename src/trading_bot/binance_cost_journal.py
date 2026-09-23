@@ -1563,6 +1563,34 @@ def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
     ``Retry-After`` the venue sent, so the run loop can wait as long as it was
     asked to (fix wave W7).
     """
+    document = _public_binance_json(url)
+    if not isinstance(document, dict):
+        raise BinanceCostJournalError("public response is not a JSON object")
+    return document
+
+
+def public_binance_json_array_fetcher(url: str) -> list[object]:
+    """GET one public Binance JSON array over HTTPS, under the object fetcher's rules.
+
+    Binance's all-symbol endpoints - ``premiumIndex`` and the two
+    ``ticker/bookTicker`` - answer with an array where the per-symbol endpoints
+    answer with an object. Every check the object fetcher makes is made here,
+    on the same code: the two differ in the body shape they accept and in
+    nothing else.
+    """
+    document = _public_binance_json(url)
+    if not isinstance(document, list):
+        raise BinanceCostJournalError("public response is not a JSON array")
+    return document
+
+
+def _public_binance_json(url: str) -> object:
+    """The fetch both public fetchers share: the checks, the request, the parse.
+
+    Whatever ``json.loads`` returns comes back as an ``object``; which shapes
+    are acceptable is the caller's question, and the only one the two fetchers
+    answer differently.
+    """
     parts = urlsplit(url)
     if parts.scheme != "https" or parts.netloc not in ALLOWED_HOSTS:
         raise BinanceCostJournalError("journal requests are limited to Binance's public hosts")
@@ -1592,8 +1620,6 @@ def public_binance_json_fetcher(url: str) -> Mapping[str, object]:
         document: object = json.loads(raw)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise BinanceCostJournalError("public response is not valid JSON") from error
-    if not isinstance(document, dict):
-        raise BinanceCostJournalError("public response is not a JSON object")
     return document
 
 
