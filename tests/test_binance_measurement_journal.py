@@ -25,13 +25,19 @@ from trading_bot.binance_cost_journal import (
     ZERO_HASH,
     BinanceCostJournalError,
     BinanceCostJournalTransportError,
+    InstrumentObservation,
+    TierStatistics,
+    _instrument_statistics,
+    _tier_statistics,
     public_binance_json_array_fetcher,
     public_binance_json_fetcher,
 )
 from trading_bot.binance_measurement_journal import (
     MEASUREMENT_JOURNAL_VERSION,
+    MEASUREMENT_SNAPSHOT_VERSION,
     PERP_BOOK_TICKER_URL,
     PREMIUM_INDEX_URL,
+    SNAPSHOT_ENDPOINTS,
     SNAPSHOT_EVERY_ROUNDS,
     SPOT_BOOK_TICKER_URL,
     BinanceMeasurementJournalSpecError,
@@ -42,8 +48,11 @@ from trading_bot.binance_measurement_journal import (
     book_rows,
     create_measurement_journal,
     load_measurement_journal_spec,
+    measurement_status,
     premium_rows,
     run_measurement_journal,
+    snapshot_measurement_journal,
+    verify_measurement_journal,
 )
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.depth_adapters import DepthPayloadError
@@ -891,9 +900,7 @@ def test_verification_names_a_tampered_segment_a_broken_link_and_a_mismatched_he
     assert head is not None and head.segment_count == 2
     # An edited segment whose recorded hash was left behind.
     path = segment_paths(journal)[1]
-    document = read_document(path)
-    document["received_time_ns"] = 1
-    path.write_bytes(canonical_json(document))
+    unseal(path)
     assert verified(journal)[:2] == (False, (f"SEGMENT_HASH_MISMATCH:{names[1]}",))
     # A resealed segment that no longer names its predecessor.
     rewrite_segment(path, previous_segment_hash="a" * 64)
@@ -1259,9 +1266,16 @@ def recorded_reads(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
 
 
 def unseal(path: Path) -> None:
-    """Change a segment and leave its recorded hash behind, as an editor would."""
+    """Change a segment and leave its recorded hash behind, as an editor would.
+
+    The stamp moves by a nanosecond rather than to the epoch, so the edit is
+    the one thing under test - a segment that no longer matches its own hash -
+    and not also a segment sitting under the wrong day directory.
+    """
     document = read_document(path)
-    document["received_time_ns"] = 1
+    stamp = document["received_time_ns"]
+    assert isinstance(stamp, int)
+    document["received_time_ns"] = stamp + 1
     path.write_bytes(canonical_json(document))
 
 
@@ -1326,3 +1340,585 @@ def test_a_segment_deleted_outside_the_window_still_refuses_a_restart(
         BinanceMeasurementJournalSpecError, match="CHAIN_HEAD_MISMATCH:segment_count"
     ):
         resume(journal, workspace=tmp_path)
+
+
+# --- Task 6: verify, status and windowed snapshots -------------------------
+
+# `FakeClock`'s default start falls on this UTC day, so every round of a
+# journal driven by it lands in one day directory.
+DEFAULT_DAY = "1970-01-21"
+
+
+def reseal_measurement_spec(journal_root: Path, **overrides: object) -> None:
+    """Rewrite a journal's spec with its own hash recomputed, before any round."""
+    path = journal_root / "journal-spec.json"
+    document = {**read_document(path), **overrides}
+    material = {key: value for key, value in document.items() if key != "spec_hash"}
+    path.write_bytes(canonical_json({**material, "spec_hash": content_sha256(material)}))
+
+
+def test_verify_measurement_journal_passes_a_chain_and_names_what_broke_it(
+    tmp_path: Path,
+) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=2)
+    names = relative_names(journal)
+    assert verify_measurement_journal(journal) == (True, ())
+    # An edited segment whose recorded hash was left behind.
+    path = segment_paths(journal)[1]
+    unseal(path)
+    assert verify_measurement_journal(journal) == (
+        False,
+        (f"SEGMENT_HASH_MISMATCH:{names[1]}",),
+    )
+    # A resealed segment that no longer names its predecessor.
+    rewrite_segment(path, previous_segment_hash="a" * 64)
+    assert verify_measurement_journal(journal) == (
+        False,
+        (f"CHAIN_LINK_BROKEN:{names[1]}", "CHAIN_HEAD_MISMATCH:final_segment_hash"),
+    )
+
+
+def test_verify_measurement_journal_names_a_head_that_lost_its_chain(
+    tmp_path: Path,
+) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=2)
+    first_hash = read_document(segment_paths(journal)[0])["content_hash"]
+    rewrite_chain_head(journal, segment_count=1, last_sequence=0, final_segment_hash=first_hash)
+    assert verify_measurement_journal(journal) == (
+        False,
+        (
+            "CHAIN_HEAD_MISMATCH:segment_count",
+            "CHAIN_HEAD_MISMATCH:last_sequence",
+            "CHAIN_HEAD_MISMATCH:final_segment_hash",
+        ),
+    )
+
+
+def test_verify_measurement_journal_reports_an_unverifiable_spec_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A journal whose declaration cannot be read is a reason code, never an exception."""
+    journal = journal_with_rounds(tmp_path, rounds=1)
+    (journal / "journal-spec.json").write_bytes(b'{"version": "bina')
+    assert verify_measurement_journal(journal) == (False, ("JOURNAL_SPEC_UNVERIFIED",))
+    (journal / "journal-spec.json").unlink()
+    assert verify_measurement_journal(journal) == (False, ("JOURNAL_SPEC_UNVERIFIED",))
+
+
+def test_a_segment_moved_to_another_day_directory_is_named_by_verification(
+    tmp_path: Path,
+) -> None:
+    """The day directory is checked against the segment's own stamp (Task 5 concern 2)."""
+    journal = journal_with_rounds(tmp_path, rounds=6)
+    _, spec_hash = load_measurement_journal_spec(journal)
+    assert relative_names(journal) == [f"{DEFAULT_DAY}/{index:010d}.json" for index in range(6)]
+    assert verify_measurement_journal(journal) == (True, ())
+    earlier = journal / "segments" / "1970-01-01"
+    earlier.mkdir()
+    segment_paths(journal)[3].replace(earlier / "0000000003.json")
+    assert verify_measurement_journal(journal) == (
+        False,
+        ("SEGMENT_DAY_MISMATCH:1970-01-01/0000000003.json",),
+    )
+    # The check sits in the shared per-segment reason function, so the bounded
+    # tail walk refuses a restart here too: the two newest day directories are
+    # the moved segment's and the rest of the journal's.
+    assert _verified_tail(journal, spec_hash=spec_hash)[:2] == (
+        False,
+        ("SEGMENT_DAY_MISMATCH:1970-01-01/0000000003.json",),
+    )
+
+
+def crossed_spot_payload() -> list[object]:
+    """One measurable USDT pair and one whose book is crossed, so it is excluded."""
+    return [
+        {
+            "symbol": "BTCUSDT",
+            "bidPrice": "99.95",
+            "bidQty": "2",
+            "askPrice": "100.05",
+            "askQty": "2",
+        },
+        {"symbol": "XRPUSDT", "bidPrice": "4", "bidQty": "1", "askPrice": "3", "askQty": "1"},
+    ]
+
+
+def test_measurement_status_reports_the_newest_age_the_failure_rate_and_the_exclusions(
+    tmp_path: Path,
+) -> None:
+    journal = measurement_journal(tmp_path)
+    snapshots = SnapshotVenue(
+        payloads={SPOT_BOOK_TICKER_URL: crossed_spot_payload()},
+        raises={PREMIUM_INDEX_URL: BinanceCostJournalTransportError(429, 0)},
+    )
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=6,
+        # The spot leg is dark every round, the perpetual leg is measured.
+        fetcher=FakeVenue(dark=("https://api.binance.com",)),
+        array_fetcher=snapshots,
+        clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    stamps = stamps_of(journal)
+    newest = stamps[-1]
+    status = measurement_status(journal, last=6, clock=lambda: newest + 5_500_000_000)
+    assert (status.segment_count, status.last_sequence) == (6, 5)
+    assert status.newest_received_time_ns == newest
+    assert status.newest_age_seconds == Decimal("5.500")
+    assert (status.verify_ok, status.verify_reasons) == (True, ())
+    # Rounds 0 and 5 snapshot; the premium index failed in the first of them.
+    assert status.snapshot_rounds == 2
+    assert status.failure_rate == {
+        "premiumIndex": Decimal("0.500000"),
+        "perpBookTicker": Decimal(0),
+        "spotBookTicker": Decimal(0),
+    }
+    assert status.excluded_total == {
+        "premiumIndex": 0,
+        "perpBookTicker": 0,
+        "spotBookTicker": 2,
+    }
+    # Six rounds, two legs, the spot leg failed in every one of them.
+    assert status.depth_failure_rate == Decimal("0.500000")
+
+
+def test_measurement_status_reads_only_the_last_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A status of a permanent stream costs a listing and the last rounds, nothing else."""
+    journal = three_day_journal(tmp_path)
+    newest = stamps_of(journal)[-1]
+    reads = recorded_reads(monkeypatch)
+    status = measurement_status(journal, last=2, clock=lambda: newest + 1_000_000_000)
+    segments = journal / "segments"
+    opened = {
+        path.relative_to(segments).as_posix() for path in reads if segments in path.parents
+    }
+    assert opened == {"2026-09-24/0000000001.json", "2026-09-25/0000000002.json"}
+    # The count is the head's; the numbers are the last two rounds'.
+    assert (status.segment_count, status.last_sequence) == (3, 2)
+    assert status.newest_age_seconds == Decimal("1.000")
+    # Sequences 1 and 2 take no snapshot, so every rate is zero over nothing.
+    assert status.snapshot_rounds == 0
+    assert status.failure_rate == dict.fromkeys(SNAPSHOT_ENDPOINTS, Decimal(0))
+    assert status.excluded_total == nothing_excluded()
+    assert status.depth_failure_rate == Decimal(0)
+
+
+@pytest.mark.parametrize("last", [0, -1])
+def test_measurement_status_refuses_a_window_of_no_segments(tmp_path: Path, last: int) -> None:
+    journal = journal_with_rounds(tmp_path, rounds=1)
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="at least one segment"):
+        measurement_status(journal, last=last)
+
+
+class ScriptedSnapshotVenue:
+    """An array fetcher that answers a different payload each snapshot round.
+
+    `payloads` holds one entry per snapshot round and per endpoint, in round
+    order; `raises` names the snapshot rounds an endpoint answers with an
+    exception instead. It is `SnapshotVenue` with a script rather than one
+    fixed answer, which is what a window of means needs.
+    """
+
+    def __init__(
+        self,
+        *,
+        payloads: Mapping[str, list[list[object]]],
+        raises: Mapping[str, Mapping[int, Exception]] | None = None,
+    ) -> None:
+        self.payloads = dict(payloads)
+        self.raises = {url: dict(rounds) for url, rounds in (raises or {}).items()}
+        self.calls: dict[str, int] = dict.fromkeys(self.payloads, 0)
+        self.urls: list[str] = []
+
+    def __call__(self, url: str) -> Sequence[object]:
+        self.urls.append(url)
+        index = self.calls[url]
+        self.calls[url] = index + 1
+        error = self.raises.get(url, {}).get(index)
+        if error is not None:
+            raise error
+        return self.payloads[url][index]
+
+
+# Ten rounds of scripted all-symbol snapshots. Index price 100 for BTCUSDT and
+# 2000 for ETHUSDT, so the basis in bps is (mark - index) / index * 10 000.
+BTC_MARKS = (
+    "100.1", "100.2", "100.3", "100.4", "100.5", "100.6", "100.7", "100.8", "100.9", "101",
+)
+BTC_FUNDING = (
+    "0.0001", "0.0002", "0.0003", "0.0004", "0.0005",
+    "0.0006", "0.0007", "0.0008", "0.0009", "0.0010",
+)
+ETH_MARKS = (
+    "2000", "2000.2", "2000.4", "2000.6", "2000.8",
+    "2001", "2001.2", "2001.4", "2001.6", "2001.8",
+)
+# Mid 100 in every round; the two prices are 0.01 * (round + 1) apart, so the
+# spread in bps is the round number plus one.
+BTC_PERP_BOOKS = (
+    ("99.995", "100.005"), ("99.990", "100.010"), ("99.985", "100.015"),
+    ("99.980", "100.020"), ("99.975", "100.025"), ("99.970", "100.030"),
+    ("99.965", "100.035"), ("99.960", "100.040"), ("99.955", "100.045"),
+    ("99.950", "100.050"),
+)
+SCRIPTED_ROUNDS = 10
+
+
+def scripted_premium(index: int) -> list[object]:
+    rows: list[object] = [
+        {
+            "symbol": "BTCUSDT",
+            "markPrice": BTC_MARKS[index],
+            "indexPrice": "100",
+            "lastFundingRate": BTC_FUNDING[index],
+            "nextFundingTime": 1_757_001_600_000,
+        },
+        {
+            "symbol": "ETHUSDT",
+            "markPrice": ETH_MARKS[index],
+            "indexPrice": "2000",
+            "lastFundingRate": "-0.00005",
+            "nextFundingTime": 1_757_001_600_000,
+        },
+    ]
+    if index == 2:
+        # A delisted perpetual: it parses, measures nothing and is excluded.
+        rows.append(
+            {
+                "symbol": "LUNAUSDT",
+                "markPrice": "1",
+                "indexPrice": "0",
+                "lastFundingRate": "0",
+                "nextFundingTime": 1_757_001_600_000,
+            }
+        )
+    return rows
+
+
+def scripted_perp_book(index: int) -> list[object]:
+    bid, ask = BTC_PERP_BOOKS[index]
+    rows: list[object] = [
+        {"symbol": "BTCUSDT", "bidPrice": bid, "bidQty": "3", "askPrice": ask, "askQty": "4"}
+    ]
+    if index != 4:
+        # ETHUSDT is quoted in the premium index every round and missing from
+        # the book in round 4, so its two round counts differ.
+        rows.append(
+            {
+                "symbol": "ETHUSDT",
+                "bidPrice": "1999",
+                "bidQty": "1.5",
+                "askPrice": "2001",
+                "askQty": "2.5",
+            }
+        )
+    return rows
+
+
+def scripted_spot_book(index: int) -> list[object]:
+    rows: list[object] = [
+        {
+            "symbol": "BTCUSDT",
+            "bidPrice": "99.95",
+            "bidQty": "2",
+            "askPrice": "100.05",
+            "askQty": "2",
+        }
+    ]
+    if index in (0, 1, 8, 9):
+        # Quoted outside the window only, so the window's map never names it.
+        rows.append(
+            {
+                "symbol": "DOGEUSDT",
+                "bidPrice": "3",
+                "bidQty": "10",
+                "askPrice": "4",
+                "askQty": "20",
+            }
+        )
+    if index == 5:
+        rows.append(
+            {"symbol": "XRPUSDT", "bidPrice": "4", "bidQty": "1", "askPrice": "3", "askQty": "1"}
+        )
+    return rows
+
+
+def scripted_journal(tmp_path: Path) -> Path:
+    """Ten rounds, every one of them a snapshot round, with a scripted venue."""
+    journal = measurement_journal(tmp_path)
+    reseal_measurement_spec(journal, snapshot_every_rounds=1)
+    run_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        reserve_bytes=0,
+        rounds=SCRIPTED_ROUNDS,
+        fetcher=FakeVenue(),
+        array_fetcher=ScriptedSnapshotVenue(
+            payloads={
+                PREMIUM_INDEX_URL: [scripted_premium(i) for i in range(SCRIPTED_ROUNDS)],
+                PERP_BOOK_TICKER_URL: [scripted_perp_book(i) for i in range(SCRIPTED_ROUNDS)],
+                SPOT_BOOK_TICKER_URL: [scripted_spot_book(i) for i in range(SCRIPTED_ROUNDS)],
+            },
+            # The spot endpoint is throttled in round 3, inside the window.
+            raises={SPOT_BOOK_TICKER_URL: {3: BinanceCostJournalTransportError(429, 0)}},
+        ),
+        clock=FakeClock(),
+        sleep=FakeSleep(),
+    )
+    return journal
+
+
+def stamps_of(journal_root: Path) -> list[int]:
+    """Every segment's `received_time_ns`, in sequence order."""
+    stamps: list[int] = []
+    for document in segment_documents(journal_root):
+        stamp = document["received_time_ns"]
+        assert isinstance(stamp, int)
+        stamps.append(stamp)
+    return stamps
+
+
+def take_snapshot(
+    tmp_path: Path, journal: Path, *, first: int, last: int, output: str = "snapshot.json"
+) -> dict[str, object]:
+    stamps = stamps_of(journal)
+    path = snapshot_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        output_path=tmp_path / output,
+        reserve_bytes=0,
+        window_start_ns=stamps[first],
+        window_end_ns=stamps[last],
+    )
+    return read_document(path)
+
+
+def test_a_snapshot_over_rounds_two_to_seven_equals_a_hand_computation(
+    tmp_path: Path,
+) -> None:
+    journal = scripted_journal(tmp_path)
+    document = take_snapshot(tmp_path, journal, first=2, last=7)
+    stamps = stamps_of(journal)
+    head = read_document(journal / "chain-head.json")
+    _, spec_hash = load_measurement_journal_spec(journal)
+    assert document["version"] == MEASUREMENT_SNAPSHOT_VERSION
+    assert document["spec_hash"] == spec_hash
+    assert document["chain_head_hash"] == head["content_hash"]
+    assert (document["window_start_ns"], document["window_end_ns"]) == (stamps[2], stamps[7])
+    assert (document["first_sequence"], document["last_sequence"]) == (2, 7)
+    assert (document["rounds"], document["snapshot_rounds"]) == (6, 6)
+    assert document["failures"] == {
+        "premiumIndex": 0,
+        "perpBookTicker": 0,
+        "spotBookTicker": 1,
+    }
+    assert document["excluded"] == {
+        "premiumIndex": 1,
+        "perpBookTicker": 0,
+        "spotBookTicker": 1,
+    }
+    # BTCUSDT: basis 30..80 bps over the six rounds, mean 55; funding
+    # 0.0003..0.0008, mean 0.00055, last the round-7 value; spread 3..8 bps,
+    # mean 5.5. ETHUSDT: basis 2..7 bps, mean 4.5; a constant 10 bps spread in
+    # the five rounds its book was quoted in.
+    assert document["perpetuals"] == {
+        "BTCUSDT": {
+            "premium_rounds": 6,
+            "book_rounds": 6,
+            "mean_last_funding_rate": "0.00055000",
+            "last_funding_rate": "0.0008",
+            "mean_basis_bps": "55.000000",
+            "mean_spread_bps": "5.500000",
+        },
+        "ETHUSDT": {
+            "premium_rounds": 6,
+            "book_rounds": 5,
+            "mean_last_funding_rate": "-0.00005000",
+            "last_funding_rate": "-0.00005",
+            "mean_basis_bps": "4.500000",
+            "mean_spread_bps": "10.000000",
+        },
+    }
+    # The spot endpoint failed in round 3, so five of the six rounds carry a
+    # book; DOGEUSDT was quoted outside the window only and XRPUSDT was
+    # excluded, so neither is named.
+    assert document["spot"] == {
+        "BTCUSDT": {"book_rounds": 5, "mean_spread_bps": "10.000000"},
+    }
+    material = {key: value for key, value in document.items() if key != "content_hash"}
+    assert document["content_hash"] == content_sha256(material)
+
+
+def decimal_or_none(value: object) -> str | None:
+    return None if value is None else str(value)
+
+
+def test_a_snapshot_s_cost_blocks_are_v1_s_arithmetic_over_the_window(
+    tmp_path: Path,
+) -> None:
+    journal = scripted_journal(tmp_path)
+    document = take_snapshot(tmp_path, journal, first=2, last=7)
+    spec, _ = load_measurement_journal_spec(journal)
+    keys = tuple(str(notional) for notional in spec.notionals)
+    measured: dict[str, list[InstrumentObservation]] = {}
+    for segment in segment_documents(journal)[2:8]:
+        depth = segment["depth"]
+        assert isinstance(depth, list)
+        for entry in depth:
+            observation = InstrumentObservation.model_validate(entry)
+            if observation.ok:
+                measured.setdefault(observation.instrument_id, []).append(observation)
+    statistics = [
+        _instrument_statistics(instrument, measured.get(instrument.instrument_id, ()), keys=keys)
+        for instrument in spec.instruments
+    ]
+    expected_instruments = {
+        instrument.instrument_id: {
+            "symbol": instrument.symbol,
+            "market": instrument.market,
+            "tier": instrument.tier,
+            "observation_count": item.observation_count,
+            "slippage": {
+                key: {
+                    "count": item.slippage[key]["count"],
+                    "p50": decimal_or_none(item.slippage[key]["p50"]),
+                    "p90": decimal_or_none(item.slippage[key]["p90"]),
+                }
+                for key in keys
+            },
+        }
+        for instrument, item in zip(spec.instruments, statistics, strict=True)
+    }
+    assert document["cost_instruments"] == expected_instruments
+    # The window, not the journal: ten rounds were sampled and six are read.
+    assert [item.observation_count for item in statistics] == [6, 6]
+    assert [item.slippage["500"]["count"] for item in statistics] == [6, 6]
+    expected_tiers = {
+        f"{tier}:{market}": tier_block(
+            _tier_statistics(statistics, tier=tier, market=market, keys=keys), keys=keys
+        )
+        for tier in (1, 2)
+        for market in ("spot", "um")
+    }
+    assert document["cost_tiers"] == expected_tiers
+
+
+def tier_block(item: TierStatistics, *, keys: Sequence[str]) -> dict[str, object]:
+    return {
+        "instrument_count": item.instrument_count,
+        "slippage": {
+            key: {
+                "contributing_count": item.slippage[key]["contributing_count"],
+                "p50_of_p50": decimal_or_none(item.slippage[key]["p50_of_p50"]),
+                "p50_of_p90": decimal_or_none(item.slippage[key]["p50_of_p90"]),
+            }
+            for key in keys
+        },
+    }
+
+
+def test_a_snapshot_counts_only_the_rounds_that_took_one(tmp_path: Path) -> None:
+    """The cadence the spec sealed decides, so a window can hold plain rounds."""
+    journal = journal_with_rounds(tmp_path, rounds=6)
+    stamps = stamps_of(journal)
+    path = snapshot_measurement_journal(
+        workspace_root=tmp_path,
+        journal_root=journal,
+        output_path=tmp_path / "snapshot.json",
+        reserve_bytes=0,
+        window_start_ns=stamps[0],
+        window_end_ns=stamps[-1],
+    )
+    document = read_document(path)
+    assert (document["rounds"], document["snapshot_rounds"]) == (6, 2)
+    assert (document["first_sequence"], document["last_sequence"]) == (0, 5)
+
+
+def test_a_snapshot_refuses_an_existing_output(tmp_path: Path) -> None:
+    journal = scripted_journal(tmp_path)
+    stamps = stamps_of(journal)
+    output = tmp_path / "snapshot.json"
+    output.write_bytes(b"{}")
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="already exists"):
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=output,
+            reserve_bytes=0,
+            window_start_ns=stamps[0],
+            window_end_ns=stamps[-1],
+        )
+
+
+def test_a_snapshot_refuses_an_empty_and_a_reversed_window(tmp_path: Path) -> None:
+    journal = scripted_journal(tmp_path)
+    stamps = stamps_of(journal)
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="MEASUREMENT_WINDOW_EMPTY"):
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "gap.json",
+            reserve_bytes=0,
+            # Between two rounds of a day this journal did write.
+            window_start_ns=stamps[2] + 1,
+            window_end_ns=stamps[3] - 1,
+        )
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="MEASUREMENT_WINDOW_EMPTY"):
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "before.json",
+            reserve_bytes=0,
+            # A day directory this journal never opened.
+            window_start_ns=1,
+            window_end_ns=2,
+        )
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="ends before it starts"):
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "reversed.json",
+            reserve_bytes=0,
+            window_start_ns=stamps[7],
+            window_end_ns=stamps[2],
+        )
+    assert not (tmp_path / "gap.json").exists()
+    assert not (tmp_path / "before.json").exists()
+    assert not (tmp_path / "reversed.json").exists()
+
+
+def test_a_snapshot_refuses_a_window_whose_segments_do_not_link(tmp_path: Path) -> None:
+    journal = scripted_journal(tmp_path)
+    stamps = stamps_of(journal)
+    rewrite_segment(segment_paths(journal)[4], previous_segment_hash="a" * 64)
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="CHAIN_LINK_BROKEN"):
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "snapshot.json",
+            reserve_bytes=0,
+            window_start_ns=stamps[2],
+            window_end_ns=stamps[7],
+        )
+    assert not (tmp_path / "snapshot.json").exists()
+
+
+def test_a_snapshot_refuses_a_chain_head_that_does_not_recompute(tmp_path: Path) -> None:
+    journal = scripted_journal(tmp_path)
+    stamps = stamps_of(journal)
+    head = journal / "chain-head.json"
+    head.write_bytes(canonical_json({**read_document(head), "segment_count": 99}))
+    with pytest.raises(BinanceMeasurementJournalSpecError, match="CHAIN_HEAD_UNREADABLE"):
+        snapshot_measurement_journal(
+            workspace_root=tmp_path,
+            journal_root=journal,
+            output_path=tmp_path / "snapshot.json",
+            reserve_bytes=0,
+            window_start_ns=stamps[2],
+            window_end_ns=stamps[7],
+        )

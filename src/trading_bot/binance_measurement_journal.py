@@ -16,15 +16,20 @@ finished and immutable; nothing here changes its behaviour. What is written
 here is what the day-partitioned layout needs - the segment walk, the chain
 head read, the torn-file discard and the chain verification - plus the three
 snapshot parsers and the round that joins them.
+
+The read side is the last section of the file: ``verify_measurement_journal``
+walks the whole chain, ``measurement_status`` reads the tip a supervisor
+watches, and ``snapshot_measurement_journal`` seals a window of rounds into the
+immutable document a weekly shadow artifact cites by hash (spec 5).
 """
 
 import json
 import re
 import sys
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal
 from pathlib import Path
 from typing import Literal, NamedTuple, Self
 
@@ -35,6 +40,8 @@ from trading_bot.binance_cost_journal import (
     _BPS_QUANTUM,
     _IDENTIFIER,
     _MAX_REASON_CHARACTERS,
+    _RECEIPT_MARKETS,
+    _RECEIPT_TIERS,
     _SEGMENT_NAME,
     _SEGMENT_TEMPORARY_NAME,
     _SYMBOL,
@@ -50,7 +57,9 @@ from trading_bot.binance_cost_journal import (
     _authorize,
     _failure_reason,
     _Frozen,
+    _instrument_statistics,
     _lock_journal,
+    _notional_keys,
     _observe,
     _publish,
     _quantised,
@@ -58,6 +67,7 @@ from trading_bot.binance_cost_journal import (
     _release_journal_lock,
     _remaining_interval,
     _throttle_seconds,
+    _tier_statistics,
     _validated_hex,
     load_journal_spec,
 )
@@ -71,6 +81,9 @@ from trading_bot.depth_adapters import (
 )
 
 MEASUREMENT_JOURNAL_VERSION = "binance-measurement-journal/1.0.0"
+# The sealed reading of a window of rounds (spec 5's `snapshot`). A weekly
+# shadow artifact cites one of these by hash, so its schema is fixed.
+MEASUREMENT_SNAPSHOT_VERSION = "binance-measurement-snapshot/1.0.0"
 # Spec 5: every 61 seconds the depth walk, every fifth round the three
 # all-symbol snapshots. The interval itself is copied from the cost journal's
 # spec at creation, so the two streams keep one cadence.
@@ -98,6 +111,17 @@ type ArrayFetcher = Callable[[str], Sequence[object]]
 
 _DAY_NAME = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 _NANOSECONDS_A_SECOND = 1_000_000_000
+# A liveness age is read to the millisecond: the cadence is 61 seconds and
+# the reading itself costs more than a microsecond, so anything finer is
+# noise from the reading.
+_AGE_QUANTUM = Decimal("0.001")
+# A share of a bounded number of rounds. Six places is exact for any window
+# below a million rounds and stops a repeating decimal from being recorded
+# as if it had been measured that precisely.
+_SHARE_QUANTUM = Decimal("0.000001")
+# Binance publishes funding rates to eight places; a mean of them is
+# recorded at the precision the venue quotes.
+_FUNDING_RATE_QUANTUM = Decimal("0.00000001")
 
 
 class BinanceMeasurementJournalError(RuntimeError):
@@ -380,6 +404,67 @@ class MeasurementChainHead(_Frozen):
         if value < 0:
             raise ValueError("segment count and last sequence cannot be negative")
         return value
+
+
+class MeasurementStatus(_Frozen):
+    """What a supervisor reads off a running journal, over its last rounds.
+
+    ``segment_count`` is the chain head's, so it counts the whole journal;
+    every other number is taken over the last ``last`` segments alone, because
+    this is read on a schedule against a stream that never ends.
+    ``newest_age_seconds`` is the liveness figure - a journal whose newest
+    segment is older than a few rounds has a dead supervisor behind it, which
+    is the lesson of 2026-09-17 - and it is negative where the host's clock
+    stepped backwards.
+
+    ``failure_rate`` is per endpoint over the **snapshot rounds** in that
+    window and ``excluded_total`` the symbols those rounds left out; read them
+    together, because an endpoint that quietly stops measuring anything raises
+    the second long before it raises the first (ruling 12). ``verify_ok`` and
+    ``verify_reasons`` are the bounded tail judgement, not the whole chain's:
+    ``verify_measurement_journal`` is the reading that covers the history.
+    """
+
+    segment_count: int
+    last_sequence: int
+    newest_received_time_ns: int
+    newest_age_seconds: Decimal
+    verify_ok: bool
+    verify_reasons: tuple[str, ...]
+    snapshot_rounds: int
+    failure_rate: Mapping[str, Decimal]
+    excluded_total: Mapping[str, int]
+    depth_failure_rate: Decimal
+
+    @field_validator("segment_count", "last_sequence", "snapshot_rounds")
+    @classmethod
+    def validate_counts(cls, value: int) -> int:
+        if value < 0:
+            raise ValueError("counts of segments and rounds cannot be negative")
+        return value
+
+    @field_validator("newest_received_time_ns")
+    @classmethod
+    def validate_time(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("received_time_ns must be a positive nanosecond stamp")
+        return value
+
+    @field_validator("failure_rate", "excluded_total")
+    @classmethod
+    def validate_per_endpoint(cls, value: Mapping[str, object]) -> Mapping[str, object]:
+        if set(value) != set(SNAPSHOT_ENDPOINTS):
+            raise ValueError(f"a status reports every endpoint of {SNAPSHOT_ENDPOINTS}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_shares(self) -> Self:
+        rates = (self.depth_failure_rate, *self.failure_rate.values())
+        if any(rate < 0 or rate > 1 for rate in rates):
+            raise ValueError("a failure rate is a share of the rounds that were read")
+        if any(count < 0 for count in self.excluded_total.values()):
+            raise ValueError("an exclusion count cannot be negative")
+        return self
 
 
 def _distinct_rows[RowT: PremiumRow | BookRow](
@@ -1112,6 +1197,7 @@ def _walked(
                 document,
                 segment,
                 name=name,
+                day=path.parent.name,
                 expected_sequence=expected_sequence,
                 spec_hash=spec_hash,
                 previous_hash=previous_hash,
@@ -1129,15 +1215,28 @@ def _segment_reasons(
     segment: MeasurementSegment,
     *,
     name: str,
+    day: str,
     expected_sequence: int,
     spec_hash: str,
     previous_hash: str,
 ) -> list[str]:
-    """Everything one segment can be wrong about, given where it sits in the chain."""
+    """Everything one segment can be wrong about, given where it sits in the chain.
+
+    Every reader of a segment comes through here - the full walk, the bounded
+    tail walk a restart makes and the window a snapshot seals - so a check
+    added here is a check all three make. ``SEGMENT_DAY_MISMATCH`` is the one
+    that is about the file rather than the chain: the day directory is where a
+    reader looks for a stamp, and a segment moved into the wrong one still
+    hashes and links perfectly while making every windowed reading of the
+    journal wrong (Task 5's second concern). A restart refuses it too, as long
+    as the move is inside the two day directories the tail walk opens.
+    """
     material = {key: value for key, value in document.items() if key != "content_hash"}
     reasons: list[str] = []
     if segment.content_hash != content_sha256(material):
         reasons.append(f"SEGMENT_HASH_MISMATCH:{name}")
+    if _segment_day(segment.received_time_ns) != day:
+        reasons.append(f"SEGMENT_DAY_MISMATCH:{name}")
     if segment.sequence != expected_sequence:
         reasons.append(f"SEGMENT_SEQUENCE_GAP:{name}")
     if segment.spec_hash != spec_hash:
@@ -1375,3 +1474,505 @@ def _report_repair(reason: str) -> None:
     is left comparing sequence numbers to work out what happened.
     """
     print(f"binance measurement journal repair: {reason}", file=sys.stderr)
+
+
+def verify_measurement_journal(journal_root: Path) -> tuple[bool, tuple[str, ...]]:
+    """Walk the whole chain from ``ZERO_HASH`` and report what is wrong with it.
+
+    This is the only reading that ever covers the history. A restart verifies
+    the tail alone (ruling 13), so corruption older than the two newest day
+    directories sits unnoticed until this runs: the daily liveness check is
+    where it belongs, beside the newest-segment-age check that says the stream
+    is alive at all.
+
+    It never raises. A journal whose declaration cannot be read at all - no
+    spec, an unparseable one, one that does not match its own recorded hash -
+    is ``JOURNAL_SPEC_UNVERIFIED``, because nothing under ``segments/`` can be
+    judged without the hash the segments name. Everything else is the walk's
+    own reason codes, in segment order and then the chain head's.
+    """
+    try:
+        _, spec_hash = load_measurement_journal_spec(journal_root)
+    except BinanceMeasurementJournalSpecError:
+        return False, ("JOURNAL_SPEC_UNVERIFIED",)
+    ok, reasons, _ = _verified_chain(journal_root, spec_hash=spec_hash)
+    return ok, reasons
+
+
+def measurement_status(
+    journal_root: Path,
+    *,
+    last: int,
+    clock: Callable[[], int] = time.time_ns,
+) -> MeasurementStatus:
+    """Read the tip of a running journal: how old it is and how it is doing.
+
+    This is what a supervisor calls, so it is bounded twice over. The counts
+    and rates are taken over the last ``last`` segments of the listing and no
+    other file is opened for them; the verdict comes from ``_verified_tail``,
+    which reads the chain head and the two newest day directories. A permanent
+    stream writes a segment a minute forever, and a status that walked the
+    history would grow more expensive every day it stayed alive -
+    ``verify_measurement_journal`` is the reading that does that, on a
+    schedule.
+
+    ``newest_age_seconds`` is the liveness figure the 2026-09-17 lesson asks
+    for: the injected ``clock`` less the newest segment's own stamp. A clock
+    the host stepped backwards makes it negative, which is reported rather
+    than clamped - a negative age is evidence about the machine, not about the
+    journal.
+
+    ``failure_rate`` is, per endpoint, the number of rounds in which that
+    endpoint failed over the number of **snapshot rounds** among the last
+    ``last`` - the depth walk runs every round but the three all-symbol
+    endpoints only every ``snapshot_every_rounds``, so the other rounds are
+    not evidence about them. Where the window holds no snapshot round at all
+    the rate is ``Decimal(0)`` for every endpoint, which says "nothing was
+    asked", not "nothing failed"; ``snapshot_rounds`` is what tells the two
+    apart. ``excluded_total`` is counted over the same last ``last`` segments
+    and belongs beside the rate: an endpoint that starts excluding symbols is
+    the early warning that a whole-endpoint failure is coming, and a snapshot
+    that returned nothing at all shows up here as a rising count and not as a
+    failure (ruling 12).
+
+    A journal with no segment, no chain head or a head that does not recompute
+    has no status and refuses: there is no age to report and no count to
+    report it against.
+    """
+    if last <= 0:
+        raise BinanceMeasurementJournalSpecError("a status reads at least one segment")
+    spec, spec_hash = load_measurement_journal_spec(journal_root)
+    paths = _segment_paths(journal_root)
+    if not paths:
+        raise BinanceMeasurementJournalSpecError("this journal holds no segment to report")
+    verify_ok, verify_reasons, _ = _verified_tail(journal_root, spec_hash=spec_hash)
+    head, head_reasons = _chain_head_on_disk(journal_root)
+    if head is None:
+        named = head_reasons[0] if head_reasons else "CHAIN_HEAD_MISSING"
+        raise BinanceMeasurementJournalSpecError(f"this journal has no readable head: {named}")
+    read = [_read_segment(journal_root, path).segment for path in paths[-last:]]
+    newest = read[-1]
+    snapshot_rounds = _snapshot_round_count(read, every=spec.snapshot_every_rounds)
+    return MeasurementStatus(
+        segment_count=head.segment_count,
+        last_sequence=newest.sequence,
+        newest_received_time_ns=newest.received_time_ns,
+        newest_age_seconds=_age_seconds(newest.received_time_ns, now_ns=clock()),
+        verify_ok=verify_ok,
+        verify_reasons=verify_reasons,
+        snapshot_rounds=snapshot_rounds,
+        failure_rate={
+            endpoint: _share(count, snapshot_rounds)
+            for endpoint, count in _failure_totals(read).items()
+        },
+        excluded_total=_excluded_totals(read),
+        depth_failure_rate=_depth_failure_rate(read),
+    )
+
+
+def snapshot_measurement_journal(
+    *,
+    workspace_root: Path,
+    journal_root: Path,
+    output_path: Path,
+    reserve_bytes: int,
+    window_start_ns: int,
+    window_end_ns: int,
+) -> Path:
+    """Seal the journal's readings between two stamps into an immutable document.
+
+    Spec 5's ``snapshot``: the weekly shadow artifact cites one of these by
+    hash, so it is a receipt, not a report - an output that exists is refused
+    rather than replaced, and the document seals itself with ``content_hash``
+    over everything else in it. It never touches a declaration: the carry
+    family's cost tiers stay the v1 receipt's, and this is the paper phase's
+    cost monitor beside them.
+
+    The window is closed on both ends (``window_start_ns <= received_time_ns
+    <= window_end_ns``) and is read out of the day directories whose names can
+    hold it, so a week's snapshot opens seven directories rather than the
+    journal's history. The segments it keeps must re-seal, name this spec and
+    link to one another in sequence order; the first one is an anchor whose
+    own predecessor is outside the window and is not resolved, exactly as the
+    tail walk anchors. The chain head must recompute as well, because
+    ``chain_head_hash`` is what a citing artifact binds this reading to; it is
+    the journal's tip as this reading began and not a bound on the window -
+    the stream keeps running while a snapshot is taken, so ``first_sequence``,
+    ``last_sequence`` and ``rounds`` are what say which rounds the numbers are
+    over.
+
+    The per-symbol numbers are means over exactly the rounds inside the window
+    that carried the symbol: ``premium_rounds`` and ``book_rounds`` say how
+    many those were, and they differ where one endpoint listed a symbol and
+    the other did not. A symbol no round in the window carried is absent from
+    the map rather than present with zeroes. The cost blocks are v1's
+    arithmetic over the window's measured observations, per instrument and per
+    (tier, market); the tier medians keep v1's two rules, which were written
+    for a finished 11 000-round journal - a member must be *eligible* (10 000
+    measured rounds spanning seven days) and a notional needs
+    ``TIER_MINIMUM_CONTRIBUTORS`` of them - so a window shorter than that
+    reports counts of zero and no median, which is the honest reading and not
+    a defect of this snapshot.
+    """
+    root = _authorize(workspace_root, journal_root, reserve_bytes)
+    # The output is authorised like the journal is - inside the workspace, on
+    # its drive, over the reserve - and its parent is where the atomic publish
+    # puts its temporary file.
+    output = _authorize(workspace_root, output_path, reserve_bytes)
+    if output.exists():
+        raise BinanceMeasurementJournalSpecError("this snapshot already exists and is immutable")
+    if window_end_ns < window_start_ns:
+        raise BinanceMeasurementJournalSpecError("the snapshot window ends before it starts")
+    spec, spec_hash = load_measurement_journal_spec(root)
+    head, head_reasons = _chain_head_on_disk(root)
+    if head is None:
+        named = head_reasons[0] if head_reasons else "CHAIN_HEAD_MISSING"
+        raise BinanceMeasurementJournalSpecError(f"this journal has no readable head: {named}")
+    segments = _window_segments(
+        root,
+        spec_hash=spec_hash,
+        window_start_ns=window_start_ns,
+        window_end_ns=window_end_ns,
+    )
+    instruments, tiers = _cost_blocks(spec, segments)
+    material: dict[str, object] = {
+        "version": MEASUREMENT_SNAPSHOT_VERSION,
+        "spec_hash": spec_hash,
+        # The head's own hash binds the spec, the count and the final segment.
+        "chain_head_hash": head.content_hash,
+        "window_start_ns": window_start_ns,
+        "window_end_ns": window_end_ns,
+        "first_sequence": segments[0].sequence,
+        "last_sequence": segments[-1].sequence,
+        "rounds": len(segments),
+        "snapshot_rounds": _snapshot_round_count(segments, every=spec.snapshot_every_rounds),
+        "failures": _failure_totals(segments),
+        "excluded": _excluded_totals(segments),
+        "perpetuals": _perpetual_block(
+            _rows_by_symbol(segment.premium_index for segment in segments),
+            _rows_by_symbol(segment.perp_book for segment in segments),
+        ),
+        "spot": _spot_block(_rows_by_symbol(segment.spot_book for segment in segments)),
+        "cost_instruments": instruments,
+        "cost_tiers": tiers,
+    }
+    _publish(output, {**material, "content_hash": content_sha256(material)})
+    return output
+
+
+class _ReadSegment(NamedTuple):
+    """A segment as it sits on disk: where it is, what it says, what it parses to."""
+
+    name: str
+    day: str
+    document: Mapping[str, object]
+    segment: MeasurementSegment
+
+
+def _read_segment(journal_root: Path, path: Path) -> _ReadSegment:
+    """One segment, or a refusal naming it.
+
+    A reading is over whole segments: a file that will not parse is not a
+    round that measured nothing, it is a round nobody can read, and a number
+    taken over the rest would be a mean of an unknown sample.
+    """
+    name = _segment_name(journal_root, path)
+    try:
+        document = _read_object(path, label="a journal segment")
+        segment = MeasurementSegment.model_validate(document)
+    except (BinanceCostJournalError, ValidationError) as error:
+        raise BinanceMeasurementJournalSpecError(
+            f"journal verification failed: SEGMENT_UNREADABLE:{name}"
+        ) from error
+    return _ReadSegment(name, path.parent.name, document, segment)
+
+
+def _window_segments(
+    journal_root: Path, *, spec_hash: str, window_start_ns: int, window_end_ns: int
+) -> tuple[MeasurementSegment, ...]:
+    """The rounds received inside the window, verified among themselves.
+
+    Only the day directories whose names fall between the window's two days
+    are opened - a segment sits under the UTC day of its own
+    ``received_time_ns``, so no other directory can hold one - and the listing
+    that finds them still covers the whole journal, which is what refuses a
+    foreign name or a duplicated sequence anywhere.
+    """
+    first_day = _segment_day(window_start_ns)
+    last_day = _segment_day(window_end_ns)
+    kept: list[_ReadSegment] = []
+    for path in _segment_paths(journal_root):
+        if not first_day <= path.parent.name <= last_day:
+            continue
+        read = _read_segment(journal_root, path)
+        if window_start_ns <= read.segment.received_time_ns <= window_end_ns:
+            kept.append(read)
+    if not kept:
+        raise BinanceMeasurementJournalSpecError(
+            "MEASUREMENT_WINDOW_EMPTY: this journal received no round inside the window"
+        )
+    reasons = _window_reasons(kept, spec_hash=spec_hash)
+    if reasons:
+        raise BinanceMeasurementJournalSpecError(
+            "journal verification failed: " + ",".join(reasons)
+        )
+    return tuple(read.segment for read in kept)
+
+
+def _window_reasons(kept: Sequence[_ReadSegment], *, spec_hash: str) -> list[str]:
+    """Everything the window's segments can be wrong about, as the walk judges it.
+
+    Anchored like the tail walk: the first segment's predecessor is outside
+    the window by construction and is taken as given, and every segment after
+    it must follow the one before by sequence and name its hash.
+    """
+    first = kept[0].segment
+    expected_sequence = first.sequence
+    previous_hash = ZERO_HASH if first.sequence == 0 else first.previous_segment_hash
+    reasons: list[str] = []
+    for read in kept:
+        reasons.extend(
+            _segment_reasons(
+                read.document,
+                read.segment,
+                name=read.name,
+                day=read.day,
+                expected_sequence=expected_sequence,
+                spec_hash=spec_hash,
+                previous_hash=previous_hash,
+            )
+        )
+        expected_sequence += 1
+        previous_hash = read.segment.content_hash
+    return reasons
+
+
+def _snapshot_round_count(segments: Sequence[MeasurementSegment], *, every: int) -> int:
+    """How many of these rounds were snapshot rounds, by the cadence the spec sealed.
+
+    The sequence decides, not what the round came back with: a snapshot round
+    whose three endpoints all failed carries no rows and is still a round in
+    which the venue was asked, which is what the failure rate is a rate over.
+    """
+    return sum(1 for segment in segments if segment.sequence % every == 0)
+
+
+def _failure_totals(segments: Sequence[MeasurementSegment]) -> dict[str, int]:
+    """How many of these rounds each endpoint failed in (ruling 10's ``<endpoint>:``)."""
+    return {
+        endpoint: sum(
+            1
+            for segment in segments
+            for failure in segment.failures
+            if failure.startswith(f"{endpoint}:")
+        )
+        for endpoint in SNAPSHOT_ENDPOINTS
+    }
+
+
+def _excluded_totals(segments: Sequence[MeasurementSegment]) -> dict[str, int]:
+    """How many USDT symbols each endpoint left out of these rounds (ruling 11)."""
+    return {
+        endpoint: sum(segment.excluded[endpoint] for segment in segments)
+        for endpoint in SNAPSHOT_ENDPOINTS
+    }
+
+
+def _depth_failure_rate(segments: Sequence[MeasurementSegment]) -> Decimal:
+    """The share of depth observations these rounds did not measure.
+
+    The depth walk's failures never reach ``failures`` - they stay inside
+    their own observation, as v1 records them (ruling 10) - so this is the
+    only place a reader sees a venue that stopped answering the fifteen cost
+    pairs while the all-symbol endpoints kept working.
+    """
+    observations = [
+        observation for segment in segments for observation in segment.depth
+    ]
+    failed = sum(1 for observation in observations if not observation.ok)
+    return _share(failed, len(observations))
+
+
+def _share(part: int, whole: int) -> Decimal:
+    """A count over a count at the recorded precision; nothing over nothing is zero."""
+    if whole <= 0:
+        return Decimal(0)
+    return _rounded(Decimal(part) / Decimal(whole), _SHARE_QUANTUM)
+
+
+def _age_seconds(received_time_ns: int, *, now_ns: int) -> Decimal:
+    """How long ago a segment was received, to the millisecond.
+
+    Not clamped at zero: a host whose clock stepped backwards reports a
+    negative age, and that is worth seeing.
+    """
+    return _rounded(
+        Decimal(now_ns - received_time_ns) / Decimal(_NANOSECONDS_A_SECOND), _AGE_QUANTUM
+    )
+
+
+def _mean(values: Sequence[Decimal], *, quantum: Decimal) -> Decimal | None:
+    """The mean at the recorded precision, or ``None`` where nothing was measured."""
+    if not values:
+        return None
+    return _rounded(sum(values, Decimal(0)) / Decimal(len(values)), quantum)
+
+
+def _rounded(value: Decimal, quantum: Decimal) -> Decimal:
+    return value.quantize(quantum, rounding=ROUND_HALF_EVEN)
+
+
+def _rows_by_symbol[RowT: PremiumRow | BookRow](
+    rounds: Iterable[tuple[RowT, ...] | None],
+) -> dict[str, list[RowT]]:
+    """Every round's rows regrouped under their symbol, in round order.
+
+    ``None`` and ``()`` both contribute nothing: an endpoint that was not read
+    this round and one that was read and measured nothing leave the same gap
+    in a symbol's series, and the segment's ``failures`` and ``excluded``
+    counts are where the difference is recorded.
+    """
+    tally: dict[str, list[RowT]] = {}
+    for rows in rounds:
+        for row in rows or ():
+            tally.setdefault(row.symbol, []).append(row)
+    return tally
+
+
+def _perpetual_block(
+    premium: Mapping[str, list[PremiumRow]], book: Mapping[str, list[BookRow]]
+) -> dict[str, object]:
+    """Per USDT perpetual: its two round counts, its funding, its basis and its spread.
+
+    The counts are kept apart because the two endpoints are: a symbol the
+    premium index listed and the book ticker did not is measured in one and
+    not the other, and averaging over a single count would quietly claim
+    otherwise.
+    """
+    block: dict[str, object] = {}
+    for symbol in sorted(set(premium) | set(book)):
+        rows = premium.get(symbol, [])
+        books = book.get(symbol, [])
+        block[symbol] = {
+            "premium_rounds": len(rows),
+            "book_rounds": len(books),
+            "mean_last_funding_rate": _recorded(
+                _mean([row.last_funding_rate for row in rows], quantum=_FUNDING_RATE_QUANTUM)
+            ),
+            # The venue's own last rate, from the newest round that carried
+            # the symbol: a week's mean says what was paid, this says what is
+            # being paid now.
+            "last_funding_rate": str(rows[-1].last_funding_rate) if rows else None,
+            "mean_basis_bps": _recorded(
+                _mean([row.basis_bps for row in rows], quantum=_BPS_QUANTUM)
+            ),
+            "mean_spread_bps": _recorded(
+                _mean([row.spread_bps for row in books], quantum=_BPS_QUANTUM)
+            ),
+        }
+    return block
+
+
+def _spot_block(book: Mapping[str, list[BookRow]]) -> dict[str, object]:
+    """Per USDT spot pair: how many rounds quoted it and what it cost to cross."""
+    return {
+        symbol: {
+            "book_rounds": len(rows),
+            "mean_spread_bps": _recorded(
+                _mean([row.spread_bps for row in rows], quantum=_BPS_QUANTUM)
+            ),
+        }
+        for symbol, rows in sorted(book.items())
+    }
+
+
+def _cost_blocks(
+    spec: BinanceMeasurementJournalSpec, segments: Sequence[MeasurementSegment]
+) -> tuple[dict[str, object], dict[str, object]]:
+    """The window's cost instruments and cost tiers, on v1's arithmetic.
+
+    ``_instrument_statistics`` and ``_tier_statistics`` are the cost journal's
+    own, called here over the window's measured observations rather than a
+    finished journal's: the slippage tiers stay continuous across the two
+    streams because they are computed by the same code, not by the same recipe
+    written twice. Only the fields spec 5 asks a snapshot for are carried over
+    - the eligibility window, the reason codes and the p99 belong to the v1
+    receipt, which is the declaration's authority and stays it.
+    """
+    keys = _notional_keys(spec.notionals)
+    measured = _measured_depth(segments)
+    statistics = tuple(
+        _instrument_statistics(instrument, measured.get(instrument.instrument_id, ()), keys=keys)
+        for instrument in spec.instruments
+    )
+    instruments: dict[str, object] = {
+        instrument.instrument_id: {
+            "symbol": instrument.symbol,
+            "market": instrument.market,
+            "tier": instrument.tier,
+            "observation_count": item.observation_count,
+            "slippage": {
+                key: {
+                    "count": _counted(item.slippage[key]["count"]),
+                    "p50": _recorded(_measured_quantile(item.slippage[key]["p50"])),
+                    "p90": _recorded(_measured_quantile(item.slippage[key]["p90"])),
+                }
+                for key in keys
+            },
+        }
+        for instrument, item in zip(spec.instruments, statistics, strict=True)
+    }
+    tiers: dict[str, object] = {}
+    for tier in _RECEIPT_TIERS:
+        for market in _RECEIPT_MARKETS:
+            item = _tier_statistics(statistics, tier=tier, market=market, keys=keys)
+            tiers[f"{tier}:{market}"] = {
+                "instrument_count": item.instrument_count,
+                "slippage": {key: _tier_notional(item.slippage[key]) for key in keys},
+            }
+    return instruments, tiers
+
+
+def _tier_notional(entry: Mapping[str, Decimal | int | None]) -> dict[str, object]:
+    """One tier notional as the document records it: the count and the two medians."""
+    return {
+        "contributing_count": _counted(entry["contributing_count"]),
+        "p50_of_p50": _recorded(_measured_quantile(entry["p50_of_p50"])),
+        "p50_of_p90": _recorded(_measured_quantile(entry["p50_of_p90"])),
+    }
+
+
+def _measured_depth(
+    segments: Sequence[MeasurementSegment],
+) -> dict[str, list[InstrumentObservation]]:
+    """Every measured depth observation of the window, per instrument, in round order.
+
+    A failed observation carries no measurement at all, so it is left out
+    rather than counted as a zero - exactly what v1's finalisation does with
+    the segments its chain head covers.
+    """
+    measured: dict[str, list[InstrumentObservation]] = {}
+    for segment in segments:
+        for observation in segment.depth:
+            if observation.ok:
+                measured.setdefault(observation.instrument_id, []).append(observation)
+    return measured
+
+
+def _counted(value: Decimal | int | None) -> int:
+    """A v1 statistic's count, which its own model has already validated as one."""
+    if not isinstance(value, int):
+        raise BinanceMeasurementJournalError("a slippage count is a whole number of rounds")
+    return value
+
+
+def _measured_quantile(value: Decimal | int | None) -> Decimal | None:
+    """A v1 statistic's quantile: a decimal, or absent where nothing filled it."""
+    if value is None or isinstance(value, Decimal):
+        return value
+    raise BinanceMeasurementJournalError("a slippage quantile is a decimal or absent")
+
+
+def _recorded(value: Decimal | None) -> str | None:
+    """A measured decimal as the document records it: a string, or ``null``."""
+    return None if value is None else str(value)
