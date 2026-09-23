@@ -289,6 +289,34 @@ Acceptance:
 - reconnect, staleness, clock, and disk-reserve failures are exercised;
 - restart preserves state and audit continuity.
 
+Built 2026-09 on branch `codex/shadow-book` under
+`docs/superpowers/specs/2026-09-22-shadow-book-and-measurement-stream-design.md`, for the
+small-book carry: weekly shadow captures that extend a verified panel base through the last
+Sunday with daily kline dumps and REST funding history and reconcile every carried tail row
+against the monthly dump once that dump appears (`shadow-capture`); the weekly shadow book
+over `evaluate_carry_decisions` from the fixed anchor 2026-09-13, sealed, registered and —
+in Phase A — written with `status: development_only` and no P&L block or running totals at
+all (`shadow-week`); and the permanent measurement journal
+`binance-measurement-journal/1.0.0` beside the finished, immutable cost journal v1, with
+`create`, `run`, `status`, `verify` and `snapshot`. Phase B is a later, separate commit and
+needs both halves of the spec's section 2 gate: a `P1_33_HOLDOUT_<date>.md` recording
+`holdout_confirmed`, and that report's `report_hash` in `configs/shadow-carry-v4.json`,
+which a week re-seals before it reads a single number out of it.
+
+Against the acceptance above: no execution credentials and no live client factory exist
+anywhere in this path — nothing here imports an execution adapter, and the only clients are
+the public zip and JSON fetchers — met. The staleness and disk-reserve failures are
+exercised by the refusals: a daily dump the venue has not published by the Sunday deadline,
+a reconciliation mismatch, a weekly capture that is not a superset of its base, a Sunday
+bar a held leg does not have, and a free-space reserve the job would cross, each failing
+closed. Reconnect and clock sit in the operations layer outside the repository — the Monday
+supervisor and the Startup launcher — with the daily liveness check reading the newest
+segment's age and walking the whole chain with `binance-measurement-journal-verify`, which
+is what a restart does not do (it verifies the tail alone). Restart preserves state because
+there is no state to preserve: a shadow week is recomputable from its captures, and the
+measurement journal resumes from its chain head, discarding a torn trailing segment and
+rebuilding a head a kill never wrote.
+
 ### P1.25 Paper adapter and reconciliation
 
 Connect only to a verified sandbox/paper endpoint or local paper adapter.
