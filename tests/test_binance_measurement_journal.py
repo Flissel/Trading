@@ -1743,6 +1743,30 @@ def test_measurement_status_reads_only_the_last_segments(
     assert status.depth_failure_rate == Decimal(0)
 
 
+def test_measurement_status_reports_a_foreign_name_instead_of_raising(
+    tmp_path: Path,
+) -> None:
+    """A status is a report: a supervisor asked how the stream is doing.
+
+    The strict listing refuses a name this journal did not write, which is
+    right for everything that verifies; raising it out of `status` told the
+    supervisor nothing about the age, the failure rate or the exclusions it
+    asked after.
+    """
+    journal = journal_with_rounds(tmp_path, rounds=2)
+    (journal / "segments" / DEFAULT_DAY / "notes.txt").write_text("x", encoding="utf-8")
+    newest = stamps_of(journal)[-1]
+
+    status = measurement_status(journal, last=2, clock=lambda: newest)
+
+    assert (status.verify_ok, status.verify_reasons) == (
+        False,
+        (f"SEGMENT_LAYOUT:{DEFAULT_DAY}/notes.txt",),
+    )
+    assert (status.segment_count, status.last_sequence) == (2, 1)
+    assert status.newest_age_seconds == Decimal("0.000")
+
+
 @pytest.mark.parametrize("last", [0, -1])
 def test_measurement_status_refuses_a_window_of_no_segments(tmp_path: Path, last: int) -> None:
     journal = journal_with_rounds(tmp_path, rounds=1)

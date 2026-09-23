@@ -68,9 +68,11 @@ from trading_bot.panel_samples import rebalance_close_times
 from trading_bot.registry import ArtifactRecord, MetadataRegistry, RegistryConflictError
 from trading_bot.shadow_capture import DAILY_TAIL_KIND, FUNDING_REST_KIND
 from trading_bot.shadow_config import (
+    SUNDAY,
     ShadowDeclaration,
     ShadowDeclarationError,
     load_shadow_declaration,
+    parse_date,
 )
 from trading_bot.storage import StoragePolicy, StoragePolicyError
 
@@ -89,7 +91,6 @@ _SHADOW_MODULES = ("shadow_book.py", "shadow_capture.py", "shadow_config.py")
 _STATUS_BY_PHASE = {"A": "development_only", "B": "shadow"}
 _DAY_NS = 86_400_000_000_000
 _NANOSECONDS_PER_MILLISECOND = 1_000_000
-_SUNDAY = 6  # `date.weekday()` counts from Monday
 _EPOCH = date(1970, 1, 1)
 _BPS = Decimal(10_000)
 # The two source kinds a weekly capture adds to its base. They are the rows
@@ -1317,19 +1318,17 @@ def _code_hash() -> str:
 
 def _sunday(value: str) -> date:
     day = _date(value)
-    if day.weekday() != _SUNDAY:
+    if day.weekday() != SUNDAY:
         raise ShadowBookError(f"{value} is not a Sunday; a decision is a Sunday close")
     return day
 
 
 def _date(value: str) -> date:
+    """`shadow_config.parse_date`, refused in this module's own words."""
     try:
-        parsed = date.fromisoformat(value)
+        return parse_date(value)
     except ValueError as error:
-        raise ShadowBookError(f"invalid date: {value}") from error
-    if parsed.isoformat() != value:
-        raise ShadowBookError(f"invalid date: {value}")
-    return parsed
+        raise ShadowBookError(str(error)) from error
 
 
 def _close_of(day: date) -> int:

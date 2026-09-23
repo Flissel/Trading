@@ -56,7 +56,7 @@ from trading_bot.shadow_capture import (
     ShadowCaptureTransportError,
     build_shadow_capture,
 )
-from trading_bot.shadow_config import ShadowDeclarationError
+from trading_bot.shadow_config import ShadowDeclarationError, load_shadow_declaration
 from trading_bot.storage import StoragePolicy, StoragePolicyError, StorageReserveError
 from trading_bot.strategy import CostScenario
 from trading_bot.trend_fold_run import run_trend_fold
@@ -860,11 +860,37 @@ def _shadow_week(parsed: argparse.Namespace) -> int:
             reserve_bytes=parsed.reserve_bytes,
         )
     except Exception as error:  # the supervisor reads the code, not the traceback
+        refused = _shadow_refusal_path(workspace, declaration, parsed.decision_sunday)
+        if refused is not None and refused.exists():
+            print(f"refused document: {refused}", file=sys.stderr)
         return _journal_failure(f"{type(error).__name__}: {error}", _shadow_exit_code(error))
     print(f"shadow week written: {artifact.output_path}")
     print(f"report hash: {artifact.report_hash}")
     print(f"status: {artifact.status}")
     return 0
+
+
+def _shadow_refusal_path(
+    workspace: Path, declaration_path: Path, decision_sunday: str
+) -> Path | None:
+    """`<workspace>/<artifact_root>/<family_name>/<S>-refused.json`, or nothing.
+
+    A refusal after the inputs verified is recorded beside the week that was
+    not written (spec section 6), and the declaration -- not the command line
+    -- says where that is. Nothing is returned where the declaration is the
+    thing that could not be read: there is no artifact root to name then, and
+    no document was written either.
+    """
+    try:
+        declaration, _ = load_shadow_declaration(declaration_path)
+    except ShadowDeclarationError:
+        return None
+    return (
+        workspace
+        / declaration.artifact_root
+        / declaration.family_name
+        / f"{decision_sunday}-refused.json"
+    )
 
 
 def _binance_measurement_journal_create(parsed: argparse.Namespace) -> int:

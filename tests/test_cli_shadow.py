@@ -316,6 +316,51 @@ def test_the_cli_refuses_a_shadow_week_it_cannot_publish(
     assert not (root / "artifacts" / "cli-week-refused").exists()
 
 
+def test_the_cli_names_the_refused_document_of_a_recorded_refusal(
+    book_captures: ShadowBookCaptures, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Spec section 6: a missing week is visible, and the operator is told where.
+
+    Where the document goes is the declaration's business, not the command
+    line's, so the command that refused is the one that can name the path.
+    """
+    root = book_captures.root
+    spec_path = small_carry_v4_config(root)
+    _, spec_hash = load_carry_family_spec(spec_path)
+    declaration = write_shadow_declaration(
+        root / "cli-week-recorded-declaration.json",
+        family_spec_path=spec_path.name,
+        family_spec_hash=spec_hash,
+        artifact_root="artifacts/cli-week-recorded",
+        registry_path="artifacts/cli-week-recorded/metadata-shadow.sqlite3",
+        # The Sunday asked for is before the anchor, so the run has no
+        # decision for it and records the refusal beside the week.
+        anchor_decision_close_date=SECOND_TAIL_SUNDAY,
+    )
+
+    assert (
+        main(
+            [
+                "shadow-week", "--workspace-root", str(root),
+                "--declaration", str(declaration),
+                "--capture", str(book_captures.perp_second),
+                "--hedge-capture", str(book_captures.spot_second),
+                "--perp-base-capture", str(book_captures.perp_base),
+                "--spot-base-capture", str(book_captures.spot_base),
+                "--decision-sunday", FIRST_TAIL_SUNDAY, "--reserve-bytes", "0",
+            ]
+        )
+        == 2
+    )
+
+    refused = (
+        root / "artifacts" / "cli-week-recorded" / SHADOW_FAMILY_NAME
+        / f"{FIRST_TAIL_SUNDAY}-refused.json"
+    )
+    assert _document(refused)["reason"] == "SHADOW_SUNDAY_NOT_IN_CAPTURE"
+    assert f"refused document: {refused}" in capsys.readouterr().err
+
+
 # --- the measurement stream ---------------------------------------------
 
 
@@ -467,7 +512,18 @@ def test_the_cli_seals_a_window_of_the_measurement_journal(
     assert main(snapshot) == 2
 
 
-@pytest.mark.parametrize("stamp", ["2025-09-04", "2025-09-04T00:00:00+02:00", "yesterday"])
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2025-09-04",
+        "2025-09-04T00:00:00+02:00",
+        # Naive: no zone at all, so nobody can say which hour it names.
+        "2025-09-04T00:00:00",
+        # Fractional: a window is written by hand to the second.
+        "2025-09-04T00:00:00.500Z",
+        "yesterday",
+    ],
+)
 def test_the_cli_refuses_a_snapshot_window_that_is_not_an_iso_utc_stamp(
     tmp_path: Path, running_journal: Path, stamp: str
 ) -> None:

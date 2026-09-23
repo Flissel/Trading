@@ -1354,6 +1354,30 @@ def _head_mismatch_reasons(
     )
 
 
+def _reported_segment_paths(journal_root: Path) -> list[Path]:
+    """The segments a *status* reads, listed leniently.
+
+    ``_segment_paths`` refuses the whole listing over one name this journal
+    did not write, which is right for everything that verifies and wrong for
+    a report: a supervisor asking how old the newest segment is would get an
+    exception where it asked for a status. So a foreign name is stepped over
+    here and named in ``verify_reasons`` instead -- ``_verified_tail`` lists
+    strictly and reports it -- while the age, the failure rate and the
+    exclusions are read off the segments this journal did write.
+    """
+    directory = journal_root / SEGMENT_DIRECTORY_NAME
+    if not directory.is_dir():
+        return []
+    found: dict[int, Path] = {}
+    for day in sorted(directory.iterdir()):
+        if not day.is_dir() or not _DAY_NAME.match(day.name):
+            continue
+        for path in sorted(day.iterdir()):
+            if path.is_file() and _SEGMENT_NAME.match(path.name):
+                found[int(path.stem)] = path
+    return [found[sequence] for sequence in sorted(found)]
+
+
 def _segment_paths(journal_root: Path) -> list[Path]:
     """This journal's segments in sequence order, across the day directories.
 
@@ -1639,12 +1663,15 @@ def measurement_status(
 
     A journal with no segment, no chain head or a head that does not recompute
     has no status and refuses: there is no age to report and no count to
-    report it against.
+    report it against. A name under ``segments/`` this journal did not write
+    is reported rather than raised -- ``verify_ok`` is false and the layout
+    reason says which name -- because a status that raises tells a supervisor
+    nothing about the stream it asked after.
     """
     if last <= 0:
         raise BinanceMeasurementJournalSpecError("a status reads at least one segment")
     spec, spec_hash = load_measurement_journal_spec(journal_root)
-    paths = _segment_paths(journal_root)
+    paths = _reported_segment_paths(journal_root)
     if not paths:
         raise BinanceMeasurementJournalSpecError("this journal holds no segment to report")
     verify_ok, verify_reasons, _ = _verified_tail(journal_root, spec_hash=spec_hash)

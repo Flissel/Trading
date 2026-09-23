@@ -25,6 +25,7 @@ from tests.shadow_fixtures import (
     day_end_ms,
     day_start_ms,
     funding_rest_json,
+    funding_settlement_times_ms,
 )
 from tests.test_panel_fold_run import MONTHS, SYMBOLS, kline_csv, zip_bytes
 from trading_bot.canonical import canonical_json, content_sha256
@@ -533,6 +534,8 @@ def test_an_altered_tail_bar_refuses_and_leaves_a_readable_refusal(tmp_path: Pat
             "kind": "candle",
             "instrument_id": _SYMBOL,
             "key": day_start_ms(FIRST_TAIL_DATE) * _NANOSECONDS_PER_MILLISECOND,
+            # The same key a person can read: the bar's own UTC open.
+            "key_utc": f"{FIRST_TAIL_DATE}T00:00:00Z",
             "field": "close",
             "previous": "999.5",
             "base": _monthly_close(_SYMBOL, FIRST_TAIL_DATE),
@@ -575,6 +578,7 @@ def test_a_previous_settlement_the_base_never_had_is_missing_in_base(tmp_path: P
             "kind": "missing_in_base",
             "instrument_id": _SYMBOL,
             "key": extra_ms * _NANOSECONDS_PER_MILLISECOND,
+            "key_utc": f"{FIRST_TAIL_DATE}T08:00:00Z",
             "field": "funding",
             "previous": "present",
             "base": "absent",
@@ -605,6 +609,62 @@ _RECONCILE_FUNDING = PanelFundingRow(
     funding_interval_hours=8,
     rate=Decimal("0.0001"),
 )
+
+
+# The Sunday after `THIRD_TAIL_SUNDAY`, on the fixture's own calendar.
+_FOURTH_TAIL_SUNDAY = "2020-09-13"
+_AUGUST_DAYS = 31
+
+
+def test_a_straddling_funding_window_is_reconciled_up_to_the_covered_month(
+    tmp_path: Path,
+) -> None:
+    """A dropped REST window is compared as far as the base reaches, and no further.
+
+    Week 1's one funding window runs from the first of August into September.
+    Week 2's base has since covered August and nothing of September, so the
+    window is dropped whole -- the monthly dump wins for the days it covers --
+    but only its August settlements have a monthly dump to be compared
+    against. The September ones are neither compared nor counted, and the days
+    behind them are refetched by this week's own set-difference plan rather
+    than quietly lost with the row.
+    """
+    base = _base_capture(tmp_path)
+    first = _shadow(
+        tmp_path, base, fetch=ShadowFetch(), tail_through=THIRD_TAIL_SUNDAY, name="week-1"
+    )
+    straddling = f"{FIRST_TAIL_DATE}_{THIRD_TAIL_SUNDAY}"
+    assert {str(row["month"]) for row in _rows(first.capture_root, FUNDING_REST_KIND)} == {
+        straddling
+    }
+
+    advanced = _base_capture(tmp_path, months=(*MONTHS, "2020-08"))
+    fetch = ShadowFetch()
+    second = _shadow(
+        tmp_path,
+        advanced,
+        fetch=fetch,
+        tail_through=_FOURTH_TAIL_SUNDAY,
+        previous=first.capture_root,
+        name="week-2",
+    )
+
+    assert verify_panel_capture(second.capture_root) == (True, ())
+    assert verify_capture_superset(advanced, second.capture_root) == (True, ())
+    # Per symbol: August's 31 daily bars and the window's August settlements.
+    august = len(
+        funding_settlement_times_ms(day_start_ms("2020-08-01"), day_end_ms("2020-08-31"))
+    )
+    assert second.reconciliation["compared_rows"] == len(SYMBOLS) * (_AUGUST_DAYS + august)
+    # The whole window is gone, so September is asked for again from its first
+    # day -- not from the day after the window happened to end.
+    assert {str(row["month"]) for row in _rows(second.capture_root, FUNDING_REST_KIND)} == {
+        f"2020-09-01_{_FOURTH_TAIL_SUNDAY}"
+    }
+    # The September daily bars the window straddled are carried, not refetched.
+    assert _requested_dates(fetch, _SYMBOL) == {
+        f"2020-09-{day:02d}" for day in range(7, 14)
+    }
 
 
 def test_reconcile_tail_rows_ignores_what_the_two_sources_cannot_share() -> None:
@@ -642,6 +702,7 @@ def test_reconcile_tail_rows_names_every_field_that_differs() -> None:
             "kind": "candle",
             "instrument_id": _SYMBOL,
             "key": DAY_NS,
+            "key_utc": "1970-01-02T00:00:00Z",
             "field": "close",
             "previous": "105",
             "base": "106",
@@ -650,6 +711,7 @@ def test_reconcile_tail_rows_names_every_field_that_differs() -> None:
             "kind": "candle",
             "instrument_id": _SYMBOL,
             "key": DAY_NS,
+            "key_utc": "1970-01-02T00:00:00Z",
             "field": "trade_count",
             "previous": "7",
             "base": "8",
@@ -669,6 +731,7 @@ def test_reconcile_tail_rows_compares_a_settlement_on_its_rate() -> None:
             "kind": "funding",
             "instrument_id": _SYMBOL,
             "key": DAY_NS,
+            "key_utc": "1970-01-02T00:00:00Z",
             "field": "rate",
             "previous": "0.0001",
             "base": "0.0002",

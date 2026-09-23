@@ -31,7 +31,7 @@ from trading_bot.canonical import content_sha256
 from trading_bot.carry_config import CONTROL_NAMES, MEMBER_NAMES_BY_FAMILY
 
 _HEX64 = re.compile(r"\A[0-9a-f]{64}\Z")
-_SUNDAY = 6  # `date.weekday()` counts from Monday
+SUNDAY = 6  # `date.weekday()` counts from Monday
 
 
 class ShadowDeclarationError(ValueError):
@@ -123,8 +123,8 @@ class ShadowDeclaration(_Frozen):
     @classmethod
     def validate_anchor(cls, value: str) -> str:
         """Spec 4.1's anchor is a Sunday, because every decision is one."""
-        anchor = _parse_date(value)
-        if anchor.weekday() != _SUNDAY:
+        anchor = parse_date(value)
+        if anchor.weekday() != SUNDAY:
             raise ValueError(f"the anchor {value} is not a Sunday")
         return value
 
@@ -163,13 +163,23 @@ def load_shadow_declaration(path: Path) -> tuple[ShadowDeclaration, str]:
     return declaration, content_sha256(document)
 
 
-def _parse_date(value: str) -> date:
+def parse_date(value: str) -> date:
+    """A `YYYY-MM-DD` calendar date, or a `ValueError` naming what was written.
+
+    The one date reader of this feature: a declaration's anchor Sunday, a
+    capture's tail day and a week's decision Sunday are the same spelling
+    read three times, and three copies of it could drift into three different
+    ideas of what a date is. It lives here because this module is the one the
+    other two may both import -- reading a declaration pulls in no decision
+    loop and no venue client. Callers wrap the `ValueError` in their own
+    refusal type, so each module still refuses in its own words.
+    """
     try:
         parsed = date.fromisoformat(value)
     except ValueError as error:
         raise ValueError(f"invalid date: {value}") from error
     if parsed.isoformat() != value:
-        # `fromisoformat` also accepts compact forms like "20260913"; a
-        # declared Sunday is always YYYY-MM-DD.
+        # `fromisoformat` also accepts compact forms like "20260913"; every
+        # date in this feature is the dumps' own, always YYYY-MM-DD.
         raise ValueError(f"invalid date: {value}")
     return parsed

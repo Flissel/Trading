@@ -42,8 +42,8 @@ import shutil
 import time
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from datetime import date as date_type
-from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, NoReturn
@@ -71,6 +71,7 @@ from trading_bot.panel_dataset import (
     PanelFundingRow,
     publish_panel_dataset,
 )
+from trading_bot.shadow_config import SUNDAY, parse_date
 from trading_bot.storage import StoragePolicy
 
 # The two source kinds a shadow capture adds to the panel format. Both store
@@ -90,7 +91,6 @@ _MONTH_BUCKET = {
     FUNDING_REST_KIND: "fundingRate",
 }
 _EPOCH = date_type(1970, 1, 1)
-_SUNDAY = 6  # `date.weekday()` counts from Monday
 _FUNDING_REST_LIMIT = 1000
 # What a lone settlement's interval is taken to be: Binance's standard eight
 # hours. With one row there is no spacing to read it off, and a weekly tail
@@ -388,12 +388,26 @@ def _field_mismatches(
                 "kind": kind,
                 "instrument_id": previous.instrument_id,
                 "key": key,
+                "key_utc": _key_utc(key),
                 "field": field_name,
                 "previous": str(previous_value),
                 "base": str(base_value),
             }
         )
     return tuple(records)
+
+
+def _key_utc(key: int) -> str:
+    """A mismatch's key as the UTC stamp a person reads it by.
+
+    The key itself stays the nanosecond it is -- that is what identifies the
+    row -- and this is written beside it: a refusal is read by someone
+    deciding whether a bar or a settlement is worth chasing, and nobody reads
+    1596240000000000000 as the first of August.
+    """
+    seconds, remainder = divmod(key, 1_000_000_000)
+    stamp = datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=remainder // 1_000)
+    return stamp.isoformat().replace("+00:00", "Z")
 
 
 def _missing_in_base(row_kind: str, instrument_id: str, key: int) -> dict[str, object]:
@@ -407,6 +421,7 @@ def _missing_in_base(row_kind: str, instrument_id: str, key: int) -> dict[str, o
         "kind": "missing_in_base",
         "instrument_id": instrument_id,
         "key": key,
+        "key_utc": _key_utc(key),
         "field": row_kind,
         "previous": "present",
         "base": "absent",
@@ -725,7 +740,7 @@ def _fetch_daily_tail(
         url = build_daily_kline_zip_url(symbol, date, market=market)
         waiting = (
             day == tail_day
-            and tail_day.weekday() == _SUNDAY
+            and tail_day.weekday() == SUNDAY
             and saturday_open_time_ns in open_times.get(symbol, set())
         )
         payload = _fetch_daily_dump(
@@ -1309,15 +1324,11 @@ def _string_list(manifest: dict[str, Any], key: str) -> list[str]:
 
 
 def _parse_date(value: str) -> date_type:
+    """`shadow_config.parse_date`, refused in this module's own words."""
     try:
-        parsed = date_type.fromisoformat(value)
+        return parse_date(value)
     except ValueError as error:
-        raise ShadowCaptureError(f"invalid date: {value}") from error
-    if parsed.isoformat() != value:
-        # `fromisoformat` also accepts compact forms like "20200802"; the
-        # manifest's dates are the dumps' own, always YYYY-MM-DD.
-        raise ShadowCaptureError(f"invalid date: {value}")
-    return parsed
+        raise ShadowCaptureError(str(error)) from error
 
 
 def _plan_tail_days(*, first_day: date_type, tail_day: date_type) -> tuple[date_type, ...]:
