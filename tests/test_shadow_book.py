@@ -427,28 +427,35 @@ def test_the_code_hash_covers_the_carry_stack_and_the_shadow_modules(
     assert document["code_hash"] == content_sha256(material)
 
 
-def test_the_books_slots_are_empty_while_the_week_ahead_has_no_bars(
+def test_the_books_slots_survive_the_last_episodes_forced_closes(
     harness: Harness,
 ) -> None:
-    """A consequence of reading the book off the runner's state after the last
-    decision, recorded here because it is surprising and load-bearing.
+    """The book is the state S traded on, not what survived S's episode.
 
     S's episode exits seven days after S -- a bar the capture cannot hold yet,
-    because that week has not happened. The panel accounting therefore
-    force-closes every leg of the last decision, and the fold runner strips a
-    force-closed pair from the slot state it ends on. So a shadow week's
-    `slots` is empty by construction, and `leg_weights` -- assembled before
-    the episode -- is the book a reader must use. The per-slot detail for the
-    Sunday just past is carried by `m_labels`, whose S-1 slots were exited at
-    S and so survive.
+    because that week has not happened -- so the panel accounting force-closes
+    every leg of the last decision and the fold runner strips those pairs from
+    the state it would carry into the next decision. The runner records the
+    book where the decision assembles its weights, before all that, so `slots`
+    and `leg_weights` are one and the same book rather than a book and an
+    empty list: every slot's two legs carry weight, and no leg belongs to a
+    pair no slot names.
     """
     artifact = _run(harness, harness.declare())
 
-    book = _mapping(_document(artifact.output_path)["book"])
+    document = _document(artifact.output_path)
+    book = _mapping(document["book"])
 
-    assert book["slots"] == []
-    assert _sequence(book["leg_weights"])
-    assert _sequence(_document(artifact.output_path)["m_labels"])
+    slots = [_mapping(item) for item in _sequence(book["slots"])]
+    assert slots
+    legs = {_text(_sequence(item)[0]) for item in _sequence(book["leg_weights"])}
+    assert legs == {
+        leg
+        for slot in slots
+        for leg in (_text(slot["perpetual_leg"]), _text(slot["spot_leg"]))
+    }
+    assert len(legs) == 2 * len(slots)
+    assert _sequence(document["m_labels"])
 
 
 # --- the universe measurements ------------------------------------------

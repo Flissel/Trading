@@ -1238,9 +1238,10 @@ def test_the_final_book_of_a_slot_member_is_its_last_decision_s_slots(
     """Spec 4.1: the last decision's slot state and leg weights are the book.
 
     The two slots the exit member ends fold 0 on are the two pairs its last
-    episode traded, and the weights are the declared book's, not a
-    proportional one: four slots, two filled, so each pair carries a quarter
-    of the book as spot +1/8 and perpetual -1/8.
+    episode traded -- the same book stated as slots and as weights -- and the
+    weights are the declared book's, not a proportional one: four slots, two
+    filled, so each pair carries a quarter of the book as spot +1/8 and
+    perpetual -1/8.
     """
     space = v4_workspace
     run = _decision_runner(space)(None)
@@ -1397,3 +1398,36 @@ def test_a_run_whose_every_decision_is_skipped_still_reports_its_empty_book(
     assert run.skipped_sample_ids == [f"BINANCE_UM:{skipped_close}:w1"]
     empty = FinalBook(decision_close_ns=skipped_close, slots=(), leg_weights=())
     assert run.final_books == {name: empty for name in MEMBER_NAMES_V4 + CONTROL_NAMES}
+
+
+def test_a_pair_force_closed_by_the_last_episode_is_still_in_the_book(
+    v4_workspace_with_a_hole: Workspace,
+) -> None:
+    """The book is the state the decision traded on, not what survived its
+    episode.
+
+    The hole symbol loses its perpetual bar during the week after the second
+    decision, so that episode force-closes the leg and the runner strips the
+    pair from the slot it was filling -- but the decision did trade it, so the
+    book still names its slot and still carries its weights. This is not a
+    corner: a shadow week's last episode is exited past the end of the capture,
+    so every leg is force-closed there and a book read after the episode would
+    always be empty while the weights it traded were real.
+    """
+    space = v4_workspace_with_a_hole
+    decisions = _decisions(space[0])
+    name = MEMBER_NAMES_V4[2]
+    run = _decision_runner(space, decisions=decisions[:2])(None)
+    episode = _last_episode(run, name)
+    assert episode["forced_close_count"] == 1
+    book = run.final_books[name]
+    assert book.decision_close_ns == decisions[1]
+    assert len(book.slots) == 2
+    assert HOLE_SYMBOL in {slot.pair_id.split(":")[0] for slot in book.slots}
+    # slots and leg weights are one book: the forced close thins neither
+    weights = dict(book.leg_weights)
+    assert len(weights) == 2 * len(book.slots)
+    for slot in book.slots:
+        assert weights[slot.spot_leg] == Decimal(1) / 8
+        assert weights[slot.perpetual_leg] == -Decimal(1) / 8
+    assert sum((abs(w) for w in weights.values()), Decimal(0)) == _gross_exposure(episode)

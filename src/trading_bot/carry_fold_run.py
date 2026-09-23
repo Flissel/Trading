@@ -111,7 +111,7 @@ class CarryFoldArtifact:
 
 @dataclass(frozen=True, slots=True)
 class SlotEntry:
-    """One filled slot of the book a decision run ended on.
+    """One filled slot of the book a decision run's last decision traded on.
 
     Spec 4.1 reads the shadow book off the last decision's slot state, and
     spec 4.2 states that book per slot: the pair, the Sunday it was entered
@@ -129,14 +129,17 @@ class SlotEntry:
 
 @dataclass(frozen=True, slots=True)
 class FinalBook:
-    """The book one candidate ended a decision run on (spec 4.1).
+    """The book one candidate's last decision in a run traded on (spec 4.1).
 
-    `leg_weights` is what the last decision actually traded, before that
-    episode's forced closes; `slots` is the slot state the same decision ended
-    with, forced closes stripped and the prune applied, which is what the next
-    decision would start from. A cohort candidate has no slots -- a weekly
-    cohort is not a slot and reading it as one would invent a book -- so
-    `slots` is empty for it and `leg_weights` is its whole book. A last
+    `slots` and `leg_weights` are one and the same book, stated twice: the
+    slot state the last decision traded on -- after its releases, exit-rule
+    removals, untradeable drops and fills -- and the leg weights assembled
+    from exactly that state. Both are taken before the decision's episode, so
+    neither is emptied by the forced closes that end an episode whose exit
+    week reaches past the capture, nor thinned by the age prune that bounds
+    state for a decision that never ran. A cohort candidate has no slots -- a
+    weekly cohort is not a slot and reading it as one would invent a book --
+    so `slots` is empty for it and `leg_weights` is its whole book. A last
     decision skipped for want of a universe leaves both empty at that Sunday's
     close, because the runner resets its state there and the book is the
     runner's state, reset included.
@@ -407,9 +410,14 @@ def evaluate_carry_decisions(
     # The last evaluated decision's tiers, which price the fold's uncharged
     # final exit; empty until the first decision that is not skipped.
     tiers: dict[str, int] = {}
-    # Spec 4.1's book, recorded as each decision ends rather than read off the
-    # live state after the loop, so that all three parts of a book are one and
-    # the same decision's. A shadow week is these fold mechanics unchanged, so
+    # Spec 4.1's book, recorded per decision rather than read off the live
+    # state after the loop, so that all three parts of a book are one and the
+    # same decision's. Recorded where the decision's weights are assembled,
+    # which is the state it traded on: what follows in the loop body is the
+    # episode, whose forced closes strip pairs, and the prune, which bounds
+    # state for the next decision -- and a week's last episode is exited past
+    # the end of the capture, so it force-closes every leg and would leave
+    # every book empty. A shadow week is these fold mechanics unchanged, so
     # every decision records -- a skipped one included, which is why the skip
     # branch below records its reset rather than leaving the last decision that
     # traded standing as the book.
@@ -522,6 +530,7 @@ def evaluate_carry_decisions(
                     for key, value in zip(_SLOT_EXTRA_KEYS, counts, strict=True)
                 })
             last_weights[name] = weights
+            last_slot_state[name] = tuple(cohorts[name])
             held_nothing[name].append(name in members and not weights)
             forced_pairs: set[str] = set()
             for scenario in scenarios:
@@ -547,7 +556,6 @@ def evaluate_carry_decisions(
             cohorts[name] = [
                 c for c in cohorts[name] if decision_close_ns - c.decision_close_ns < longest
             ]
-            last_slot_state[name] = tuple(cohorts[name])
         last_decision_close_ns = decision_close_ns
 
     episode_count = len(episodes[(names[0], "base")]) if names else 0
@@ -623,16 +631,17 @@ def _final_books(
     decision_close_ns: int,
     slot_names: set[str],
 ) -> dict[str, FinalBook]:
-    """The book each evaluated candidate ended on, from the state the loop left.
+    """The book each candidate's last decision traded on, as the loop recorded it.
 
     Spec 4.1 makes the last decision's slot state and leg weights the book, so
-    both are read off that state rather than recomputed from a second copy of
-    the rules. Only a slot family has slots; a slot is a `Cohort` holding
-    exactly one pair, so anything else is a bug in the slot bookkeeping and is
-    refused rather than guessed at. A run with no decisions at all recorded
-    nothing and so has no books, which is why this iterates the recorded
-    weights; a run whose decisions were all skipped recorded each reset and so
-    has an empty book per candidate rather than none.
+    both are read off the state that decision assembled its weights from,
+    rather than recomputed from a second copy of the rules. Only a slot family
+    has slots; a slot is a `Cohort` holding exactly one pair, so anything else
+    is a bug in the slot bookkeeping and is refused rather than guessed at. A
+    run with no decisions at all recorded nothing and so has no books, which
+    is why this iterates the recorded weights; a run whose decisions were all
+    skipped recorded each reset and so has an empty book per candidate rather
+    than none.
     """
     books: dict[str, FinalBook] = {}
     for name, weights in leg_weights.items():
