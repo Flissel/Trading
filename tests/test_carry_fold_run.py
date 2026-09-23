@@ -42,6 +42,7 @@ from trading_bot.carry_fold_run import (
     FOLD_WARMED_REASON_CODE,
     CarryFoldError,
     DecisionRun,
+    FinalBook,
     _final_books,
     control_reference,
     evaluate_carry_decisions,
@@ -1089,7 +1090,7 @@ def test_a_universe_too_small_week_empties_every_slot(
 
 
 def _decision_runner(
-    space: Workspace, fold_index: int = 0
+    space: Workspace, fold_index: int = 0, *, decisions: list[int] | None = None
 ) -> Callable[[tuple[str, ...] | None], DecisionRun]:
     """Load one fold's bars, funding and decisions as `run_carry_fold` does,
     and hand back a caller that evaluates them for a choice of candidates.
@@ -1097,6 +1098,8 @@ def _decision_runner(
     The holdout runner will load the same way and call the same function with
     its own decisions, so a full run and a filtered one are compared here over
     one set of inputs, with nothing between them but `candidate_names`.
+    `decisions` overrides the fold's own list, which is how a run is made to
+    end on a chosen Sunday over the same loaded inputs.
     """
     root, perp, spot, config_path = space
     spec, _ = load_carry_family_spec(config_path)
@@ -1118,14 +1121,18 @@ def _decision_runner(
     for event in load_funding_events(perp / "dataset"):
         leg_key = f"perp:{event.contract_id}"
         funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
-    decisions = sorted(int(str(value).split(":")[1]) for value in fold["test_ids"])
+    evaluated = (
+        sorted(int(str(value).split(":")[1]) for value in fold["test_ids"])
+        if decisions is None
+        else decisions
+    )
 
     def evaluate(candidate_names: tuple[str, ...] | None) -> DecisionRun:
         return evaluate_carry_decisions(
             spec,
             perp_histories=perp_histories, spot_histories=spot_histories,
             leg_histories=leg_histories, funding_by_leg=funding_by_leg,
-            decisions=decisions, candidate_names=candidate_names,
+            decisions=evaluated, candidate_names=candidate_names,
         )
 
     return evaluate
@@ -1350,3 +1357,43 @@ def test_a_slot_that_holds_more_than_one_pair_is_refused() -> None:
         slot_names=set(),
     )
     assert books["member"].slots == ()
+
+
+def test_a_skipped_last_decision_leaves_every_candidate_on_an_empty_book(
+    v4_workspace_with_a_liquidity_dip: Workspace,
+) -> None:
+    """A shadow week is these fold mechanics unchanged (spec 4.1), and the
+    runner empties every slot on a week whose universe is too small. So a run
+    that ends on the skipped Sunday ends on an empty book dated to it, not on
+    the book of the last decision that traded -- and every candidate is on
+    one, whether or not it ran the slot book."""
+    space = v4_workspace_with_a_liquidity_dip
+    decisions = _decisions(space[0])
+    names = list(MEMBER_NAMES_V4 + CONTROL_NAMES)
+    # the decision before the skip trades a real book ...
+    traded = _decision_runner(space, decisions=decisions[:1])(None)
+    assert traded.skipped_sample_ids == []
+    assert traded.final_books[MEMBER_NAMES_V4[3]].slots != ()
+    assert traded.final_books[MEMBER_NAMES_V4[3]].decision_close_ns == decisions[0]
+    # ... and the skip that follows it resets the book rather than leaving it
+    run = _decision_runner(space, decisions=decisions[:2])(None)
+    assert run.skipped_sample_ids == [f"BINANCE_UM:{decisions[1]}:w1"]
+    assert sorted(run.final_books) == sorted(names)
+    empty = FinalBook(decision_close_ns=decisions[1], slots=(), leg_weights=())
+    for name in names:
+        assert run.final_books[name] == empty, name
+
+
+def test_a_run_whose_every_decision_is_skipped_still_reports_its_empty_book(
+    v4_workspace_with_a_liquidity_dip: Workspace,
+) -> None:
+    """One skipped decision and nothing else: no episode was evaluated, but a
+    decision was, so the run reports the flat book that decision left rather
+    than no book at all -- which is what an empty decision list reports."""
+    space = v4_workspace_with_a_liquidity_dip
+    skipped_close = _decisions(space[0])[1]
+    run = _decision_runner(space, decisions=[skipped_close])(None)
+    assert run.episode_count == 0
+    assert run.skipped_sample_ids == [f"BINANCE_UM:{skipped_close}:w1"]
+    empty = FinalBook(decision_close_ns=skipped_close, slots=(), leg_weights=())
+    assert run.final_books == {name: empty for name in MEMBER_NAMES_V4 + CONTROL_NAMES}

@@ -131,12 +131,15 @@ class SlotEntry:
 class FinalBook:
     """The book one candidate ended a decision run on (spec 4.1).
 
-    `leg_weights` is what the last evaluated decision actually traded, before
-    that episode's forced closes; `slots` is the slot state the same decision
-    ended with, forced closes stripped and the prune applied, which is what
-    the next decision would start from. A cohort candidate has no slots --
-    a weekly cohort is not a slot and reading it as one would invent a book --
-    so `slots` is empty for it and `leg_weights` is its whole book.
+    `leg_weights` is what the last decision actually traded, before that
+    episode's forced closes; `slots` is the slot state the same decision ended
+    with, forced closes stripped and the prune applied, which is what the next
+    decision would start from. A cohort candidate has no slots -- a weekly
+    cohort is not a slot and reading it as one would invent a book -- so
+    `slots` is empty for it and `leg_weights` is its whole book. A last
+    decision skipped for want of a universe leaves both empty at that Sunday's
+    close, because the runner resets its state there and the book is the
+    runner's state, reset included.
     """
 
     decision_close_ns: int
@@ -405,9 +408,11 @@ def evaluate_carry_decisions(
     # final exit; empty until the first decision that is not skipped.
     tiers: dict[str, int] = {}
     # Spec 4.1's book, recorded as each decision ends rather than read off the
-    # live state after the loop: a trailing skipped week empties the state
-    # without evaluating anything, and would otherwise label the last
-    # evaluated decision's weights with a book it never held.
+    # live state after the loop, so that all three parts of a book are one and
+    # the same decision's. A shadow week is these fold mechanics unchanged, so
+    # every decision records -- a skipped one included, which is why the skip
+    # branch below records its reset rather than leaving the last decision that
+    # traded standing as the book.
     last_weights: dict[str, tuple[tuple[str, Decimal], ...]] = {}
     last_slot_state: dict[str, tuple[Cohort, ...]] = {}
     last_decision_close_ns: int | None = None
@@ -423,6 +428,12 @@ def evaluate_carry_decisions(
                 carried[episode_key] = ()
             for name in names:
                 cohorts[name] = []
+                # The book mirrors the reset the line above applies: a skipped
+                # last decision ends the run flat at this Sunday's close, on
+                # nothing held and nothing traded.
+                last_slot_state[name] = ()
+                last_weights[name] = ()
+            last_decision_close_ns = decision_close_ns
             continue
         # Tiers follow P1.27: this week's universe tier, tier two for a leg that
         # is only being exited (see panel_accounting's `tiers.get(id, 2)`).
@@ -618,14 +629,21 @@ def _final_books(
     both are read off that state rather than recomputed from a second copy of
     the rules. Only a slot family has slots; a slot is a `Cohort` holding
     exactly one pair, so anything else is a bug in the slot bookkeeping and is
-    refused rather than guessed at. A candidate no decision was evaluated for
-    has no entry at all, which is why this iterates the recorded weights.
+    refused rather than guessed at. A run with no decisions at all recorded
+    nothing and so has no books, which is why this iterates the recorded
+    weights; a run whose decisions were all skipped recorded each reset and so
+    has an empty book per candidate rather than none.
     """
     books: dict[str, FinalBook] = {}
     for name, weights in leg_weights.items():
         slots: list[SlotEntry] = []
         if name in slot_names:
             for slot in slot_state[name]:
+                # Deliberately stricter than `assemble_slot_book`, which
+                # refuses only more than one entry: an emptied slot is dropped
+                # on every live path (`_without_pairs(..., drop_empty=True)`),
+                # so a zero-entry slot reaching here is a bug in the slot
+                # bookkeeping too, not a slot that happens to hold nothing.
                 if len(slot.entries) != 1:
                     raise CarryFoldError(
                         f"{name} ended on a slot holding {len(slot.entries)} pairs; "
