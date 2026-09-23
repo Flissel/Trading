@@ -23,7 +23,9 @@ contracts stop years early and funding dumps lag klines. The tail therefore
 starts per symbol and per source bucket -- a symbol one month behind the
 furthest one is simply lagging and its tail starts a month earlier, while a
 symbol further behind is named in the manifest's `stale_symbols` rather than
-having years of daily dumps refetched every week.
+having years of daily dumps refetched every week. Each week plans its own
+span from its own base and subtracts what the previous week already carried,
+so a month that arrived since last week is fetched rather than stepped over.
 """
 
 import hashlib
@@ -31,7 +33,7 @@ import json
 import os
 import shutil
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import timedelta
@@ -357,8 +359,13 @@ def build_shadow_capture(
             open_times=open_times,
         )
 
-    carried_tail_day: dict[str, date_type] = {}
-    carried_rest_day: dict[str, date_type] = {}
+    # Per symbol and bucket, every calendar day a carried row already speaks
+    # for. A cursor ("the last day carried") cannot stand in for this: a week
+    # that corrects a symbol's start backwards -- because the base now covers
+    # a month it did not cover last week -- would have the older, later cursor
+    # win, and the days in between would never be fetched by any week.
+    carried_daily_days: dict[str, set[date_type]] = {}
+    carried_rest_days: dict[str, set[date_type]] = {}
     if previous_manifest is not None and previous_root is not None:
         for entry in _source_entries(previous_manifest, label="previous"):
             kind = str(entry.get("kind"))
@@ -385,14 +392,21 @@ def build_shadow_capture(
                 funding=funding,
                 open_times=open_times,
             )
-            reached = carried_tail_day if kind == DAILY_TAIL_KIND else carried_rest_day
-            reached[symbol] = max(span_end, reached.get(symbol, span_end))
+            reached = carried_daily_days if kind == DAILY_TAIL_KIND else carried_rest_days
+            # An `absent` carried row counts as covered: its day was asked for
+            # and the venue does not have it, and flipping it to present in a
+            # later week would break the lineage check against this one.
+            reached.setdefault(symbol, set()).update(_span_days(span_start, span_end))
 
     deadline_ns = clock() + sunday_deadline_hours * _NANOSECONDS_PER_HOUR
     for symbol in symbols:
         _fetch_daily_tail(
             symbol=symbol,
-            first_day=_next_day_or(carried_tail_day.get(symbol), daily_start[symbol]),
+            days=_uncovered_days(
+                first_day=daily_start[symbol],
+                tail_day=tail_day,
+                covered=carried_daily_days.get(symbol, frozenset()),
+            ),
             tail_day=tail_day,
             market=market,
             venue=venue,
@@ -409,16 +423,25 @@ def build_shadow_capture(
             # Funding exists only on the perpetual market, so a spot shadow
             # capture never reaches for the funding endpoint at all.
             continue
-        _fetch_funding_window(
-            symbol=symbol,
-            first_day=_next_day_or(carried_rest_day.get(symbol), rest_start[symbol]),
-            tail_day=tail_day,
-            venue=venue,
-            fetch=fetch,
-            target=target,
-            sources=sources,
-            funding=funding,
-        )
+        # One request per contiguous uncovered run -- ordinarily one, or two
+        # when a carried window sits inside this week's span.
+        for run_first, run_last in _contiguous_runs(
+            _uncovered_days(
+                first_day=rest_start[symbol],
+                tail_day=tail_day,
+                covered=carried_rest_days.get(symbol, frozenset()),
+            )
+        ):
+            _fetch_funding_window(
+                symbol=symbol,
+                first_day=run_first,
+                last_day=run_last,
+                venue=venue,
+                fetch=fetch,
+                target=target,
+                sources=sources,
+                funding=funding,
+            )
 
     dataset = publish_panel_dataset(
         tuple(candles),
@@ -467,7 +490,7 @@ def build_shadow_capture(
 def _fetch_daily_tail(
     *,
     symbol: str,
-    first_day: date_type,
+    days: tuple[date_type, ...],
     tail_day: date_type,
     market: str,
     venue: str,
@@ -480,7 +503,7 @@ def _fetch_daily_tail(
     candles: list[PanelCandleRow],
     open_times: dict[str, set[int]],
 ) -> None:
-    """Fetch one symbol's daily dumps for every day of its tail.
+    """Fetch one symbol's daily dumps for the planned days of its tail.
 
     A 404 is an absence, recorded exactly the way `capture_panel` records one
     and then stepped over -- except on the decision Sunday itself, where spec
@@ -489,7 +512,7 @@ def _fetch_daily_tail(
     capture that silently misses the week's close.
     """
     saturday_open_time_ns = _open_time_ns(tail_day - timedelta(days=1))
-    for day in _plan_tail_days(first_day=first_day, tail_day=tail_day):
+    for day in days:
         date = day.isoformat()
         url = build_daily_kline_zip_url(symbol, date, market=market)
         waiting = (
@@ -544,25 +567,23 @@ def _fetch_funding_window(
     *,
     symbol: str,
     first_day: date_type,
-    tail_day: date_type,
+    last_day: date_type,
     venue: str,
     fetch: PanelFetch,
     target: Path,
     sources: list[dict[str, object]],
     funding: list[PanelFundingRow],
 ) -> None:
-    """Fetch one symbol's funding history for the whole tail in one request.
+    """Fetch one symbol's funding history for one uncovered run of days.
 
     Funding settles several times a day, so a per-day request would be a
     dozen times the traffic for the same rows; the window is recorded in the
     manifest's `month` field as `<from>_<to>` so a reader can tell exactly
     which days one stored answer speaks for.
     """
-    if first_day > tail_day:
-        return
     start_time_ms = _day_start_ms(first_day)
-    end_time_ms = _day_end_ms(tail_day)
-    window = f"{first_day.isoformat()}_{tail_day.isoformat()}"
+    end_time_ms = _day_end_ms(last_day)
+    window = f"{first_day.isoformat()}_{last_day.isoformat()}"
     url = build_funding_rest_url(symbol, start_time_ms=start_time_ms, end_time_ms=end_time_ms)
     try:
         payload = fetch(url)
@@ -654,6 +675,7 @@ def _carry_source(
     sources.append(record)
     if record.get("status") != "present":
         return
+    symbol = _present_row_text(entry, "symbol")
     _copy_raw_payload(
         source_root=source_root,
         target=target,
@@ -663,9 +685,7 @@ def _carry_source(
     new_candles, new_funding = _rows_from_source(entry, capture_root=target, venue=venue)
     candles.extend(new_candles)
     funding.extend(new_funding)
-    open_times.setdefault(str(entry.get("symbol")), set()).update(
-        row.open_time_ns for row in new_candles
-    )
+    open_times.setdefault(symbol, set()).update(row.open_time_ns for row in new_candles)
 
 
 def _copy_raw_payload(
@@ -707,8 +727,8 @@ def _rows_from_source(
     entry: dict[str, Any], *, capture_root: Path, venue: str
 ) -> tuple[tuple[PanelCandleRow, ...], tuple[PanelFundingRow, ...]]:
     """Re-derive one present source row's candle and funding rows."""
-    symbol = str(entry.get("symbol"))
-    kind = str(entry.get("kind"))
+    symbol = _present_row_text(entry, "symbol")
+    kind = _present_row_text(entry, "kind")
     payload = PanelPayload(
         url=_present_row_text(entry, "url"),
         raw_bytes=(capture_root / _present_row_text(entry, "raw_relative_path")).read_bytes(),
@@ -938,9 +958,37 @@ def _plan_tail_days(*, first_day: date_type, tail_day: date_type) -> tuple[date_
     )
 
 
-def _next_day_or(reached: date_type | None, fallback: date_type) -> date_type:
-    """The day after what is already covered, or where coverage has to start."""
-    return fallback if reached is None else reached + timedelta(days=1)
+def _span_days(first_day: date_type, last_day: date_type) -> tuple[date_type, ...]:
+    """Every calendar day one carried row speaks for, inclusive."""
+    return _plan_tail_days(first_day=first_day, tail_day=last_day)
+
+
+def _uncovered_days(
+    *, first_day: date_type, tail_day: date_type, covered: Collection[date_type]
+) -> tuple[date_type, ...]:
+    """The days of this week's span that no carried row already speaks for.
+
+    The span is recomputed from this week's base every week, so a symbol whose
+    base coverage moved backwards-looking -- a month that arrived since last
+    week -- gets the days between its new start and what was carried, which a
+    forward-only cursor would have skipped for good.
+    """
+    return tuple(
+        day
+        for day in _plan_tail_days(first_day=first_day, tail_day=tail_day)
+        if day not in covered
+    )
+
+
+def _contiguous_runs(days: tuple[date_type, ...]) -> tuple[tuple[date_type, date_type], ...]:
+    """Ascending days grouped into inclusive (first, last) runs."""
+    runs: list[tuple[date_type, date_type]] = []
+    for day in days:
+        if runs and day == runs[-1][1] + timedelta(days=1):
+            runs[-1] = (runs[-1][0], day)
+        else:
+            runs.append((day, day))
+    return tuple(runs)
 
 
 def _first_day_after_month(month: str) -> date_type:

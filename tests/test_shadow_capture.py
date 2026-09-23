@@ -49,6 +49,7 @@ from trading_bot.shadow_capture import (
 
 _SYMBOL = SYMBOLS[0]
 _NANOSECONDS_PER_MILLISECOND = 1_000_000
+_BUCKETS = ("klines", "fundingRate")
 
 
 @pytest.fixture(autouse=True)
@@ -81,7 +82,11 @@ class FakeClock:
 
 
 def _base_capture(
-    root: Path, *, months: tuple[str, ...] = MONTHS, fetch: ShadowFetch | None = None
+    root: Path,
+    *,
+    months: tuple[str, ...] = MONTHS,
+    fetch: ShadowFetch | None = None,
+    name: str | None = None,
 ) -> Path:
     """A perpetual base capture over `months`, built by the shadow fetch.
 
@@ -91,7 +96,7 @@ def _base_capture(
     download = fetch if fetch is not None else ShadowFetch()
     return capture_panel(
         workspace_root=root,
-        output_directory=root / f"base-{months[-1]}",
+        output_directory=root / (name or f"base-{months[-1]}"),
         reserve_bytes=0,
         symbols=SYMBOLS,
         months=months,
@@ -718,22 +723,27 @@ def test_an_already_written_raw_payload_path_refuses(tmp_path: Path) -> None:
     assert "already written" in str(error.value)
 
 
-def test_a_present_row_without_received_time_ns_refuses(tmp_path: Path) -> None:
+# `raw_sha256` is not in this list: dropping it makes the base itself fail
+# verification, which is a different refusal and already covered.
+@pytest.mark.parametrize("field", ["received_time_ns", "symbol", "url"])
+def test_a_present_row_missing_a_required_field_refuses(tmp_path: Path, field: str) -> None:
     base = _base_capture(tmp_path)
 
-    def drop_the_timestamp(material: dict[str, object]) -> None:
+    def drop_the_field(material: dict[str, object]) -> None:
         sources = material["sources"]
         assert isinstance(sources, list)
         row = next(entry for entry in sources if entry.get("status") == "present")
-        del row["received_time_ns"]
+        del row[field]
 
-    _reseal(base, drop_the_timestamp)
+    _reseal(base, drop_the_field)
+    # The base still verifies -- none of these fields is part of what
+    # `verify_panel_capture` checks -- so the refusal has to come from here.
     assert verify_panel_capture(base) == (True, ())
 
     with pytest.raises(ShadowCaptureError) as error:
         _shadow(tmp_path, base, fetch=ShadowFetch())
 
-    assert "has no received_time_ns" in str(error.value)
+    assert f"has no {field}" in str(error.value)
 
 
 def test_a_funding_request_that_fails_refuses_as_a_shadow_error(tmp_path: Path) -> None:
@@ -804,3 +814,96 @@ def test_a_settlement_a_few_seconds_early_still_measures_eight_hours() -> None:
     )
 
     assert [row.funding_interval_hours for row in rows] == [8, 8]
+
+
+# A week plans its own span from its own base and subtracts only what the
+# previous week actually carried. The case that matters is a symbol whose base
+# coverage catches up between two weeks: week 2's correct start is *earlier*
+# than where week 1 fetched from, so a forward-only cursor would skip the days
+# in between for good while `stale_symbols` stopped mentioning the symbol.
+
+_CHAIN_SYMBOL = SYMBOLS[5]
+_JULY_DATES = frozenset(f"2020-07-{day:02d}" for day in range(1, 32))
+
+
+def _requested_dates(fetch: ShadowFetch, symbol: str) -> set[str]:
+    """Every date whose daily dump was asked for, for one symbol."""
+    return {
+        url.rsplit("-1d-", 1)[-1].removesuffix(".zip")
+        for url in _daily_urls(fetch)
+        if f"/{symbol}/" in url
+    }
+
+
+def test_a_symbol_whose_base_catches_up_gets_the_months_the_stale_week_skipped(
+    tmp_path: Path,
+) -> None:
+    # Week 1: the symbol is two months behind in both buckets, so it is stale
+    # and its tail starts at the furthest month's day like everyone else's.
+    behind_two_months = frozenset(
+        {(_CHAIN_SYMBOL, month, kind) for month in ("2020-06", "2020-07") for kind in _BUCKETS}
+    )
+    first_base = _base_capture(
+        tmp_path, fetch=ShadowFetch(absent_months=behind_two_months), name="base-week-1"
+    )
+    first = _shadow(tmp_path, first_base, fetch=ShadowFetch(), name="week-1")
+    assert _manifest(first.capture_root)["stale_symbols"] == {
+        "klines": {_CHAIN_SYMBOL: "2020-05"},
+        "fundingRate": {_CHAIN_SYMBOL: "2020-05"},
+    }
+
+    # Week 2: 2020-06 arrived, so the symbol is only one month behind and its
+    # correct start is 2020-07-01 -- a month before week 1 ever fetched.
+    behind_one_month = frozenset({(_CHAIN_SYMBOL, "2020-07", kind) for kind in _BUCKETS})
+    second_base = _base_capture(
+        tmp_path, fetch=ShadowFetch(absent_months=behind_one_month), name="base-week-2"
+    )
+    fetch = ShadowFetch()
+    second = _shadow(
+        tmp_path,
+        second_base,
+        fetch=fetch,
+        tail_through=SECOND_TAIL_SUNDAY,
+        previous=first.capture_root,
+        name="week-2",
+    )
+
+    assert verify_panel_capture(second.capture_root) == (True, ())
+    assert verify_capture_superset(second_base, second.capture_root) == (True, ())
+    # The whole of July -- which no week has ever fetched -- plus this week's
+    # own new days, and nothing week 1 already carried.
+    new_days = {"2020-08-03", "2020-08-04", "2020-08-05", "2020-08-06"}
+    new_days |= {"2020-08-07", "2020-08-08", SECOND_TAIL_SUNDAY}
+    assert _requested_dates(fetch, _CHAIN_SYMBOL) == set(_JULY_DATES) | new_days
+    assert {FIRST_TAIL_DATE, FIRST_TAIL_SUNDAY}.isdisjoint(
+        _requested_dates(fetch, _CHAIN_SYMBOL)
+    )
+    # Which is what the manifest now claims: the symbol is no longer stale,
+    # so there had better be no gap behind that claim.
+    stale = _manifest(second.capture_root)["stale_symbols"]
+    assert stale == {"klines": {}, "fundingRate": {}}
+    assert _quality(second.capture_root)[_CHAIN_SYMBOL]["missing_days"] == 0
+    # 31 July days + 7 new ones fetched, and the 2 days week 1 carried.
+    chain_rows = [
+        row
+        for row in _rows(second.capture_root, DAILY_TAIL_KIND)
+        if row["symbol"] == _CHAIN_SYMBOL
+    ]
+    assert len(chain_rows) == 40
+
+    # The funding analogue: one REST window before the carried one and one
+    # after it, because the carried window sits inside this week's span.
+    assert {
+        str(row["month"])
+        for row in _rows(second.capture_root, FUNDING_REST_KIND)
+        if row["symbol"] == _CHAIN_SYMBOL
+    } == {
+        "2020-07-01_2020-07-31",
+        f"{FIRST_TAIL_DATE}_{FIRST_TAIL_SUNDAY}",
+        f"2020-08-03_{SECOND_TAIL_SUNDAY}",
+    }
+    # Every other symbol is unaffected: two carried days and seven new ones.
+    untouched = [
+        row for row in _rows(second.capture_root, DAILY_TAIL_KIND) if row["symbol"] == _SYMBOL
+    ]
+    assert len(untouched) == 9
