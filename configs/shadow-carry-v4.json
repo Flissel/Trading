@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "family_spec_path": "configs/funding-carry-panel-v4-measured.json",
+  "family_spec_hash": "f75a298485f5e5865e568279418a6280f5880999f777d566efb05904463959bc",
+  "family_name": "funding_carry_panel_v4_measured",
+  "candidate": "carry_s10_l4w_h26w_exit",
+  "controls": ["no_trade", "random_pairs"],
+  "anchor_decision_close_date": "2026-09-13",
+  "phase": "A",
+  "holdout_report_hash": null,
+  "artifact_root": "artifacts/shadow",
+  "registry_path": "artifacts/shadow/metadata-shadow.sqlite3"
+}

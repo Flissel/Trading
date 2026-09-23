@@ -18,6 +18,7 @@ fetches it was built by before.
 import json
 import urllib.parse
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from tests.carry_fixtures import _payload, funding_csv, funding_rate, spot_kline_csv
 from tests.test_panel_fold_run import (
@@ -29,7 +30,8 @@ from tests.test_panel_fold_run import (
     SYMBOLS,
     kline_csv,
 )
-from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent
+from trading_bot.panel_capture import PanelPayload, PanelSourceAbsent, capture_panel
+from trading_bot.shadow_capture import build_shadow_capture
 
 MONTH_START_DAY.setdefault("2020-08", MONTH_START_DAY["2020-07"] + MONTH_DAYS["2020-07"])
 MONTH_DAYS.setdefault("2020-08", 31)
@@ -263,3 +265,119 @@ def _next_date(date: str) -> str:
         return f"{month}-{day + 1:02d}"
     following = ALL_MONTHS[ALL_MONTHS.index(month) + 1]
     return f"{following}-01"
+
+
+# --- the weekly shadow book ---------------------------------------------
+
+# The first Sunday the fixture chain can decide on. `select_pair_universe`
+# needs `minimum_history_days` daily bars at or before the decision -- 20
+# under the reduced v4 declaration -- and the fixture panel opens on
+# 2020-01-01, so the Sundays at day offsets 4, 11 and 18 carry 5, 12 and 19
+# bars and come back `UNIVERSE_TOO_SMALL`; the fourth Sunday, 2020-01-26 at
+# offset 25, carries 26 bars and is the first one a book can be decided on.
+SHADOW_ANCHOR_SUNDAY = "2020-01-26"
+# The wall clock a fixture shadow capture is built under: the Sunday
+# deadline never fires here, because every fixture dump is published
+# the moment it is asked for.
+_SHADOW_CLOCK_NS = 1_600_000_000_000_000_000
+SHADOW_FAMILY_NAME = "funding_carry_panel_v4"
+SHADOW_CANDIDATE = "carry_s10_l4w_h26w_exit"
+
+
+@dataclass(frozen=True, slots=True)
+class ShadowBookCaptures:
+    """One workspace's captures for a shadow week: both markets, two weeks.
+
+    `run_shadow_week` reads a perpetual capture and a spot capture, and
+    Ruling 17 makes the base each weekly capture records required, so a
+    fixture week is four directories. The second week is chained onto the
+    first with `previous_capture_root`, which is the shape the real Monday
+    job runs in.
+    """
+
+    root: Path
+    perp_base: Path
+    spot_base: Path
+    perp_first: Path
+    spot_first: Path
+    perp_second: Path
+    spot_second: Path
+
+
+def build_shadow_book_captures(root: Path) -> ShadowBookCaptures:
+    """Base captures over `MONTHS` and two chained weekly captures per market.
+
+    Both markets are built from the same `ShadowFetch`, so the spot capture
+    never reaches for funding (`market="spot"`) and the perpetual capture
+    carries the REST funding windows the book's trailing measures read.
+    """
+    perp_base = capture_panel(
+        workspace_root=root, output_directory=root / "perp-base", reserve_bytes=0,
+        symbols=SYMBOLS, months=MONTHS, fetch=ShadowFetch().fetch,
+    ).capture_root
+    spot_base = capture_panel(
+        workspace_root=root, output_directory=root / "spot-base", reserve_bytes=0,
+        symbols=SYMBOLS, months=MONTHS, fetch=ShadowFetch().fetch, market="spot",
+    ).capture_root
+    weeks: dict[str, Path] = {}
+    for market, base in (("um", perp_base), ("spot", spot_base)):
+        previous: Path | None = None
+        for label, sunday in (("first", FIRST_TAIL_SUNDAY), ("second", SECOND_TAIL_SUNDAY)):
+            name = f"{'perp' if market == 'um' else 'spot'}-{label}"
+            artifact = build_shadow_capture(
+                workspace_root=root,
+                base_capture_root=base,
+                output_directory=root / name,
+                reserve_bytes=0,
+                tail_through=sunday,
+                market=market,
+                fetch=ShadowFetch().fetch,
+                previous_capture_root=previous,
+                clock=lambda: _SHADOW_CLOCK_NS,
+                sleep=lambda _seconds: None,
+            )
+            weeks[name] = artifact.capture_root
+            previous = artifact.capture_root
+    return ShadowBookCaptures(
+        root=root,
+        perp_base=perp_base,
+        spot_base=spot_base,
+        perp_first=weeks["perp-first"],
+        spot_first=weeks["spot-first"],
+        perp_second=weeks["perp-second"],
+        spot_second=weeks["spot-second"],
+    )
+
+
+def write_shadow_declaration(
+    path: Path,
+    *,
+    family_spec_path: str,
+    family_spec_hash: str,
+    artifact_root: str,
+    registry_path: str,
+    family_name: str = SHADOW_FAMILY_NAME,
+    candidate: str = SHADOW_CANDIDATE,
+    controls: tuple[str, str] = ("no_trade", "random_pairs"),
+    anchor_decision_close_date: str = SHADOW_ANCHOR_SUNDAY,
+    phase: str = "A",
+    holdout_report_hash: str | None = None,
+    version: str = "1.0.0",
+) -> Path:
+    """Write one shadow declaration, defaulting to the fixture family's Phase A."""
+    document = {
+        "version": version,
+        "family_spec_path": family_spec_path,
+        "family_spec_hash": family_spec_hash,
+        "family_name": family_name,
+        "candidate": candidate,
+        "controls": list(controls),
+        "anchor_decision_close_date": anchor_decision_close_date,
+        "phase": phase,
+        "holdout_report_hash": holdout_report_hash,
+        "artifact_root": artifact_root,
+        "registry_path": registry_path,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document), encoding="utf-8")
+    return path
