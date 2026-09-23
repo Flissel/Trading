@@ -46,6 +46,7 @@ from trading_bot.carry_fold_run import (
     _final_books,
     control_reference,
     evaluate_carry_decisions,
+    load_decision_inputs,
     run_carry_fold,
     warm_up_weeks_of,
 )
@@ -59,9 +60,7 @@ from trading_bot.carry_signals import (
 from trading_bot.carry_universe import EligiblePair, PairUniverseSnapshot
 from trading_bot.panel_config import load_family_spec
 from trading_bot.panel_fold_run import verify_panel_fold_report
-from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
 from trading_bot.panel_samples import publish_panel_walk_forward
-from trading_bot.panel_universe import build_contract_histories
 from trading_bot.registry import MetadataRegistry
 
 Workspace = tuple[Path, Path, Path, Path]  # root, perp capture, spot capture, config
@@ -1092,8 +1091,9 @@ def test_a_universe_too_small_week_empties_every_slot(
 def _decision_runner(
     space: Workspace, fold_index: int = 0, *, decisions: list[int] | None = None
 ) -> Callable[[tuple[str, ...] | None], DecisionRun]:
-    """Load one fold's bars, funding and decisions as `run_carry_fold` does,
-    and hand back a caller that evaluates them for a choice of candidates.
+    """Load one fold's inputs through `load_decision_inputs` -- the loader
+    `run_carry_fold` itself calls -- and hand back a caller that evaluates
+    them for a choice of candidates.
 
     The holdout runner will load the same way and call the same function with
     its own decisions, so a full run and a filtered one are compared here over
@@ -1109,18 +1109,9 @@ def _decision_runner(
         if item["fold_index"] == fold_index
     )
     test_end_ns = int(fold["test_end_ns"])
-    perp_histories = build_contract_histories(
-        load_panel_bars(perp / "dataset", available_before_ns=test_end_ns + 1)
+    inputs = load_decision_inputs(
+        perp / "dataset", spot / "dataset", available_before_ns=test_end_ns + 1
     )
-    spot_histories = build_contract_histories(
-        load_panel_bars(spot / "dataset", available_before_ns=test_end_ns + 1)
-    )
-    leg_histories = {f"perp:{cid}": history for cid, history in perp_histories.items()}
-    leg_histories.update({f"spot:{cid}": history for cid, history in spot_histories.items()})
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
-    for event in load_funding_events(perp / "dataset"):
-        leg_key = f"perp:{event.contract_id}"
-        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
     evaluated = (
         sorted(int(str(value).split(":")[1]) for value in fold["test_ids"])
         if decisions is None
@@ -1130,8 +1121,8 @@ def _decision_runner(
     def evaluate(candidate_names: tuple[str, ...] | None) -> DecisionRun:
         return evaluate_carry_decisions(
             spec,
-            perp_histories=perp_histories, spot_histories=spot_histories,
-            leg_histories=leg_histories, funding_by_leg=funding_by_leg,
+            perp_histories=inputs.perp_histories, spot_histories=inputs.spot_histories,
+            leg_histories=inputs.leg_histories, funding_by_leg=inputs.funding_by_leg,
             decisions=evaluated, candidate_names=candidate_names,
         )
 

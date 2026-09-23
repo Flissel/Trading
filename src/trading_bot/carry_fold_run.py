@@ -35,7 +35,12 @@ from trading_bot.carry_signals import (
 from trading_bot.carry_universe import PairUniverseSnapshot, select_pair_universe
 from trading_bot.panel_capture import verify_panel_capture
 from trading_bot.panel_fold_run import MEMBER_HELD_NOTHING_REASON_CODE
-from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
+from trading_bot.panel_reader import (
+    FundingEvent,
+    PanelBar,
+    load_funding_events,
+    load_panel_bars,
+)
 from trading_bot.panel_samples import verify_panel_manifest
 from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.registry import ExperimentRecord, MetadataRegistry
@@ -151,6 +156,66 @@ class FinalBook:
 
 
 @dataclass(frozen=True, slots=True)
+class DecisionInputs:
+    """Everything `evaluate_carry_decisions` reads, loaded from two datasets.
+
+    The loop takes four separate mappings, and how they are built -- which
+    bars a decision may see, what a leg key looks like, which market carries
+    the funding -- is part of the mechanics, not of the caller. Carrying them
+    together means the fold runner, the weekly shadow book and the tests that
+    pin one against the other cannot load them differently: a pin that
+    compares two evaluations over separately assembled inputs proves only that
+    the loop agrees with itself.
+
+    `perp_bars` is kept because the rebalance calendar is the perpetual
+    panel's -- a caller deriving its own decisions from
+    `panel_samples.rebalance_close_times` reads them here rather than loading
+    the same parquet a second time. The spot bars are not kept: nothing asks
+    the hedge for a calendar, and a second bar tuple nobody reads is weight.
+    """
+
+    perp_bars: tuple[PanelBar, ...]
+    perp_histories: dict[str, ContractHistory]
+    spot_histories: dict[str, ContractHistory]
+    leg_histories: dict[str, ContractHistory]
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]]
+
+
+def load_decision_inputs(
+    perp_dataset_root: Path, spot_dataset_root: Path, *, available_before_ns: int
+) -> DecisionInputs:
+    """Load both markets' bars, histories and funding for one decision window.
+
+    The one loader every caller of `evaluate_carry_decisions` goes through.
+    `available_before_ns` is the point-in-time boundary the caller owns -- a
+    fold uses its test end, a shadow week its Sunday -- but everything after
+    it is fixed here: a leg is `perp:<contract id>` or `spot:<contract id>`,
+    the funding is the perpetual market's and is indexed by the perpetual
+    leg, and the spot dataset contributes histories only.
+    """
+    perp_bars = load_panel_bars(perp_dataset_root, available_before_ns=available_before_ns)
+    spot_bars = load_panel_bars(spot_dataset_root, available_before_ns=available_before_ns)
+    perp_histories = build_contract_histories(perp_bars)
+    spot_histories = build_contract_histories(spot_bars)
+    leg_histories: dict[str, ContractHistory] = {}
+    for contract_id, history in perp_histories.items():
+        leg_histories[f"perp:{contract_id}"] = history
+    for contract_id, history in spot_histories.items():
+        leg_histories[f"spot:{contract_id}"] = history
+    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
+    for event in load_funding_events(perp_dataset_root):
+        leg_key = f"perp:{event.contract_id}"
+        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
+    return DecisionInputs(
+        perp_bars=perp_bars,
+        perp_histories=perp_histories,
+        spot_histories=spot_histories,
+        leg_histories=leg_histories,
+        funding_by_leg=funding_by_leg,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class DecisionRun:
     """What evaluating a list of decisions produced, before it is sealed.
 
@@ -232,26 +297,18 @@ def run_carry_fold(
         raise CarryFoldError(f"fold {fold_index} is not in the manifest")
 
     test_end_ns = int(fold["test_end_ns"])
-    perp_bars = load_panel_bars(perp_capture_root / "dataset", available_before_ns=test_end_ns + 1)
-    spot_bars = load_panel_bars(spot_capture_root / "dataset", available_before_ns=test_end_ns + 1)
-    perp_histories = build_contract_histories(perp_bars)
-    spot_histories = build_contract_histories(spot_bars)
-    leg_histories: dict[str, ContractHistory] = {}
-    for cid, history in perp_histories.items():
-        leg_histories[f"perp:{cid}"] = history
-    for cid, history in spot_histories.items():
-        leg_histories[f"spot:{cid}"] = history
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
-    for event in load_funding_events(perp_capture_root / "dataset"):
-        leg_key = f"perp:{event.contract_id}"
-        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
+    inputs = load_decision_inputs(
+        perp_capture_root / "dataset",
+        spot_capture_root / "dataset",
+        available_before_ns=test_end_ns + 1,
+    )
 
     test_ids = [str(value) for value in fold["test_ids"]]
     decisions = sorted(int(value.split(":")[1]) for value in test_ids)
     run = evaluate_carry_decisions(
         spec,
-        perp_histories=perp_histories, spot_histories=spot_histories,
-        leg_histories=leg_histories, funding_by_leg=funding_by_leg,
+        perp_histories=inputs.perp_histories, spot_histories=inputs.spot_histories,
+        leg_histories=inputs.leg_histories, funding_by_leg=inputs.funding_by_leg,
         decisions=decisions,
     )
     material: dict[str, object] = {

@@ -6,7 +6,8 @@ immutable, and a shadow week only reads them.
 """
 
 import json
-from collections.abc import Iterable
+import shutil
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
@@ -36,10 +37,12 @@ from tests.test_panel_fold_run import SYMBOLS
 from trading_bot.canonical import canonical_json, content_sha256
 from trading_bot.carry_config import load_carry_family_spec
 from trading_bot.carry_fold_run import (
+    DecisionInputs,
     DecisionRun,
     FinalBook,
     carry_module_names,
     evaluate_carry_decisions,
+    load_decision_inputs,
 )
 from trading_bot.carry_signals import (
     Cohort,
@@ -49,9 +52,7 @@ from trading_bot.carry_signals import (
     trailing_funding,
 )
 from trading_bot.carry_universe import select_pair_universe
-from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
 from trading_bot.panel_samples import rebalance_close_times
-from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.registry import MetadataRegistry
 from trading_bot.shadow_book import (
     MEASUREMENT_SNAPSHOT_VERSION,
@@ -218,17 +219,22 @@ def _assert_no_key(value: object, forbidden: Iterable[str]) -> None:
             _assert_no_key(item, names)
 
 
-# --- the inputs, loaded the way the book loads them ---------------------
+# --- the inputs, loaded through the fold runner's own loader ------------
 
 
 @dataclass(frozen=True, slots=True)
 class Inputs:
-    """`run_carry_fold`'s loading, repeated here so a comparison is independent."""
+    """One week's loaded inputs and the decisions a book is computed over.
 
-    perp_histories: dict[str, ContractHistory]
-    spot_histories: dict[str, ContractHistory]
-    leg_histories: dict[str, ContractHistory]
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]]
+    The loading is `carry_fold_run.load_decision_inputs`, the same call
+    `run_shadow_week` and `run_carry_fold` make -- not a copy of it. A copy
+    would make the "shadow = fold mechanics" pin compare two evaluations of
+    two separately assembled input sets, which proves nothing about the
+    loading at all. Only the decision list is derived here, because that is
+    the one thing the declaration, not the loader, decides.
+    """
+
+    loaded: DecisionInputs
     decisions: list[int]
 
 
@@ -243,19 +249,16 @@ def _inputs(
     perp_root = perp if perp is not None else harness.captures.perp_second
     spot_root = spot if spot is not None else harness.captures.spot_second
     close = _close_ns(sunday)
-    perp_bars = load_panel_bars(perp_root / "dataset", available_before_ns=close + 2)
-    spot_bars = load_panel_bars(spot_root / "dataset", available_before_ns=close + 2)
-    perp_histories = build_contract_histories(perp_bars)
-    spot_histories = build_contract_histories(spot_bars)
-    leg_histories = {f"perp:{cid}": history for cid, history in perp_histories.items()}
-    leg_histories.update({f"spot:{cid}": history for cid, history in spot_histories.items()})
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
-    for event in load_funding_events(perp_root / "dataset"):
-        key = f"perp:{event.contract_id}"
-        funding_by_leg[key] = (*funding_by_leg.get(key, ()), event)
+    loaded = load_decision_inputs(
+        perp_root / "dataset", spot_root / "dataset", available_before_ns=close + 2
+    )
     anchor_close = _close_ns(anchor)
-    decisions = [t for t in rebalance_close_times(perp_bars) if anchor_close <= t <= close]
-    return Inputs(perp_histories, spot_histories, leg_histories, funding_by_leg, decisions)
+    decisions = [
+        time_ns
+        for time_ns in rebalance_close_times(loaded.perp_bars)
+        if anchor_close <= time_ns <= close
+    ]
+    return Inputs(loaded, decisions)
 
 
 def _evaluate(
@@ -268,10 +271,10 @@ def _evaluate(
     spec, _ = load_carry_family_spec(harness.family_spec_path)
     return evaluate_carry_decisions(
         spec,
-        perp_histories=inputs.perp_histories,
-        spot_histories=inputs.spot_histories,
-        leg_histories=inputs.leg_histories,
-        funding_by_leg=inputs.funding_by_leg,
+        perp_histories=inputs.loaded.perp_histories,
+        spot_histories=inputs.loaded.spot_histories,
+        leg_histories=inputs.loaded.leg_histories,
+        funding_by_leg=inputs.loaded.funding_by_leg,
         decisions=inputs.decisions if decisions is None else decisions,
         candidate_names=candidates,
     )
@@ -473,15 +476,15 @@ def test_the_universe_measurements_list_every_ranked_pair(harness: Harness) -> N
     spec, _ = load_carry_family_spec(harness.family_spec_path)
     close = _close_ns(SECOND_TAIL_SUNDAY)
     snapshot = select_pair_universe(
-        inputs.perp_histories,
-        inputs.spot_histories,
+        inputs.loaded.perp_histories,
+        inputs.loaded.spot_histories,
         pairs=spec.pairs,
         decision_close_ns=close,
         rules=spec.universe,
     )
     one_week = {
         pair.pair_id: trailing_funding(
-            inputs.funding_by_leg.get(f"perp:{pair.perpetual_contract_id}", ()),
+            inputs.loaded.funding_by_leg.get(f"perp:{pair.perpetual_contract_id}", ()),
             decision_close_ns=close,
             lookback_weeks=1,
         )
@@ -500,7 +503,7 @@ def test_the_universe_measurements_list_every_ranked_pair(harness: Harness) -> N
         assert entry["spot_leg"] == f"spot:{pair.spot_contract_id}"
         assert _decimal(entry["trailing_funding_1w"]) == one_week[pair.pair_id]
         assert _decimal(entry["trailing_funding_4w"]) == trailing_funding(
-            inputs.funding_by_leg.get(f"perp:{pair.perpetual_contract_id}", ()),
+            inputs.loaded.funding_by_leg.get(f"perp:{pair.perpetual_contract_id}", ()),
             decision_close_ns=close,
             lookback_weeks=4,
         )
@@ -716,6 +719,72 @@ def test_a_base_that_is_not_the_recorded_one_refuses(harness: Harness) -> None:
     assert not harness.artifact_root.exists()
 
 
+def test_a_weekly_capture_that_is_not_a_superset_of_its_base_refuses(
+    harness: Harness, tmp_path: Path
+) -> None:
+    """Ruling 17 and spec 3.1: a weekly capture carries its base's rows byte
+    for byte, so a base row the week no longer agrees with means a source the
+    fold read has changed under the book.
+
+    Both captures are copied and the base's manifest is edited so one row
+    claims a different payload digest, then the weekly manifest is pointed at
+    the edited base and resealed -- so the weekly capture still verifies and
+    still records the base it was handed, and the only thing left to fail is
+    the lineage itself.
+    """
+    base = tmp_path / "base"
+    weekly = tmp_path / "weekly"
+    shutil.copytree(harness.captures.perp_base, base)
+    shutil.copytree(harness.captures.perp_second, weekly)
+    row = _first_kline_row(base)
+    altered = _reseal(base, lambda material: _set_row_hash(material, row, "f" * 64))
+    _reseal(weekly, lambda material: material.__setitem__("base_capture_root_hash", altered))
+
+    with pytest.raises(ShadowBookError, match="not a superset") as refusal:
+        _run(harness, harness.declare(), perp=weekly, perp_base=base)
+
+    assert f"klines:{row}: hash" in str(refusal.value)
+    assert not harness.artifact_root.exists()
+
+
+def _reseal(capture_root: Path, mutate: Callable[[dict[str, object]], None]) -> str:
+    """Rewrite a capture manifest after `mutate`, resealed so it still verifies.
+
+    A hand-edited manifest that no longer matched its own seal would be
+    refused by the verification step long before the field under test is read,
+    so the seal is recomputed over the mutated material -- the same move
+    `tests.test_shadow_capture` makes.
+    """
+    document = _document(capture_root / "capture-manifest.json")
+    material = {key: value for key, value in document.items() if key != "capture_root_hash"}
+    mutate(material)
+    capture_root_hash = content_sha256(material)
+    (capture_root / "capture-manifest.json").write_bytes(
+        canonical_json({**material, "capture_root_hash": capture_root_hash})
+    )
+    return capture_root_hash
+
+
+def _first_kline_row(capture_root: Path) -> str:
+    """`<symbol>:<month>` of the first monthly kline row a capture carries."""
+    sources = _sequence(_document(capture_root / "capture-manifest.json")["sources"])
+    row = next(
+        entry
+        for item in sources
+        for entry in (_mapping(item),)
+        if entry.get("kind") == "klines" and entry.get("status") == "present"
+    )
+    return f"{_text(row['symbol'])}:{_text(row['month'])}"
+
+
+def _set_row_hash(material: dict[str, object], row: str, raw_sha256: str) -> None:
+    symbol, month = row.split(":")
+    for item in _sequence(material["sources"]):
+        entry = _mapping(item)
+        if entry.get("symbol") == symbol and entry.get("month") == month:
+            entry["raw_sha256"] = raw_sha256
+
+
 def test_a_spot_capture_in_the_perpetual_slot_refuses(harness: Harness) -> None:
     """The two captures are not interchangeable: the perpetual leg carries the
     funding and the spot leg is the hedge, so a swapped pair would evaluate a
@@ -808,7 +877,46 @@ def test_a_monthly_capture_needs_no_base(tmp_path: Path) -> None:
     assert document["decision_close_ns"] == _close_ns("2020-07-26")
 
 
-def _monthly_declaration(root: Path) -> Path:
+def test_phase_b_reports_no_pnl_when_the_previous_sunday_was_skipped(
+    tmp_path: Path,
+) -> None:
+    """A skipped S-1 evaluated no episode, so there is no P&L to state -- and
+    a zeroed block would read as a week that traded and earned nothing. The
+    running totals still carry every episode the run did evaluate before S."""
+    perp, spot = build_captures(tmp_path, perp_fetch_function=perp_fetch_with_a_liquidity_dip)
+    _, spec_hash = load_carry_family_spec(small_carry_v4_config(tmp_path))
+    report, report_hash = _holdout_report(
+        tmp_path / "holdout.json", family_spec_hash=spec_hash
+    )
+    declaration = _monthly_declaration(
+        tmp_path, phase="B", holdout_report_hash=report_hash
+    )
+
+    artifact = run_shadow_week(
+        workspace_root=tmp_path,
+        declaration_path=declaration,
+        perp_capture_root=perp,
+        spot_capture_root=spot,
+        decision_sunday="2020-05-03",
+        holdout_report_path=report,
+        measurement_snapshot_path=None,
+    )
+
+    document = _document(artifact.output_path)
+    skipped_close = _close_ns("2020-04-26")
+    assert document["previous_decision_close_ns"] == skipped_close
+    assert f"BINANCE_UM:{skipped_close}:w1" in _sequence(document["skipped_sample_ids"])
+    assert document["skipped"] is False
+    assert document["pnl"] is None
+    totals = _mapping(document["running_totals"])
+    assert totals["through_decision_close_ns"] == skipped_close
+    count = totals["episode_count"]
+    assert isinstance(count, int) and count > 0
+
+
+def _monthly_declaration(
+    root: Path, *, phase: str = "A", holdout_report_hash: str | None = None
+) -> Path:
     spec_path = small_carry_v4_config(root)
     _, spec_hash = load_carry_family_spec(spec_path)
     return write_shadow_declaration(
@@ -817,6 +925,8 @@ def _monthly_declaration(root: Path) -> Path:
         family_spec_hash=spec_hash,
         artifact_root="artifacts",
         registry_path="artifacts/metadata-shadow.sqlite3",
+        phase=phase,
+        holdout_report_hash=holdout_report_hash,
     )
 
 
@@ -968,6 +1078,51 @@ def test_phase_b_publishes_the_previous_sundays_pnl(harness: Harness, tmp_path: 
         _assert_pnl(_mapping(totals[scenario]), earlier)
 
 
+def test_a_week_on_the_anchor_itself_has_no_previous_sunday(
+    harness: Harness, tmp_path: Path
+) -> None:
+    """S == A: the run holds one decision, so there is nothing before it.
+
+    Spec 4.1 never evaluates a decision before the anchor, so the first week a
+    declaration can produce has no S-1 at all: no previous close, no slot to
+    label -- the labels are what the week just past paid the slots held at
+    S-1, and there were none -- and in Phase B a P&L block and running totals
+    that are explicitly null rather than zeroed. The two phases run on
+    different Sundays so each writes its own immutable path.
+    """
+    phase_a = _run(harness, harness.declare(anchor_decision_close_date=SECOND_TAIL_SUNDAY))
+
+    document = _document(phase_a.output_path)
+    assert document["previous_decision_close_ns"] is None
+    assert document["anchor_decision_close_ns"] == document["decision_close_ns"]
+    assert document["m_labels"] == []
+    assert document["skipped"] is False
+    assert "pnl" not in document
+    assert "running_totals" not in document
+
+    report, report_hash = _holdout_report(
+        tmp_path / "holdout.json", family_spec_hash=harness.family_spec_hash
+    )
+    phase_b = _run(
+        harness,
+        harness.declare(
+            anchor_decision_close_date=FIRST_TAIL_SUNDAY,
+            phase="B",
+            holdout_report_hash=report_hash,
+        ),
+        sunday=FIRST_TAIL_SUNDAY,
+        perp=harness.captures.perp_first,
+        spot=harness.captures.spot_first,
+        holdout_report_path=report,
+    )
+
+    document = _document(phase_b.output_path)
+    assert document["previous_decision_close_ns"] is None
+    assert document["m_labels"] == []
+    assert document["pnl"] is None
+    assert document["running_totals"] is None
+
+
 def _assert_pnl(block: dict[str, object], episodes: list[dict[str, object]]) -> None:
     """The block's five money fields and two counts are sums over `episodes`."""
     extras = [_mapping(item["extras"]) for item in episodes]
@@ -1081,7 +1236,7 @@ def test_a_measurement_snapshot_whose_seal_does_not_recompute_refuses(
     assert not harness.artifact_root.exists()
 
 
-def test_the_measurement_snapshot_version_is_the_journals(harness: Harness) -> None:
+def test_the_measurement_snapshot_version_is_the_journals() -> None:
     """The book names the document version it reads; the journal writes it.
     Pinned so the two cannot drift apart without a test saying so."""
     from trading_bot.binance_measurement_journal import MEASUREMENT_SNAPSHOT_VERSION as written

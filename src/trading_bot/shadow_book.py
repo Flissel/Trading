@@ -46,11 +46,13 @@ from trading_bot.carry_config import (
 )
 from trading_bot.carry_fold_run import (
     CarryFoldError,
+    DecisionInputs,
     DecisionRun,
     FinalBook,
     _trailing_by_pair,
     carry_module_names,
     evaluate_carry_decisions,
+    load_decision_inputs,
 )
 from trading_bot.carry_signals import (
     Cohort,
@@ -61,9 +63,8 @@ from trading_bot.carry_signals import (
 )
 from trading_bot.carry_universe import PairUniverseSnapshot, select_pair_universe
 from trading_bot.panel_capture import verify_panel_capture
-from trading_bot.panel_reader import FundingEvent, load_funding_events, load_panel_bars
+from trading_bot.panel_reader import FundingEvent
 from trading_bot.panel_samples import rebalance_close_times
-from trading_bot.panel_universe import ContractHistory, build_contract_histories
 from trading_bot.registry import ArtifactRecord, MetadataRegistry, RegistryConflictError
 from trading_bot.shadow_capture import DAILY_TAIL_KIND, FUNDING_REST_KIND
 from trading_bot.shadow_config import (
@@ -149,17 +150,6 @@ class _Capture:
     data_available_time_ns: int
 
 
-@dataclass(frozen=True, slots=True)
-class _Inputs:
-    """The bars, histories, funding and decisions one week is computed over."""
-
-    perp_histories: dict[str, ContractHistory]
-    spot_histories: dict[str, ContractHistory]
-    leg_histories: dict[str, ContractHistory]
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]]
-    decisions: list[int]
-
-
 def run_shadow_week(
     *,
     workspace_root: Path,
@@ -188,6 +178,10 @@ def run_shadow_week(
     when the matching weekly capture records a `base_capture_root_hash`
     (ruling 17): the lineage check needs the base's own manifest, which only
     the caller has. A monthly capture extends nothing and is run without one.
+
+    A week is published and then registered, and a crash between the two
+    leaves an artifact no registry row points at; `_register`'s docstring has
+    the operator step that clears it.
     """
     declaration, declaration_hash = _declaration(declaration_path)
     sunday = _sunday(decision_sunday)
@@ -267,18 +261,18 @@ def _publish_week(
     measurement_snapshot_hash: str | None,
 ) -> ShadowWeekArtifact:
     """Everything after the inputs verified: the runs, the blocks, the seal."""
-    inputs = _load_inputs(
+    inputs, decisions = _load_inputs(
         perp.root, spot.root,
         anchor_close_ns=anchor_close_ns, decision_close_ns=decision_close_ns,
     )
-    if decision_close_ns not in inputs.decisions:
+    if decision_close_ns not in decisions:
         raise _Refusal(
             _SUNDAY_NOT_IN_CAPTURE,
             f"{decision_sunday} is not among the decisions from "
             f"{declaration.anchor_decision_close_date} on that these captures carry",
         )
     candidates = (declaration.candidate, *declaration.controls)
-    run = _evaluate(spec, inputs, inputs.decisions, candidates)
+    run = _evaluate(spec, inputs, decisions, candidates)
     book = run.final_books[declaration.candidate]
     _require_sunday_bars(book, inputs=inputs, decision_close_ns=decision_close_ns)
 
@@ -287,12 +281,12 @@ def _publish_week(
     # decision's. Only the candidate is evaluated there -- a filtered run is
     # the full run's record for the candidates it names, so its siblings would
     # change nothing about the book this reads.
-    previous_close_ns = inputs.decisions[-2] if len(inputs.decisions) > 1 else None
+    previous_close_ns = decisions[-2] if len(decisions) > 1 else None
     previous_book = (
         None
         if previous_close_ns is None
         else _evaluate(
-            spec, inputs, inputs.decisions[:-1], (declaration.candidate,)
+            spec, inputs, decisions[:-1], (declaration.candidate,)
         ).final_books[declaration.candidate]
     )
 
@@ -348,7 +342,7 @@ def _publish_week(
             run, candidate=declaration.candidate, decision_close_ns=previous_close_ns
         )
         material["running_totals"] = _running_totals_block(
-            run, candidate=declaration.candidate, decisions=inputs.decisions
+            run, candidate=declaration.candidate, decisions=decisions
         )
 
     report_hash = _publish(output_path, material)
@@ -669,43 +663,38 @@ def _verify_measurement_blocks(document: dict[str, Any]) -> None:
 
 def _load_inputs(
     perp_root: Path, spot_root: Path, *, anchor_close_ns: int, decision_close_ns: int
-) -> _Inputs:
-    """Bars, histories, funding and decisions, loaded as `run_carry_fold` loads them.
+) -> tuple[DecisionInputs, list[int]]:
+    """The fold runner's own loader, plus this week's decision list.
 
-    `available_before_ns = S + 2` is the point-in-time boundary: a bar's
-    availability is its close plus one nanosecond, so this admits the Sunday's
-    own bar and nothing after it. The decisions are the panel's Sunday closes
-    restricted to `[anchor, S]` -- spec 4.1's "decisions before A are never
-    evaluated", with the bars before A still read as history.
+    The loading itself is `carry_fold_run.load_decision_inputs` and nothing
+    else: a week that assembled its own histories, leg keys or funding index
+    could differ from the fold runner in exactly the way "shadow = fold
+    mechanics" is supposed to forbid, and no comparison of two evaluations
+    would notice, because both would be evaluations of the same private copy.
+
+    `available_before_ns = S + 2` is the point-in-time boundary this caller
+    owns: a bar's availability is its close plus one nanosecond, so this
+    admits the Sunday's own bar and nothing after it. The decisions are the
+    perpetual panel's Sunday closes restricted to `[anchor, S]` -- spec 4.1's
+    "decisions before A are never evaluated", with the bars before A still
+    read as history.
     """
-    perp_bars = load_panel_bars(
-        perp_root / "dataset", available_before_ns=decision_close_ns + 2
+    loaded = load_decision_inputs(
+        perp_root / "dataset",
+        spot_root / "dataset",
+        available_before_ns=decision_close_ns + 2,
     )
-    spot_bars = load_panel_bars(
-        spot_root / "dataset", available_before_ns=decision_close_ns + 2
-    )
-    perp_histories = build_contract_histories(perp_bars)
-    spot_histories = build_contract_histories(spot_bars)
-    leg_histories: dict[str, ContractHistory] = {}
-    for contract_id, history in perp_histories.items():
-        leg_histories[f"perp:{contract_id}"] = history
-    for contract_id, history in spot_histories.items():
-        leg_histories[f"spot:{contract_id}"] = history
-    funding_by_leg: dict[str, tuple[FundingEvent, ...]] = {}
-    for event in load_funding_events(perp_root / "dataset"):
-        leg_key = f"perp:{event.contract_id}"
-        funding_by_leg[leg_key] = (*funding_by_leg.get(leg_key, ()), event)
     decisions = [
         close_time_ns
-        for close_time_ns in rebalance_close_times(perp_bars)
+        for close_time_ns in rebalance_close_times(loaded.perp_bars)
         if anchor_close_ns <= close_time_ns <= decision_close_ns
     ]
-    return _Inputs(perp_histories, spot_histories, leg_histories, funding_by_leg, decisions)
+    return loaded, decisions
 
 
 def _evaluate(
     spec: CarryFamilySpec,
-    inputs: _Inputs,
+    inputs: DecisionInputs,
     decisions: list[int],
     candidate_names: tuple[str, ...],
 ) -> DecisionRun:
@@ -724,7 +713,7 @@ def _evaluate(
 
 
 def _require_sunday_bars(
-    book: FinalBook, *, inputs: _Inputs, decision_close_ns: int
+    book: FinalBook, *, inputs: DecisionInputs, decision_close_ns: int
 ) -> None:
     """Spec section 6: refuse if the Sunday bar is absent for what the book holds.
 
@@ -780,7 +769,7 @@ def _book_block(book: FinalBook) -> dict[str, object]:
 def _universe_block(
     universe: PairUniverseSnapshot,
     *,
-    inputs: _Inputs,
+    inputs: DecisionInputs,
     snapshot_document: dict[str, Any] | None,
 ) -> list[dict[str, object]]:
     """Spec 4.2's measurements, for every pair the universe ranked.
@@ -831,7 +820,7 @@ def _measurement_for(
     *,
     perpetual_leg: str,
     spot_leg: str,
-    inputs: _Inputs,
+    inputs: DecisionInputs,
     snapshot_document: dict[str, Any] | None,
 ) -> dict[str, object] | None:
     """One pair's readings from the measurement stream, or nothing cited.
@@ -934,11 +923,19 @@ def _pnl_block(
     """Spec 4.2's previous-week P&L: S-1's episode under both cost tables.
 
     S's own episode is the week ahead -- it exits seven days after a Sunday
-    whose week has not happened -- so it is never reported. `None` where there
-    is no previous Sunday inside the run, or where that Sunday was skipped and
-    so has no episode.
+    whose week has not happened -- so it is never reported. `None` in the two
+    cases where there is honestly nothing to report: no previous Sunday inside
+    the run at all (S is the anchor), and a previous Sunday the runner
+    skipped, which evaluated no episode because its universe was too small.
+
+    A previous Sunday that *was* evaluated and still has no episode record is
+    a different thing entirely -- a bug in the runner or in this reader -- and
+    is refused rather than published as an absent P&L, which would read as a
+    week that simply earned nothing.
     """
     if decision_close_ns is None:
+        return None
+    if _was_skipped(run, decision_close_ns):
         return None
     by_scenario: dict[str, list[dict[str, object]]] = {
         scenario: [
@@ -948,8 +945,13 @@ def _pnl_block(
         ]
         for scenario in ("base", "adverse")
     }
-    if not all(by_scenario.values()):
-        return None
+    missing = sorted(name for name, episodes in by_scenario.items() if not episodes)
+    if missing:
+        raise _Refusal(
+            _DECISION_RUN_REFUSED,
+            f"{candidate} was evaluated at {decision_close_ns} but the run carries "
+            f"no {'/'.join(missing)} episode for it",
+        )
     return {
         "decision_close_ns": decision_close_ns,
         "sample_id": _text(by_scenario["base"][0].get("sample_id"), "sample_id"),
@@ -1081,6 +1083,18 @@ def _register(
     recorded would be immutable at a path no retry could reuse while the week
     still reads as unpublished, so the report this call wrote is removed
     before the refusal is raised.
+
+    That cleanup cannot run if the process itself dies between the publish and
+    the registration -- a crash, a kill, the machine going down -- which
+    leaves an orphan: `<artifact_root>/<family>/<S>.json` on disk with no row
+    in the registry. Recovering it is an operator step, deliberately not an
+    automatic one, because "delete a sealed artifact" is not a decision code
+    should take on its own. The path is: open the registry, look up
+    `uuid5(NAMESPACE_URL, "shadow:<family spec hash>:<S>")`, and only if there
+    is no row for it, delete that JSON file and run the week again. If there
+    *is* a row, the week is published and nothing needs doing -- compare the
+    row's `content_hash` against the file's `report_hash` and raise it with a
+    person if they differ.
     """
     artifact_id = uuid5(NAMESPACE_URL, f"shadow:{family_spec_hash}:{decision_sunday}")
     try:
